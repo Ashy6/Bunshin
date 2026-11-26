@@ -3,3 +3,6 @@ SESSION_SECRET=replace-with-at-least-32-random-bytes
 ADMIN_BOOTSTRAP_TOKEN=replace-with-one-time-bootstrap-token
 PUBLIC_ORIGIN=http://localhost:8787
 ADMIN_ORIGIN=http://localhost:8788
+# Optional: only enable Turnstile when both values are configured.
+TURNSTILE_SITE_KEY=
+TURNSTILE_SECRET_KEY=

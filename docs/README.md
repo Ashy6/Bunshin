@@ -11,6 +11,7 @@
 - [技术架构方案](./technical-architecture.md)
 - [Monorepo 项目结构](./repository-structure.md)
 - [数据、安全、GEO/SEO 与 Cloudflare 部署](./security-seo-deployment.md)
+- [生产监控、混合 RAG 与 Turnstile](./observability-rag-turnstile.md)
 
 ## 已确认的产品边界
 

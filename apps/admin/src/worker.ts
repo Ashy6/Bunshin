@@ -5,7 +5,7 @@ import {
   type EncryptedSecret,
 } from "@ai-bunshin/crypto";
 import { createEmbedding, testChatConnection } from "@ai-bunshin/ai";
-import { chunkText, cosineSimilarity, createLocalEmbedding } from "@ai-bunshin/rag";
+import { bm25Search, chunkText, cosineSimilarity, createLocalEmbedding, reciprocalRankFusion, rerankHybrid } from "@ai-bunshin/rag";
 import { extractText, getDocumentProxy } from "unpdf";
 import {
   articleSchema,
@@ -119,6 +119,7 @@ function parseSystemConfig(value?: string | null) {
     return defaultSystemConfig;
   }
 }
+async function recordAdminTelemetry(env:Env,event:{eventType:string;severity?:"info"|"warning"|"error"|"critical";route?:string;scenario?:string;durationMs?:number;statusCode?:number;traceId?:string;detail?:Record<string,unknown>}){const traceId=event.traceId??crypto.randomUUID();try{await env.DB.prepare("INSERT INTO observability_events (id,service,event_type,severity,route,scenario,duration_ms,status_code,trace_id,detail_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(),"admin",event.eventType,event.severity??"info",event.route??null,event.scenario??null,event.durationMs??0,event.statusCode??0,traceId,JSON.stringify(event.detail??{}),new Date().toISOString()).run()}catch(error){console.error("telemetry_write_failed",error)}return traceId}
 function providerErrorMessage(error: unknown) {
   const message = error instanceof Error ? error.message : "模型连接测试失败";
   if (message.includes("model.request") || message.includes("Missing scopes"))
@@ -357,7 +358,11 @@ app.onError((error, c) => {
   );
 });
 app.use("/api/*", async (c, next) => {
+  const started=Date.now(),traceId=c.req.header("cf-ray")??crypto.randomUUID();
   await next();
+  const durationMs=Date.now()-started,statusCode=c.res.status;
+  c.executionCtx.waitUntil(recordAdminTelemetry(c.env,{eventType:"http_request",severity:statusCode>=500?"error":statusCode>=400?"warning":"info",route:c.req.path,durationMs,statusCode,traceId,detail:{method:c.req.method}}));
+  c.header("X-Trace-Id",traceId);
   c.header("Cache-Control", "no-store");
   c.header("X-Robots-Tag", "noindex, nofollow");
   c.header("X-Content-Type-Options", "nosniff");
@@ -607,6 +612,26 @@ app.post("/api/admin/maintenance/repair-document-metadata", async (c) => {
   const result = await repairDocumentMetadata(c.env);
   await audit(c.env, c.req.raw, "documents.repair_metadata", "document", undefined, result);
   return c.json(result);
+});
+app.get("/api/admin/observability", async (c) => {
+  const hours=boundedInteger(c.req.query("hours"),24,1,168),modifier=`-${hours} hours`;
+  await evaluateOperationalAlerts(c.env);
+  const [requests,usage,rag,queue,alerts,events,budgets,stuck]=await Promise.all([
+    c.env.DB.prepare("SELECT COUNT(*) total,SUM(CASE WHEN severity IN ('error','critical') OR status_code>=500 THEN 1 ELSE 0 END) errors,COALESCE(AVG(duration_ms),0) avg_duration_ms,SUM(CASE WHEN duration_ms>=12000 THEN 1 ELSE 0 END) slow FROM observability_events WHERE created_at>=datetime('now',?)").bind(modifier).first(),
+    c.env.DB.prepare("SELECT COUNT(*) total,SUM(CASE WHEN status!='success' THEN 1 ELSE 0 END) errors,COALESCE(AVG(latency_ms),0) avg_latency_ms,COALESCE(SUM(cost_micros),0) cost_micros FROM usage_events WHERE created_at>=datetime('now',?)").bind(modifier).first(),
+    c.env.DB.prepare("SELECT COUNT(*) queries,COALESCE(AVG(retrieval_ms),0) avg_retrieval_ms,SUM(CASE WHEN answer_status='no_match' THEN 1 ELSE 0 END) no_match,COALESCE(AVG(top_score),0) avg_top_score FROM rag_query_events WHERE created_at>=datetime('now',?)").bind(modifier).first(),
+    c.env.DB.prepare("SELECT COUNT(*) total,SUM(CASE WHEN status='processing' THEN 1 ELSE 0 END) processing,SUM(CASE WHEN status IN ('retrying','dead_letter_risk') THEN 1 ELSE 0 END) retrying,SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) completed FROM queue_job_runs WHERE heartbeat_at>=datetime('now',?)").bind(modifier).first(),
+    c.env.DB.prepare("SELECT * FROM operational_alerts WHERE status!='resolved' ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'error' THEN 1 WHEN 'warning' THEN 2 ELSE 3 END,last_seen_at DESC LIMIT 100").all(),
+    c.env.DB.prepare("SELECT * FROM observability_events WHERE created_at>=datetime('now',?) ORDER BY created_at DESC LIMIT 100").bind(modifier).all(),
+    c.env.DB.prepare("SELECT providers.id,providers.name,providers.monthly_budget_micros,COALESCE(SUM(usage_events.cost_micros),0) spent_micros FROM providers LEFT JOIN usage_events ON usage_events.provider_id=providers.id AND usage_events.created_at>=datetime('now','start of month') GROUP BY providers.id ORDER BY providers.is_default DESC,providers.name").all(),
+    c.env.DB.prepare("SELECT id,title,status,ingestion_progress,updated_at FROM documents WHERE status IN ('parsing','embedding') AND updated_at<datetime('now','-15 minutes') ORDER BY updated_at").all(),
+  ]);
+  return c.json({hours,requests:requests??{},usage:usage??{},rag:rag??{},queue:queue??{},alerts:alerts.results,events:events.results,budgets:budgets.results,stuck:stuck.results});
+});
+app.post("/api/admin/observability/alerts/:id/ack", async (c) => {
+  await c.env.DB.prepare("UPDATE operational_alerts SET status='acknowledged',acknowledged_at=? WHERE id=? AND status='open'").bind(new Date().toISOString(),c.req.param("id")).run();
+  await audit(c.env,c.req.raw,"alert.acknowledge","operational_alert",c.req.param("id"));
+  return c.json({ok:true});
 });
 app.get("/api/admin/agent", async (c) => {
   const [setting, provider, documents, today] = await Promise.all([
@@ -1597,10 +1622,12 @@ app.post("/api/admin/documents/:id/search-test", async (c) => {
   const rows = (await c.env.DB.prepare(
     "SELECT chunks.id,chunks.chunk_index,chunks.content,chunks.heading_path,local_vectors.embedding_json FROM chunks JOIN local_vectors ON local_vectors.chunk_id=chunks.id WHERE chunks.document_id=?",
   ).bind(c.req.param("id")).all<any>()).results;
-  const vector = createLocalEmbedding(query), items = rows.map((row) => ({
+  const vector = createLocalEmbedding(query), vectorItems = rows.map((row) => ({
     id: row.id, chunkIndex: row.chunk_index, content: row.content, headingPath: JSON.parse(row.heading_path || "[]"),
     score: cosineSimilarity(vector, JSON.parse(row.embedding_json)),
-  })).sort((a, b) => b.score - a.score).slice(0, 5);
+  })).sort((a, b) => b.score - a.score).slice(0, 12),
+    lexicalItems=bm25Search(query,rows.map((row)=>({id:row.id,chunkIndex:row.chunk_index,content:row.content,headingPath:JSON.parse(row.heading_path||"[]")})),12),
+    items=rerankHybrid(query,reciprocalRankFusion([lexicalItems,vectorItems],8),5);
   return c.json({ items });
 });
 app.post("/api/admin/documents/batch-action", async (c) => {
@@ -1708,10 +1735,34 @@ async function currentAdmin(request: Request, env: Env) {
     .first<{ id: string; email: string }>();
 }
 
+async function syncOperationalAlert(env:Env,input:{fingerprint:string;active:boolean;kind:string;severity:"warning"|"error"|"critical";title:string;message:string;metric?:number;threshold?:number}){const now=new Date().toISOString();if(!input.active){await env.DB.prepare("UPDATE operational_alerts SET status='resolved',resolved_at=?,last_seen_at=? WHERE fingerprint=? AND status!='resolved'").bind(now,now,input.fingerprint).run();return}await env.DB.prepare("INSERT INTO operational_alerts (id,fingerprint,kind,severity,title,message,status,metric_value,threshold_value,first_seen_at,last_seen_at) VALUES (?,?,?,?,?,?,'open',?,?,?,?) ON CONFLICT(fingerprint) DO UPDATE SET kind=excluded.kind,severity=excluded.severity,title=excluded.title,message=excluded.message,metric_value=excluded.metric_value,threshold_value=excluded.threshold_value,last_seen_at=excluded.last_seen_at,status=CASE WHEN operational_alerts.status='resolved' THEN 'open' ELSE operational_alerts.status END,resolved_at=NULL").bind(crypto.randomUUID(),input.fingerprint,input.kind,input.severity,input.title,input.message,input.metric??null,input.threshold??null,now,now).run()}
+
+async function evaluateOperationalAlerts(env:Env){const setting=await env.DB.prepare("SELECT value FROM settings WHERE key='observability_config'").first<{value:string}>(),config={errorRateThreshold:20,minimumRequests:5,stuckMinutes:15,budgetWarningPercent:80,slowRequestMs:12000,...(setting?.value?JSON.parse(setting.value):{})},[usage,stuck,queue,budgets,turnstile]=await Promise.all([
+  env.DB.prepare("SELECT COUNT(*) total,SUM(CASE WHEN status!='success' THEN 1 ELSE 0 END) errors FROM usage_events WHERE created_at>=datetime('now','-15 minutes')").first<{total:number;errors:number}>(),
+  env.DB.prepare("SELECT COUNT(*) count FROM documents WHERE status IN ('parsing','embedding') AND updated_at<datetime('now',?)").bind(`-${config.stuckMinutes} minutes`).first<{count:number}>(),
+  env.DB.prepare("SELECT COUNT(*) count FROM queue_job_runs WHERE status IN ('retrying','dead_letter_risk') OR (status='processing' AND heartbeat_at<datetime('now',?))").bind(`-${config.stuckMinutes} minutes`).first<{count:number}>(),
+  env.DB.prepare("SELECT providers.id,providers.name,providers.monthly_budget_micros,COALESCE(SUM(usage_events.cost_micros),0) spent FROM providers LEFT JOIN usage_events ON usage_events.provider_id=providers.id AND usage_events.created_at>=datetime('now','start of month') GROUP BY providers.id").all<{id:string;name:string;monthly_budget_micros:number;spent:number}>(),
+  env.DB.prepare("SELECT COUNT(*) total,SUM(CASE WHEN event_type='turnstile_fail' THEN 1 ELSE 0 END) failed FROM observability_events WHERE event_type IN ('turnstile_pass','turnstile_fail') AND created_at>=datetime('now','-15 minutes')").first<{total:number;failed:number}>(),
+]);const errorRate=(usage?.total??0)>0?((usage?.errors??0)/(usage?.total??1))*100:0,turnstileRate=(turnstile?.total??0)>0?((turnstile?.failed??0)/(turnstile?.total??1))*100:0;await Promise.all([
+  syncOperationalAlert(env,{fingerprint:"usage_error_rate",active:(usage?.total??0)>=config.minimumRequests&&errorRate>=config.errorRateThreshold,kind:"error_rate",severity:"error",title:"模型调用错误率升高",message:`最近 15 分钟错误率 ${errorRate.toFixed(1)}%`,metric:errorRate,threshold:config.errorRateThreshold}),
+  syncOperationalAlert(env,{fingerprint:"stuck_documents",active:(stuck?.count??0)>0,kind:"stuck",severity:"critical",title:"文档处理可能卡死",message:`${stuck?.count??0} 个任务超过 ${config.stuckMinutes} 分钟未推进`,metric:stuck?.count??0,threshold:1}),
+  syncOperationalAlert(env,{fingerprint:"queue_retry_risk",active:(queue?.count??0)>0,kind:"dead_letter",severity:"critical",title:"Queue 重试或死信风险",message:`${queue?.count??0} 个 Queue 任务正在重试或心跳超时`,metric:queue?.count??0,threshold:1}),
+  syncOperationalAlert(env,{fingerprint:"turnstile_failure_rate",active:(turnstile?.total??0)>=10&&turnstileRate>=50,kind:"security",severity:"warning",title:"人机验证失败率异常",message:`最近 15 分钟 Turnstile 失败率 ${turnstileRate.toFixed(1)}%`,metric:turnstileRate,threshold:50}),
+  ...budgets.results.map((provider)=>{const percent=provider.monthly_budget_micros>0?provider.spent/provider.monthly_budget_micros*100:0;return syncOperationalAlert(env,{fingerprint:`budget:${provider.id}`,active:provider.monthly_budget_micros>0&&percent>=config.budgetWarningPercent,kind:"budget",severity:percent>=100?"critical":"warning",title:`${provider.name} 预算预警`,message:`本月预算已使用 ${percent.toFixed(1)}%`,metric:percent,threshold:config.budgetWarningPercent})}),
+]);}
+
+async function updateQueueRun(env:Env,input:{id:string;documentId:string;status:string;attempt:number;traceId:string;startedAt:string;error?:string}){const now=new Date().toISOString();await env.DB.prepare("INSERT INTO queue_job_runs (id,document_id,status,attempt,trace_id,error_message,started_at,heartbeat_at,completed_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,attempt=excluded.attempt,error_message=excluded.error_message,heartbeat_at=excluded.heartbeat_at,completed_at=excluded.completed_at").bind(input.id,input.documentId,input.status,input.attempt,input.traceId,input.error??null,input.startedAt,now,input.status==='completed'?now:null).run()}
+
 async function consume(batch: MessageBatch<Job>, env: Env) {
   for (const message of batch.messages) {
     const job = message.body;
+    const attempt=(message as Message<Job>&{attempts?:number}).attempts??1,
+      runId=`${job.documentId}:${attempt}`,
+      traceId=crypto.randomUUID(),
+      startedAt=new Date().toISOString();
     try {
+      await updateQueueRun(env,{id:runId,documentId:job.documentId,status:"processing",attempt,traceId,startedAt});
+      await recordAdminTelemetry(env,{eventType:"queue_started",scenario:"ingestion",traceId,detail:{documentId:job.documentId,attempt}});
       await env.DB.prepare(
         "UPDATE documents SET status='parsing',ingestion_progress=35, updated_at=? WHERE id=?",
       )
@@ -1734,6 +1785,7 @@ async function consume(batch: MessageBatch<Job>, env: Env) {
           )
             .bind(new Date().toISOString(), job.documentId)
             .run();
+          await updateQueueRun(env,{id:runId,documentId:job.documentId,status:"completed",attempt,traceId,startedAt});
           message.ack();
           continue;
         }
@@ -1747,6 +1799,7 @@ async function consume(batch: MessageBatch<Job>, env: Env) {
         await env.DB.prepare(
           "UPDATE documents SET status='archived',ingestion_progress=100,updated_at=? WHERE id=?",
         ).bind(new Date().toISOString(), job.documentId).run();
+        await updateQueueRun(env,{id:runId,documentId:job.documentId,status:"completed",attempt,traceId,startedAt});
         message.ack();
         continue;
       }
@@ -1790,6 +1843,7 @@ async function consume(batch: MessageBatch<Job>, env: Env) {
         embedding_mode: string;
       }>();
       if (provider?.embedding_mode === "provider" && chunks.length) {
+        await updateQueueRun(env,{id:runId,documentId:job.documentId,status:"processing",attempt,traceId,startedAt});
         await env.DB.prepare(
           "UPDATE documents SET status='embedding',ingestion_progress=75,updated_at=? WHERE id=?",
         )
@@ -1849,17 +1903,23 @@ async function consume(batch: MessageBatch<Job>, env: Env) {
       )
         .bind(text, chunks.length, new Date().toISOString(), job.documentId)
         .run();
+      await updateQueueRun(env,{id:runId,documentId:job.documentId,status:"completed",attempt,traceId,startedAt});
+      await recordAdminTelemetry(env,{eventType:"queue_completed",scenario:"ingestion",traceId,durationMs:Date.now()-new Date(startedAt).getTime(),detail:{documentId:job.documentId,chunks:chunks.length,attempt}});
       message.ack();
     } catch (error) {
+      const messageText=error instanceof Error?error.message:"Unknown error",
+        queueStatus=attempt>=3?"dead_letter_risk":"retrying";
       await env.DB.prepare(
         "UPDATE documents SET status='failed',ingestion_progress=100, error_message=?, updated_at=? WHERE id=?",
       )
         .bind(
-          error instanceof Error ? error.message : "Unknown error",
+          messageText,
           new Date().toISOString(),
           job.documentId,
         )
         .run();
+      await updateQueueRun(env,{id:runId,documentId:job.documentId,status:queueStatus,attempt,traceId,startedAt,error:messageText});
+      await recordAdminTelemetry(env,{eventType:"queue_failed",severity:attempt>=3?"critical":"error",scenario:"ingestion",traceId,durationMs:Date.now()-new Date(startedAt).getTime(),detail:{documentId:job.documentId,attempt,error:messageText}});
       message.retry();
     }
   }
@@ -1934,7 +1994,7 @@ export default {
   queue: consume,
   scheduled: (_controller: ScheduledController, env: Env, ctx: ExecutionContext) => {
     ctx.waitUntil(
-      Promise.all([publishScheduledArticles(env), repairDocumentMetadata(env)]),
+      Promise.all([publishScheduledArticles(env), repairDocumentMetadata(env),evaluateOperationalAlerts(env)]),
     );
   },
 };

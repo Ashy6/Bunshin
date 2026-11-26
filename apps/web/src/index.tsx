@@ -4,9 +4,12 @@ import { chatRequestSchema } from "@ai-bunshin/validation";
 import { decryptSecret, type EncryptedSecret } from "@ai-bunshin/crypto";
 import { createEmbedding, streamChat } from "@ai-bunshin/ai";
 import {
+  bm25Search,
   buildGroundedPrompt,
   cosineSimilarity,
   createLocalEmbedding,
+  reciprocalRankFusion,
+  rerankHybrid,
 } from "@ai-bunshin/rag";
 
 type Bindings = {
@@ -17,8 +20,12 @@ type Bindings = {
   ASSETS: Fetcher;
   PUBLIC_ORIGIN?: string;
   MASTER_ENCRYPTION_KEY: string;
+  TURNSTILE_SITE_KEY?: string;
+  TURNSTILE_SECRET_KEY?: string;
 };
 const app = new Hono<{ Bindings: Bindings }>();
+async function recordTelemetry(env:Bindings,event:{eventType:string;severity?:"info"|"warning"|"error"|"critical";route?:string;scenario?:string;durationMs?:number;statusCode?:number;traceId?:string;detail?:Record<string,unknown>}){const traceId=event.traceId??crypto.randomUUID();try{await env.DB.prepare("INSERT INTO observability_events (id,service,event_type,severity,route,scenario,duration_ms,status_code,trace_id,detail_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(),"web",event.eventType,event.severity??"info",event.route??null,event.scenario??null,event.durationMs??0,event.statusCode??0,traceId,JSON.stringify(event.detail??{}),new Date().toISOString()).run()}catch(error){console.error(JSON.stringify({level:"error",event:"telemetry_write_failed",traceId,message:error instanceof Error?error.message:String(error)}))}return traceId}
+async function verifyTurnstile(env:Bindings,token:string|undefined,request:Request){if(!env.TURNSTILE_SECRET_KEY)return{success:true,disabled:true};if(!token)return{success:false,error:"请先完成人机验证"};const body=new FormData();body.set("secret",env.TURNSTILE_SECRET_KEY);body.set("response",token);body.set("remoteip",request.headers.get("CF-Connecting-IP")??"");body.set("idempotency_key",crypto.randomUUID());try{const response=await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify",{method:"POST",body,signal:AbortSignal.timeout(5000)}),result=await response.json() as{success:boolean;action?:string;hostname?:string;[key:string]:unknown};return{success:response.ok&&result.success&&(result.action==null||result.action==="chat"),detail:{hostname:result.hostname,action:result.action}}}catch{return{success:false,error:"人机验证服务暂时不可用，请刷新后重试"}}}
 type AgentConfig = {
   enabled: boolean;
   dailyLimit: number;
@@ -70,7 +77,9 @@ async function publicOrigin(env: Bindings, requestUrl: string) {
   ).replace(/\/$/, "");
 }
 app.use("*", async (c, next) => {
+  const started=Date.now(),traceId=c.req.header("cf-ray")??crypto.randomUUID();
   await next();
+  if(c.req.path.startsWith("/api/")){const durationMs=Date.now()-started,statusCode=c.res.status,severity=statusCode>=500?"error":statusCode>=400?"warning":"info";c.executionCtx.waitUntil(recordTelemetry(c.env,{eventType:"http_request",severity,route:c.req.path,durationMs,statusCode,traceId,detail:{method:c.req.method,colo:c.req.header("cf-ray")?.split("-")[1]??null}}));c.header("X-Trace-Id",traceId)}
   if (
     c.req.method === "GET" &&
     !c.req.path.startsWith("/api/") &&
@@ -448,6 +457,11 @@ function layout(
         </script>
       </head>
       <body>
+        <svg class="ambient-scene" aria-hidden="true" viewBox="0 0 1440 900" preserveAspectRatio="xMidYMid slice">
+          <defs><filter id="ambient-blur"><feGaussianBlur stdDeviation="70" /></filter><linearGradient id="ambient-line" x1="0" x2="1"><stop stop-color="var(--accent)" stop-opacity="0"/><stop offset=".5" stop-color="var(--accent)" stop-opacity=".22"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs>
+          <g class="ambient-blobs" filter="url(#ambient-blur)"><circle cx="260" cy="190" r="180"/><circle cx="1180" cy="260" r="220"/><circle cx="800" cy="820" r="250"/></g>
+          <g class="ambient-waves"><path d="M-80 620 C260 480 420 780 760 620 S1260 470 1520 650"/><path d="M-80 690 C260 550 480 820 780 690 S1240 560 1520 720"/></g>
+        </svg>
         <header class="desktop-header">
           <a class="desktop-brand" href="/">
             <img src="/avatar" alt="" style=${`object-position:${profile?.avatar_position_x ?? 50}% ${profile?.avatar_position_y ?? 50}%`} />
@@ -512,6 +526,7 @@ app.get("/", async (c) => {
             ></textarea
             ><button type="submit" aria-label="发送">↑</button>
           </form>
+          <div id="turnstile-container" class="turnstile-container" hidden><span>正在加载访客验证…</span></div>
           <div class="agent-meta">
             <span id="agent-status">正在读取 Agent 状态…</span
             ><span id="agent-quota"></span>
@@ -687,7 +702,7 @@ app.get("/about", async (c) => {
           ? html`<p class="lead">${profile.headline}</p>`
           : ""}
         ${profile?.bio ? html`<p class="profile-summary">${profile.bio}</p>` : ""}
-        ${(profile?.location || profile?.public_email || profile?.website_url || Object.values(social).some(Boolean)) ? html`<div class="profile-facts">${profile?.location ? html`<span>⌖ ${profile.location}</span>` : ""}${profile?.public_email ? html`<a href=${`mailto:${profile.public_email}`}>邮箱</a>` : ""}${profile?.website_url ? html`<a href=${profile.website_url} rel="noreferrer">个人网站</a>` : ""}${Object.entries(social).filter(([, value]) => value).map(([label, value]) => html`<a href=${value} rel="noreferrer">${label}</a>`)}</div>` : ""}
+        ${(profile?.location || profile?.public_email || profile?.website_url || Object.values(social).some(Boolean)) ? html`<div class="profile-facts">${profile?.location ? html`<span><small>所在地</small><strong>${profile.location}</strong></span>` : ""}${profile?.public_email ? html`<a href=${`mailto:${profile.public_email}`}><small>邮箱</small><strong>${profile.public_email}</strong></a>` : ""}${profile?.website_url ? html`<a href=${profile.website_url} rel="noreferrer" target="_blank"><small>个人网站</small><strong>${profile.website_url.replace(/^https?:\/\//, "").replace(/\/$/, "")}</strong></a>` : ""}${Object.entries(social).filter(([, value]) => value).map(([label, value]) => {const names:Record<string,string>={github:"GitHub",linkedin:"LinkedIn",x:"X / Twitter",zhihu:"知乎"};return html`<a href=${value} rel="noreferrer" target="_blank"><small>${names[label.toLowerCase()]||label}</small><strong>${value.replace(/^https?:\/\//, "").replace(/\/$/, "")}</strong></a>`})}</div>` : ""}
         ${profile?.markdown_bio
           ? html`<div class="rich-content">${renderSafeMarkdown(profile.markdown_bio)}</div>`
           : html`<p>个人资料尚未完善。</p>`}
@@ -757,6 +772,10 @@ app.get("/api/agent/status", async (c) => {
       remaining: Math.max(0, config.dailyLimit - (usage?.count ?? 0)),
       dailyLimit: config.dailyLimit,
       welcomeMessage: config.welcomeMessage,
+      turnstile: {
+        enabled: Boolean(c.env.TURNSTILE_SITE_KEY && c.env.TURNSTILE_SECRET_KEY),
+        siteKey: c.env.TURNSTILE_SITE_KEY || null,
+      },
       reasonCode: !config.enabled
         ? "disabled_by_owner"
         : !provider
@@ -789,6 +808,9 @@ app.post("/api/chat", async (c) => {
     await c.req.json().catch(() => null),
   );
   if (!parsed.success) return c.json({ error: "问题格式不正确" }, 400);
+  const turnstileStarted=Date.now(),turnstile=await verifyTurnstile(c.env,parsed.data.turnstileToken,c.req.raw);
+  c.executionCtx.waitUntil(recordTelemetry(c.env,{eventType:turnstile.success?"turnstile_pass":"turnstile_fail",severity:turnstile.success?"info":"warning",route:"/api/chat",scenario:"security",durationMs:Date.now()-turnstileStarted,statusCode:turnstile.success?200:403,detail:"detail" in turnstile?turnstile.detail:{}}));
+  if(!turnstile.success)return c.json({error:"error" in turnstile?turnstile.error:"人机验证未通过"},403);
   const question = parsed.data.message,
     config = await agentConfig(c.env),
     visitor = await visitorIdentity(c.req.raw, c.env);
@@ -831,38 +853,31 @@ app.post("/api/chat", async (c) => {
       JSON.parse(provider.encrypted_api_key) as EncryptedSecret,
       c.env.MASTER_ENCRYPTION_KEY,
     );
-  let contexts: Array<{
+  type RetrievalRow={
     id: string;
     content: string;
     title: string;
     score: number;
     source_url?: string | null;
-  }> = [];
+    embedding_json?:string|null;
+  };
+  const retrievalStarted=Date.now(),corpus=(await c.env.DB.prepare(
+    "SELECT chunks.id,chunks.content,documents.title,documents.source_url,local_vectors.embedding_json FROM chunks JOIN documents ON documents.id=chunks.document_id LEFT JOIN local_vectors ON local_vectors.chunk_id=chunks.id WHERE documents.status='indexed' AND documents.visibility!='private' ORDER BY documents.updated_at DESC LIMIT 1500",
+  ).all<Omit<RetrievalRow,"score">>()).results,
+    lexical=bm25Search(question,corpus,12);
+  let vectorRanking:Array<RetrievalRow>=[],retrievalMode="local_hybrid";
   if (provider?.embedding_mode === "provider" && apiKey) {
+    retrievalMode="provider_hybrid";
     const started = Date.now();
     const embedded = await createEmbedding(
       { baseUrl: provider.base_url, apiKey, model: provider.embedding_model },
       [question],
     );
     const matches = await c.env.VECTORIZE.query(embedded.vectors[0]!, {
-      topK: 5,
+      topK: 12,
     });
-    const ids = matches.matches.map((match) => match.id);
-    if (ids.length) {
-      const rows = (
-        await c.env.DB.prepare(
-          `SELECT chunks.id,chunks.content,documents.title,documents.source_url FROM chunks JOIN documents ON documents.id=chunks.document_id WHERE chunks.id IN (${ids.map(() => "?").join(",")}) AND documents.status='indexed' AND documents.visibility!='private'`,
-        )
-          .bind(...ids)
-          .all<{ id: string; content: string; title: string; source_url: string | null }>()
-      ).results;
-      const scores = new Map(
-        matches.matches.map((match) => [match.id, match.score]),
-      );
-      contexts = rows
-        .map((row) => ({ ...row, score: scores.get(row.id) ?? 0 }))
-        .sort((a, b) => b.score - a.score);
-    }
+    const byId=new Map(corpus.map((row)=>[row.id,row]));
+    vectorRanking=matches.matches.flatMap((match)=>{const row=byId.get(match.id);return row?[{...row,score:match.score}]:[]});
     c.executionCtx.waitUntil(
       c.env.DB.prepare(
         "INSERT INTO usage_events (id,scenario,provider_id,model,input_tokens,output_tokens,cached_tokens,cost_micros,currency,latency_ms,status,estimated,trace_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -886,30 +901,28 @@ app.post("/api/chat", async (c) => {
         .run(),
     );
   } else {
-    const rows = (
-      await c.env.DB.prepare(
-        "SELECT chunks.id,chunks.content,documents.title,documents.source_url,local_vectors.embedding_json FROM local_vectors JOIN chunks ON chunks.id=local_vectors.chunk_id JOIN documents ON documents.id=chunks.document_id WHERE documents.status='indexed' AND documents.visibility!='private' LIMIT 1000",
-      ).all<{
-        id: string;
-        content: string;
-        title: string;
-        embedding_json: string;
-        source_url: string | null;
-      }>()
-    ).results;
     const query = createLocalEmbedding(question);
-    contexts = rows
+    vectorRanking = corpus
+      .filter((row)=>row.embedding_json)
       .map((row) => ({
         ...row,
         score: cosineSimilarity(
           query,
-          JSON.parse(row.embedding_json) as number[],
+          JSON.parse(row.embedding_json!) as number[],
         ),
       }))
       .sort((a, b) => b.score - a.score)
-      .slice(0, 5)
+      .slice(0, 12)
       .filter((row) => row.score > 0);
   }
+  const fused=reciprocalRankFusion([lexical,vectorRanking],8),
+    contexts=rerankHybrid(question,fused,5) as RetrievalRow[],
+    retrievalMs=Date.now()-retrievalStarted,
+    retrievalTrace=crypto.randomUUID();
+  c.executionCtx.waitUntil(Promise.all([
+    c.env.DB.prepare("INSERT INTO rag_query_events (id,query_hash,retrieval_mode,lexical_count,vector_count,fused_count,top_score,retrieval_ms,answer_status,trace_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(),await sha256Text(question),retrievalMode,lexical.length,vectorRanking.length,contexts.length,contexts[0]?.score??0,retrievalMs,contexts.length?"matched":"no_match",retrievalTrace,new Date().toISOString()).run(),
+    recordTelemetry(c.env,{eventType:"rag_retrieval",severity:contexts.length?"info":"warning",route:"/api/chat",scenario:retrievalMode,durationMs:retrievalMs,statusCode:contexts.length?200:404,traceId:retrievalTrace,detail:{lexical:lexical.length,vector:vectorRanking.length,fused:contexts.length,topScore:contexts[0]?.score??0}}),
+  ]));
   const enc = new TextEncoder();
   const headers = {
     "Content-Type": "text/event-stream",
@@ -1050,8 +1063,12 @@ app.post("/api/chat", async (c) => {
               .run(),
           );
           controller.close();
-        } catch {
+        } catch (error) {
           await quota.release();
+          c.executionCtx.waitUntil(Promise.all([
+            c.env.DB.prepare("INSERT INTO usage_events (id,scenario,provider_id,model,input_tokens,output_tokens,cached_tokens,cost_micros,currency,latency_ms,status,estimated,visitor_hash,trace_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(),"chat",provider.id,provider.chat_model,0,0,0,0,"USD",Date.now()-chatStarted,"error",1,visitor.hash,crypto.randomUUID(),new Date().toISOString()).run(),
+            recordTelemetry(c.env,{eventType:"chat_stream_interrupted",severity:"error",route:"/api/chat",scenario:"chat",durationMs:Date.now()-chatStarted,statusCode:502,detail:{message:error instanceof Error?error.message:"stream interrupted"}}),
+          ]));
           controller.enqueue(
             enc.encode(
               `data: ${JSON.stringify({ type: "error", text: "模型响应中断" })}\n\n`,
@@ -1064,6 +1081,7 @@ app.post("/api/chat", async (c) => {
     return new Response(stream, { headers });
   } catch (error) {
     await quota.release();
+    c.executionCtx.waitUntil(recordTelemetry(c.env,{eventType:"chat_provider_error",severity:"error",route:"/api/chat",scenario:"chat",statusCode:502,detail:{message:error instanceof Error?error.message:"provider unavailable"}}));
     return new Response(
       `data: ${JSON.stringify({ type: "error", text: "模型渠道暂时不可用，请稍后重试。" })}\n\n`,
       { status: 502, headers },

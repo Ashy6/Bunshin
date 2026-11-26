@@ -444,6 +444,35 @@ export function UsageManager() {
   );
 }
 
+type ObservabilityData = {
+  hours:number;
+  requests:{total:number;errors:number;avg_duration_ms:number;slow:number};
+  usage:{total:number;errors:number;avg_latency_ms:number;cost_micros:number};
+  rag:{queries:number;avg_retrieval_ms:number;no_match:number;avg_top_score:number};
+  queue:{total:number;processing:number;retrying:number;completed:number};
+  alerts:Array<{id:string;severity:string;title:string;message:string;status:string;last_seen_at:string}>;
+  events:Array<{id:string;service:string;event_type:string;severity:string;route:string|null;duration_ms:number;status_code:number;trace_id:string;created_at:string}>;
+  budgets:Array<{id:string;name:string;monthly_budget_micros:number;spent_micros:number}>;
+  stuck:Array<{id:string;title:string;status:string;ingestion_progress:number;updated_at:string}>;
+};
+
+export function ObservabilityManager(){
+  const [hours,setHours]=useState(24),[data,setData]=useState<ObservabilityData|null>(null),[error,setError]=useState(""),[refresh,setRefresh]=useState(0);
+  useEffect(()=>{let active=true;const load=()=>fetch(`/api/admin/observability?hours=${hours}`).then((response)=>{if(!response.ok)throw new Error("读取生产监控失败");return response.json() as Promise<ObservabilityData>}).then((body)=>{if(active){setData(body);setError("")}}).catch((reason)=>active&&setError(reason instanceof Error?reason.message:"读取失败"));void load();const timer=setInterval(load,30000);return()=>{active=false;clearInterval(timer)}},[hours,refresh]);
+  const requestErrorRate=data?.requests.total?data.requests.errors/data.requests.total*100:0,modelErrorRate=data?.usage.total?data.usage.errors/data.usage.total*100:0,noMatchRate=data?.rag.queries?data.rag.no_match/data.rag.queries*100:0;
+  const acknowledge=async(id:string)=>{await fetch(`/api/admin/observability/alerts/${id}/ack`,{method:"POST"});setRefresh((value)=>value+1)};
+  return <>
+    <header className="page-head"><div><p>生产监控</p><h1>告警、错误率与卡死信号</h1></div><div className="monitor-actions"><select value={hours} onChange={(event)=>setHours(Number(event.target.value))}><option value={1}>最近 1 小时</option><option value={24}>最近 24 小时</option><option value={168}>最近 7 天</option></select><button className="secondary-button" onClick={()=>setRefresh((value)=>value+1)}>立即刷新</button></div></header>
+    {error&&<div className="notice error-text">{error}</div>}
+    <section className="stats"><article><span>HTTP 错误率</span><strong>{requestErrorRate.toFixed(1)}%</strong><small>{number(data?.requests.total)} 次请求 · {number(data?.requests.slow)} 次慢请求</small></article><article><span>模型错误率</span><strong>{modelErrorRate.toFixed(1)}%</strong><small>{number(data?.usage.avg_latency_ms)} ms 平均延迟</small></article><article><span>RAG 未命中</span><strong>{noMatchRate.toFixed(1)}%</strong><small>{number(data?.rag.avg_retrieval_ms)} ms 平均检索</small></article><article><span>队列风险</span><strong>{number(data?.queue.retrying)}</strong><small>{number(data?.queue.processing)} 处理中 · {number(data?.stuck.length)} 卡死</small></article></section>
+    <section className="monitor-grid">
+      <article className="panel monitor-alerts"><div className="panel-title"><div><h2>当前告警</h2><p>每分钟自动评估，支持人工确认</p></div><span className={`status ${data?.alerts.length?"running":"ok"}`}>{data?.alerts.length||0} 条</span></div>{data?.alerts.length?data.alerts.map((alert)=><div className={`monitor-alert ${alert.severity}`} key={alert.id}><div><strong>{alert.title}</strong><p>{alert.message}</p><small>{dateTime(alert.last_seen_at)} · {alert.status==="acknowledged"?"已确认":"待处理"}</small></div>{alert.status==="open"&&<button onClick={()=>void acknowledge(alert.id)}>确认</button>}</div>):<div className="empty-inline">当前没有活动告警。</div>}</article>
+      <article className="panel"><div className="panel-title"><div><h2>月度预算</h2><p>达到 80% 自动预警</p></div></div><div className="budget-list">{data?.budgets.length?data.budgets.map((budget)=>{const ratio=budget.monthly_budget_micros>0?Math.min(100,budget.spent_micros/budget.monthly_budget_micros*100):0;return <div key={budget.id}><span><strong>{budget.name}</strong><small>{budget.monthly_budget_micros?`${money(budget.spent_micros)} / ${money(budget.monthly_budget_micros)}`:"未设置预算"}</small></span><progress max="100" value={ratio}/></div>}):<p className="muted-copy">还没有模型渠道。</p>}</div></article>
+      <article className="panel monitor-events"><div className="panel-title"><div><h2>最近事件</h2><p>Trace ID 可关联请求、模型和 Queue</p></div></div><div className="table-scroll"><table><thead><tr><th>时间</th><th>服务 / 事件</th><th>路由</th><th>耗时</th><th>状态</th><th>Trace</th></tr></thead><tbody>{data?.events.length?data.events.map((event)=><tr key={event.id}><td>{dateTime(event.created_at)}</td><td><strong>{event.service}</strong><small>{event.event_type}</small></td><td>{event.route||"-"}</td><td>{number(event.duration_ms)} ms</td><td><span className={`status ${event.severity==="info"?"ok":event.severity==="warning"?"running":""}`}>{event.status_code||event.severity}</span></td><td><code title={event.trace_id}>{event.trace_id.slice(0,8)}…</code></td></tr>):<tr><td colSpan={6}>暂无事件。</td></tr>}</tbody></table></div></article>
+    </section>
+  </>;
+}
+
 export function SystemSettings() {
   const [config, setConfig] = useState<SystemConfig | null>(null),
     [keywords, setKeywords] = useState(""),

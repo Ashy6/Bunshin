@@ -65,6 +65,7 @@ flowchart LR
 - `/api/admin/providers/*`
 - `/api/admin/analytics/*`：真实请求、Token、费用、渠道占比和文档处理概览
 - `/api/admin/usage`：按时间、渠道、场景和状态筛选调用明细，支持分页与 CSV 导出
+- `/api/admin/observability`：HTTP/模型错误率、RAG 未命中、Queue 心跳与重试、预算和安全告警
 - `/api/admin/settings`：公开地址、默认 SEO、`llms-full.txt` 和公开缓存配置
 - `/api/admin/maintenance/*`：历史附件元数据校准等可重复执行的维护任务
 - Queue 消费者：解析、切片、Embedding、重建索引
@@ -113,8 +114,8 @@ ai-bunshin/
 ### 访客问答
 
 ```text
-问题 → 限流/安全检查 → Query Embedding → Vectorize 召回
-→ D1 回查正文与可见性 → 组装引用 → Chat 模型 → SSE
+问题 → Turnstile（配置后）/服务端限流 → BM25 + 向量双路召回
+→ RRF 融合与轻量重排 → D1 回查正文与可见性 → 组装引用 → Chat 模型 → SSE
 → 写入匿名用量事件
 ```
 
@@ -145,6 +146,7 @@ Agent 只有在“渠道测试成功 + 至少一份非私有资料完成索引 +
 - 用量明细按时间范围、模型渠道、调用场景和成功/失败状态查询，费用以 `usage_events.cost_micros` 为准；CSV 导出遵循当前筛选条件。
 - 系统设置保存在 D1 的 `system_config` 中，包含公开站 Origin、默认 SEO 描述、关键词、`llms-full.txt` 开关和公开页面缓存时间。自定义域名绑定后应立即更新公开站 Origin，保证 canonical、Sitemap、RSS 和结构化数据使用正式域名。
 - Admin Cron 除定时发布文章外，也会校准历史文档在 D1 中的文件名、大小和处理进度；后台“系统设置”可以手动触发同一维护任务。
+- “生产监控”记录脱敏的 API、RAG 与 Queue 事件，通过同一 Trace ID 关联请求；内置模型错误率、文档卡死、Queue 重试/死信、人机验证失败率和渠道预算告警。Queue 最多重试 3 次后进入 DLQ。
 
 ## 安全
 
@@ -220,9 +222,14 @@ pnpm admin:init
 wrangler secret put MASTER_ENCRYPTION_KEY
 wrangler secret put SESSION_SECRET
 wrangler secret put ADMIN_BOOTSTRAP_TOKEN
+# 可选：启用公开 Agent 人机验证时同时设置
+wrangler secret put TURNSTILE_SITE_KEY --config apps/web/wrangler.jsonc
+wrangler secret put TURNSTILE_SECRET_KEY --config apps/web/wrangler.jsonc
 ```
 
 模型 API Key 由后台录入，经 `MASTER_ENCRYPTION_KEY` 加密后保存，不需要逐个写入 Wrangler。
+
+Turnstile 只有在 Site Key 与 Secret Key 同时配置时启用。前端 Token 必须由 Web Worker 调用 Cloudflare Siteverify 校验，且每次成功或失败后都会重置；它与 D1 中默认 25 次的服务端额度是两层独立保护。`cf_clearance` 是 Cloudflare WAF/Challenge 的可选凭据，不作为业务额度身份。详细方案见 [生产监控、混合 RAG 与 Turnstile](./docs/observability-rag-turnstile.md)。
 
 ### 个人版最简配置
 
@@ -273,7 +280,7 @@ pnpm deploy:production
 
 脚本会依次检查 Cloudflare 登录和 R2、运行类型检查/测试/构建、应用远程 D1 迁移、部署两个 Worker、生成并安装生产 Secrets，最后输出一次性管理员初始化令牌。稳定密钥保存在本机被 Git 忽略的 `.deploy-secrets.json` 中；后续部署会复用，避免更换主密钥导致已保存的模型 API Key 无法解密。
 
-`0008_operations.sql` 会创建系统配置、把已有站点的默认访客额度统一为 25 次，并回填可从 D1 版本记录确定的附件元数据。部署完成后进入后台“系统设置”，填写正式公开地址并执行一次“修复历史附件元数据”，即可使用 R2 对仍缺失的数据继续校准。
+`0008_operations.sql` 会创建系统配置、把已有站点的默认访客额度统一为 25 次，并回填可从 D1 版本记录确定的附件元数据；`0009_observability_rag_security.sql` 创建生产事件、告警、Queue 运行和 RAG 检索指标。部署完成后进入后台“系统设置”，填写正式公开地址并执行一次“修复历史附件元数据”，再到“生产监控”确认运行健康。
 
 将命令返回的资源 ID 写入两个应用的 `wrangler.jsonc`，然后：
 

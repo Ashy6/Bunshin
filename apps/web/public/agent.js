@@ -35,6 +35,50 @@ const sources = document.querySelector("#answer-sources");
 let agentReady = false;
 let remainingCount = 0;
 let sending = false;
+let turnstileRequired = false;
+let turnstileToken = "";
+let turnstileWidgetId = null;
+function ensureTurnstileScript() {
+  if (document.querySelector('script[data-turnstile-script]')) return;
+  const script = document.createElement("script");
+  script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+  script.async = true;
+  script.defer = true;
+  script.dataset.turnstileScript = "true";
+  document.head.append(script);
+}
+function renderTurnstile(status, targetForm = document.querySelector("#ask-form"), retry = 0) {
+  turnstileRequired = Boolean(status?.turnstile?.enabled);
+  const container = document.querySelector("#turnstile-container");
+  if (!container || !targetForm) return;
+  if (!turnstileRequired) { container.hidden = true; turnstileToken = ""; return; }
+  container.hidden = false;
+  const button = targetForm.querySelector("button[type='submit']");
+  if (button) button.disabled = true;
+  if (!window.turnstile) {
+    ensureTurnstileScript();
+    if (retry < 40) setTimeout(() => renderTurnstile(status, targetForm, retry + 1), 150);
+    else container.textContent = "访客验证加载失败，请刷新页面重试。";
+    return;
+  }
+  container.replaceChildren();
+  turnstileWidgetId = window.turnstile.render(container, {
+    sitekey: status.turnstile.siteKey,
+    action: "chat",
+    theme: "auto",
+    appearance: "interaction-only",
+    callback(token) { turnstileToken = token; if (button) button.disabled = !agentReady || remainingCount <= 0; },
+    "expired-callback"() { turnstileToken = ""; if (button) button.disabled = true; },
+    "error-callback"() { turnstileToken = ""; container.dataset.error = "true"; return true; },
+  });
+}
+function resetTurnstile(targetForm = document.querySelector("#ask-form")) {
+  if (!turnstileRequired) return;
+  turnstileToken = "";
+  if (turnstileWidgetId != null && window.turnstile) window.turnstile.reset(turnstileWidgetId);
+  const button = targetForm?.querySelector("button[type='submit']");
+  if (button) button.disabled = true;
+}
 function escapeHtml(value) {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
@@ -105,7 +149,7 @@ function setAvailability(status) {
   if (quotaText)
     quotaText.textContent = `今日剩余 ${status.remaining}/${status.dailyLimit} 次`;
   if (submitButton)
-    submitButton.disabled = !status.ready || status.remaining <= 0;
+    submitButton.disabled = !status.ready || status.remaining <= 0 || (turnstileRequired && !turnstileToken);
   if (input) {
     input.disabled = !status.ready || status.remaining <= 0;
     input.placeholder = status.ready
@@ -115,7 +159,7 @@ function setAvailability(status) {
 }
 fetch("/api/agent/status")
   .then((response) => response.json())
-  .then(setAvailability)
+  .then((status) => { setAvailability(status); renderTurnstile(status, form); })
   .catch(() => {
     if (statusText) statusText.textContent = "Agent 状态读取失败";
   });
@@ -151,7 +195,7 @@ form?.addEventListener("submit", async (event) => {
     const response = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ message, turnstileToken: turnstileToken || undefined }),
     });
     if (!response.ok || !response.body) {
       const result = await response.json().catch(() => ({}));
@@ -196,8 +240,9 @@ form?.addEventListener("submit", async (event) => {
     answer.textContent = "网络连接中断，请稍后重新提问。";
   } finally {
     sending = false;
+    resetTurnstile(form);
     if (submitButton)
-      submitButton.disabled = !agentReady || remainingCount <= 0;
+      submitButton.disabled = !agentReady || remainingCount <= 0 || (turnstileRequired && !turnstileToken);
   }
 });
 
@@ -296,7 +341,7 @@ function applyDynamicAvailability(status, dynamicForm) {
   const dynamicQuota = document.querySelector("#agent-quota");
   if (dynamicStatus) dynamicStatus.textContent = status.ready ? "Agent 已就绪" : status.reason || "Agent 尚未就绪";
   if (dynamicQuota) dynamicQuota.textContent = `今日剩余 ${status.remaining}/${status.dailyLimit} 次`;
-  if (dynamicSubmit) dynamicSubmit.disabled = !status.ready || status.remaining <= 0;
+  if (dynamicSubmit) dynamicSubmit.disabled = !status.ready || status.remaining <= 0 || (turnstileRequired && !turnstileToken);
   if (dynamicInput) {
     dynamicInput.disabled = !status.ready || status.remaining <= 0;
     dynamicInput.placeholder = status.ready
@@ -321,7 +366,7 @@ async function submitDynamicQuestion(dynamicForm) {
     const response = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ message, turnstileToken: turnstileToken || undefined }),
     });
     if (!response.ok || !response.body) {
       const result = await response.json().catch(() => ({}));
@@ -356,7 +401,8 @@ async function submitDynamicQuestion(dynamicForm) {
     dynamicAnswer.textContent = "网络连接中断，请稍后重新提问。";
   } finally {
     sending = false;
-    if (dynamicSubmit?.isConnected) dynamicSubmit.disabled = !agentReady || remainingCount <= 0;
+    resetTurnstile(dynamicForm);
+    if (dynamicSubmit?.isConnected) dynamicSubmit.disabled = !agentReady || remainingCount <= 0 || (turnstileRequired && !turnstileToken);
   }
 }
 
@@ -368,7 +414,7 @@ function bindDynamicAgentPage() {
   sending = false;
   fetch("/api/agent/status")
     .then((response) => response.json())
-    .then((status) => applyDynamicAvailability(status, dynamicForm))
+    .then((status) => { applyDynamicAvailability(status, dynamicForm); renderTurnstile(status, dynamicForm); })
     .catch(() => {
       const dynamicStatus = document.querySelector("#agent-status");
       if (dynamicStatus) dynamicStatus.textContent = "Agent 状态读取失败";
@@ -405,3 +451,25 @@ document.addEventListener("click", (event) => {
 window.addEventListener("popstate", () => void navigateWithoutReload(location.href, false));
 history.scrollRestoration = "manual";
 syncActiveNavigation(location.pathname);
+
+if (!matchMedia("(prefers-reduced-motion: reduce)").matches) {
+  let pointerFrame = 0;
+  addEventListener("pointermove", (event) => {
+    if (pointerFrame) return;
+    pointerFrame = requestAnimationFrame(() => {
+      pointerFrame = 0;
+      const x = event.clientX / innerWidth - .5, y = event.clientY / innerHeight - .5;
+      root.style.setProperty("--pointer-shift-x", `${x * 48}px`);
+      root.style.setProperty("--pointer-shift-y", `${y * 38}px`);
+    });
+  }, { passive: true });
+  addEventListener("pointerdown", (event) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    const ripple = document.createElement("span");
+    ripple.className = "ambient-ripple";
+    ripple.style.left = `${event.clientX}px`;
+    ripple.style.top = `${event.clientY}px`;
+    document.body.append(ripple);
+    ripple.addEventListener("animationend", () => ripple.remove(), { once: true });
+  }, { passive: true });
+}

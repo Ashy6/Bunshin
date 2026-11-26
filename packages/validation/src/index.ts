@@ -2,6 +2,7 @@ import { z } from "zod";
 export const chatRequestSchema = z.object({
   message: z.string().trim().min(1).max(1000),
   conversationId: z.string().uuid().optional(),
+  turnstileToken: z.string().trim().max(2048).optional(),
 });
 export const categorySchema = z.object({
   name: z.string().trim().min(1).max(40),

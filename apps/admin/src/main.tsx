@@ -5,6 +5,7 @@ import { ProfileManager } from "./management";
 import { ArticlesManagerV2, CategoriesManager, KnowledgeManagerV2 } from "./content-management";
 import {
   DashboardOperations,
+  ObservabilityManager,
   SystemSettings,
   UsageManager,
 } from "./operations";
@@ -17,6 +18,7 @@ type View =
   | "agent"
   | "providers"
   | "usage"
+  | "observability"
   | "settings";
 const nav: Array<{ id: View; label: string; icon: string }> = [
   { id: "dashboard", label: "概览", icon: "⌂" },
@@ -27,6 +29,7 @@ const nav: Array<{ id: View; label: string; icon: string }> = [
   { id: "agent", label: "Agent 设置", icon: "◉" },
   { id: "providers", label: "模型渠道", icon: "⌘" },
   { id: "usage", label: "用量明细", icon: "⌁" },
+  { id: "observability", label: "生产监控", icon: "◫" },
   { id: "settings", label: "系统设置", icon: "⚙" },
 ];
 function maskApiKey(value: string) {
@@ -1278,6 +1281,7 @@ function Placeholder({ view }: { view: View }) {
     articles: "文章管理",
     categories: "内容分类",
     usage: "用量明细",
+    observability: "生产监控",
     settings: "系统设置",
     dashboard: "",
     knowledge: "",
@@ -1412,6 +1416,8 @@ function AdminApp({ onLogout }: { onLogout: () => void }) {
           <AgentSettings />
         ) : view === "usage" ? (
           <UsageManager />
+        ) : view === "observability" ? (
+          <ObservabilityManager />
         ) : view === "settings" ? (
           <SystemSettings />
         ) : (
