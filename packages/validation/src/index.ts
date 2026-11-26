@@ -82,6 +82,13 @@ export const agentSettingsSchema = z.object({
   welcomeMessage: z.string().trim().min(1).max(500),
   systemInstruction: z.string().trim().max(2000),
 });
+export const systemSettingsSchema = z.object({
+  publicOrigin: z.union([z.string().trim().url(), z.literal("")]),
+  defaultSeoDescription: z.string().trim().max(300),
+  seoKeywords: z.array(z.string().trim().min(1).max(40)).max(30),
+  llmsFullEnabled: z.boolean(),
+  cacheTtlSeconds: z.number().int().min(30).max(86400),
+});
 export const articleSchema = z.object({
   title: z.string().trim().min(1).max(160),
   slug: z

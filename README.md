@@ -63,7 +63,10 @@ flowchart LR
 - `/api/admin/categories/*`：分类 CRUD、门户可见性与删除前迁移
 - `/api/admin/documents/*`：上传、URL 导入、版本替换、解析进度、召回测试
 - `/api/admin/providers/*`
-- `/api/admin/analytics/*`
+- `/api/admin/analytics/*`：真实请求、Token、费用、渠道占比和文档处理概览
+- `/api/admin/usage`：按时间、渠道、场景和状态筛选调用明细，支持分页与 CSV 导出
+- `/api/admin/settings`：公开地址、默认 SEO、`llms-full.txt` 和公开缓存配置
+- `/api/admin/maintenance/*`：历史附件元数据校准等可重复执行的维护任务
 - Queue 消费者：解析、切片、Embedding、重建索引
 
 后台使用可刷新、支持浏览器前进/后退的 Hash 路由：`#/profile`、`#/articles`、`#/categories`、`#/knowledge`、`#/agent`、`#/providers`。文章新建与编辑使用全屏工作台路由；切换模块时若有尚未保存的资料会先提示确认。
@@ -135,6 +138,13 @@ Agent 只有在“渠道测试成功 + 至少一份非私有资料完成索引 +
 - 知识库支持 PDF、Markdown、TXT、直接文字和 HTTPS URL 导入；详情抽屉可查看原文、切片、处理进度、版本历史并进行检索测试，还可替换文件、重试、批量删除或上传 OCR 结果。`private` 文档不参与检索，`rag_only` 仅供 Agent，`public` 可作为公开引用来源。
 - 分类为独立资源：可设置文章/知识库/共享范围、说明、排序和门户可见性。删除有关联内容的分类时必须明确迁移到另一分类或改为未分类；公开站只展示允许出现在门户且至少有一篇已发布文章的分类。
 - 文件原名、文件大小、用途、来源 URL 和归档时间记录在 D1；原文件仍保存在私有 R2。
+
+### 运营与系统配置
+
+- 概览页全部读取 D1 真实数据，可切换最近 7、30、90 天，展示请求、Token、费用、成功率、渠道占比和最近文档任务；没有数据时展示空状态，不生成演示记录。
+- 用量明细按时间范围、模型渠道、调用场景和成功/失败状态查询，费用以 `usage_events.cost_micros` 为准；CSV 导出遵循当前筛选条件。
+- 系统设置保存在 D1 的 `system_config` 中，包含公开站 Origin、默认 SEO 描述、关键词、`llms-full.txt` 开关和公开页面缓存时间。自定义域名绑定后应立即更新公开站 Origin，保证 canonical、Sitemap、RSS 和结构化数据使用正式域名。
+- Admin Cron 除定时发布文章外，也会校准历史文档在 D1 中的文件名、大小和处理进度；后台“系统设置”可以手动触发同一维护任务。
 
 ## 安全
 
@@ -246,7 +256,7 @@ Agent 的核心身份由服务端固定：它始终是资料所有者本人的 A
 - 一个 Vectorize：`ai-bunshin-knowledge-v1`
 - 一个 Queue 和一个 DLQ
 - 一个 KV namespace
-- 一个 Admin Worker Cron Trigger（每 5 分钟处理定时文章）
+- 一个 Admin Worker Cron Trigger（每 5 分钟处理定时文章并校准附件元数据）
 
 登录后执行：
 
@@ -262,6 +272,8 @@ pnpm deploy:production
 ```
 
 脚本会依次检查 Cloudflare 登录和 R2、运行类型检查/测试/构建、应用远程 D1 迁移、部署两个 Worker、生成并安装生产 Secrets，最后输出一次性管理员初始化令牌。稳定密钥保存在本机被 Git 忽略的 `.deploy-secrets.json` 中；后续部署会复用，避免更换主密钥导致已保存的模型 API Key 无法解密。
+
+`0008_operations.sql` 会创建系统配置、把已有站点的默认访客额度统一为 25 次，并回填可从 D1 版本记录确定的附件元数据。部署完成后进入后台“系统设置”，填写正式公开地址并执行一次“修复历史附件元数据”，即可使用 R2 对仍缺失的数据继续校准。
 
 将命令返回的资源 ID 写入两个应用的 `wrangler.jsonc`，然后：
 

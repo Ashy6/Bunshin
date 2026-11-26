@@ -1,24 +1,13 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import * as echarts from "echarts/core";
-import { LineChart, PieChart } from "echarts/charts";
-import {
-  GridComponent,
-  LegendComponent,
-  TooltipComponent,
-} from "echarts/components";
-import { CanvasRenderer } from "echarts/renderers";
 import "./styles.css";
 import { ProfileManager } from "./management";
 import { ArticlesManagerV2, CategoriesManager, KnowledgeManagerV2 } from "./content-management";
-echarts.use([
-  LineChart,
-  PieChart,
-  GridComponent,
-  LegendComponent,
-  TooltipComponent,
-  CanvasRenderer,
-]);
+import {
+  DashboardOperations,
+  SystemSettings,
+  UsageManager,
+} from "./operations";
 type View =
   | "dashboard"
   | "content"
@@ -40,254 +29,12 @@ const nav: Array<{ id: View; label: string; icon: string }> = [
   { id: "usage", label: "用量明细", icon: "⌁" },
   { id: "settings", label: "系统设置", icon: "⚙" },
 ];
-const stats = [
-  { label: "本月请求", value: "1,284", delta: "+18.6%" },
-  { label: "Token 消耗", value: "2.46M", delta: "+9.2%" },
-  { label: "预估费用", value: "$4.82", delta: "预算剩余 $15.18" },
-  { label: "RAG 命中率", value: "91.7%", delta: "+2.4%" },
-];
 function maskApiKey(value: string) {
   if (!value) return "尚未输入";
   if (value.length <= 4) return "•".repeat(value.length);
   const head = value.slice(0, Math.min(4, value.length - 2));
   const tail = value.slice(-2);
   return `${head}*****${tail}`;
-}
-function Chart({ type }: { type: "line" | "pie" }) {
-  const ref = React.useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!ref.current) return;
-    const chart = echarts.init(ref.current);
-    const option =
-      type === "line"
-        ? {
-            grid: {
-              left: 12,
-              right: 18,
-              top: 52,
-              bottom: 12,
-              containLabel: true,
-            },
-            tooltip: { trigger: "axis" },
-            legend: {
-              data: ["请求", "Token"],
-              top: 8,
-              right: 8,
-              itemGap: 22,
-            },
-            xAxis: {
-              type: "category",
-              data: [
-                "11/20",
-                "11/21",
-                "11/22",
-                "11/23",
-                "11/24",
-                "11/25",
-                "11/26",
-              ],
-              axisLine: { lineStyle: { color: "#dfe3e8" } },
-              axisTick: { alignWithLabel: true },
-              axisLabel: { margin: 12, hideOverlap: true },
-            },
-            yAxis: {
-              type: "value",
-              splitLine: { lineStyle: { color: "#eef0f2" } },
-            },
-            series: [
-              {
-                name: "请求",
-                type: "line",
-                smooth: true,
-                data: [116, 142, 128, 194, 176, 221, 207],
-                itemStyle: { color: "#496d8d" },
-                areaStyle: { color: "rgba(73,109,141,.08)" },
-              },
-              {
-                name: "Token",
-                type: "line",
-                smooth: true,
-                data: [90, 128, 112, 166, 150, 198, 183],
-                itemStyle: { color: "#96a9b9" },
-              },
-            ],
-            media: [
-              {
-                query: { maxWidth: 520 },
-                option: {
-                  legend: { top: 6, left: "center", right: "auto" },
-                  grid: { left: 8, right: 8, top: 48, bottom: 8 },
-                },
-              },
-            ],
-          }
-        : {
-            tooltip: { trigger: "item" },
-            legend: { bottom: 0 },
-            series: [
-              {
-                type: "pie",
-                radius: ["48%", "72%"],
-                center: ["50%", "45%"],
-                data: [
-                  { name: "DeepSeek", value: 48 },
-                  { name: "OpenAI", value: 30 },
-                  { name: "Embedding", value: 22 },
-                ],
-                itemStyle: {
-                  borderRadius: 5,
-                  borderColor: "#fff",
-                  borderWidth: 3,
-                },
-                color: ["#496d8d", "#8aa4ba", "#c0ced9"],
-              },
-            ],
-          };
-    chart.setOption(option);
-    if (type === "line")
-      fetch("/api/admin/analytics/trends")
-        .then(
-          (r) =>
-            r.json() as Promise<{
-              items: Array<{ day: string; requests: number; tokens: number }>;
-            }>,
-        )
-        .then(({ items }) =>
-          chart.setOption({
-            xAxis: { data: items.map((i) => i.day.slice(5)) },
-            series: [
-              { name: "请求", data: items.map((i) => i.requests) },
-              { name: "Token", data: items.map((i) => i.tokens) },
-            ],
-          }),
-        );
-    const ro = new ResizeObserver(() => chart.resize());
-    ro.observe(ref.current);
-    return () => {
-      ro.disconnect();
-      chart.dispose();
-    };
-  }, [type]);
-  return <div ref={ref} className="chart" />;
-}
-function Dashboard() {
-  const [overview, setOverview] = useState({ requests: 0, tokens: 0, cost: 0 });
-  useEffect(() => {
-    fetch("/api/admin/analytics/overview")
-      .then((r) => r.json() as Promise<typeof overview>)
-      .then(setOverview);
-  }, []);
-  const liveStats = [
-    {
-      label: "本月请求",
-      value: overview.requests.toLocaleString(),
-      delta: "真实调用记录",
-    },
-    {
-      label: "Token 消耗",
-      value: overview.tokens.toLocaleString(),
-      delta: "Chat + Embedding",
-    },
-    {
-      label: "预估费用",
-      value: `$${(overview.cost / 1_000_000).toFixed(4)}`,
-      delta: "按渠道价格估算",
-    },
-    { label: "RAG 文档", value: "—", delta: "在知识库查看" },
-  ];
-  return (
-    <>
-      <header className="page-head">
-        <div>
-          <p>2026 年 11 月 26 日</p>
-          <h1>下午好，这是你的分身运行概况</h1>
-        </div>
-        <button className="primary">查看公开站点 ↗</button>
-      </header>
-      <section className="stats">
-        {liveStats.map((s) => (
-          <article key={s.label}>
-            <span>{s.label}</span>
-            <strong>{s.value}</strong>
-            <small>{s.delta}</small>
-          </article>
-        ))}
-      </section>
-      <section className="grid">
-        <article className="panel wide">
-          <div className="panel-title">
-            <div>
-              <h2>调用趋势</h2>
-              <p>最近 7 天的请求与 Token 变化</p>
-            </div>
-            <select>
-              <option>最近 7 天</option>
-              <option>最近 30 天</option>
-            </select>
-          </div>
-          <Chart type="line" />
-        </article>
-        <article className="panel">
-          <div className="panel-title">
-            <div>
-              <h2>渠道占比</h2>
-              <p>按费用统计</p>
-            </div>
-          </div>
-          <Chart type="pie" />
-        </article>
-        <article className="panel wide">
-          <div className="panel-title">
-            <div>
-              <h2>最近任务</h2>
-              <p>文档解析与向量化状态</p>
-            </div>
-            <button className="link">全部任务</button>
-          </div>
-          <table>
-            <thead>
-              <tr>
-                <th>文档</th>
-                <th>分类</th>
-                <th>状态</th>
-                <th>切片</th>
-                <th>更新时间</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td>个人简历.pdf</td>
-                <td>个人经历</td>
-                <td>
-                  <span className="status ok">已索引</span>
-                </td>
-                <td>36</td>
-                <td>5 分钟前</td>
-              </tr>
-              <tr>
-                <td>RAG 设计笔记.md</td>
-                <td>AI 与 Agent</td>
-                <td>
-                  <span className="status running">向量化中</span>
-                </td>
-                <td>18</td>
-                <td>刚刚</td>
-              </tr>
-              <tr>
-                <td>年度复盘.txt</td>
-                <td>知识积累</td>
-                <td>
-                  <span className="status">待处理</span>
-                </td>
-                <td>—</td>
-                <td>12 分钟前</td>
-              </tr>
-            </tbody>
-          </table>
-        </article>
-      </section>
-    </>
-  );
 }
 function KnowledgeLegacy() {
   const [open, setOpen] = useState(false);
@@ -1650,7 +1397,7 @@ function AdminApp({ onLogout }: { onLogout: () => void }) {
       </aside>
       <main>
         {view === "dashboard" ? (
-          <Dashboard />
+          <DashboardOperations />
         ) : view === "content" ? (
           <ProfileManager />
         ) : view === "articles" ? (
@@ -1663,6 +1410,10 @@ function AdminApp({ onLogout }: { onLogout: () => void }) {
           <Providers />
         ) : view === "agent" ? (
           <AgentSettings />
+        ) : view === "usage" ? (
+          <UsageManager />
+        ) : view === "settings" ? (
+          <SystemSettings />
         ) : (
           <Placeholder view={view} />
         )}

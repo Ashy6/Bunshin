@@ -14,6 +14,7 @@ import {
   providerSchema,
   profileSchema,
   simpleProviderSchema,
+  systemSettingsSchema,
 } from "@ai-bunshin/validation";
 import {
   clearSessionCookie,
@@ -93,6 +94,31 @@ const defaultAgentConfig = {
     "你好，我是站长的个人分身。你可以问我有关经历、项目和文章的问题。",
   systemInstruction: "请简洁、准确地依据知识库回答。",
 };
+const defaultSystemConfig = {
+  publicOrigin: "",
+  defaultSeoDescription: "个人简历、文章与 AI 分身",
+  seoKeywords: ["个人简历", "AI 分身", "RAG"],
+  llmsFullEnabled: false,
+  cacheTtlSeconds: 300,
+};
+function boundedInteger(
+  value: string | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+) {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
+}
+function parseSystemConfig(value?: string | null) {
+  try {
+    return value
+      ? { ...defaultSystemConfig, ...JSON.parse(value) }
+      : defaultSystemConfig;
+  } catch {
+    return defaultSystemConfig;
+  }
+}
 function providerErrorMessage(error: unknown) {
   const message = error instanceof Error ? error.message : "模型连接测试失败";
   if (message.includes("model.request") || message.includes("Missing scopes"))
@@ -443,15 +469,145 @@ app.get("/api/admin/analytics/overview", async (c) => {
   ).first();
   return c.json(row ?? { requests: 0, tokens: 0, cost: 0 });
 });
-app.get("/api/admin/analytics/trends", async (c) =>
-  c.json({
+app.get("/api/admin/analytics/trends", async (c) => {
+  const days = boundedInteger(c.req.query("days"), 7, 1, 90),
+    modifier = `-${days - 1} days`;
+  return c.json({
     items: (
       await c.env.DB.prepare(
-        "SELECT substr(created_at,1,10) day,COUNT(*) requests,SUM(input_tokens+output_tokens+cached_tokens) tokens,SUM(cost_micros) cost_micros FROM usage_events WHERE created_at>=datetime('now','-30 days') GROUP BY substr(created_at,1,10) ORDER BY day",
-      ).all()
+        "SELECT substr(created_at,1,10) day,COUNT(*) requests,COALESCE(SUM(input_tokens+output_tokens+cached_tokens),0) tokens,COALESCE(SUM(cost_micros),0) cost_micros FROM usage_events WHERE created_at>=datetime('now',?,'start of day') GROUP BY substr(created_at,1,10) ORDER BY day",
+      ).bind(modifier).all()
     ).results,
-  }),
-);
+  });
+});
+app.get("/api/admin/analytics/dashboard", async (c) => {
+  const days = boundedInteger(c.req.query("days"), 7, 1, 90),
+    modifier = `-${days - 1} days`,
+    [summary, trends, providerShare, documentStats, recentDocuments] =
+      await Promise.all([
+        c.env.DB.prepare(
+          "SELECT COUNT(*) requests,COALESCE(SUM(input_tokens+output_tokens+cached_tokens),0) tokens,COALESCE(SUM(cost_micros),0) cost_micros,COALESCE(AVG(latency_ms),0) avg_latency_ms,COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END)*100.0/NULLIF(COUNT(*),0),0) success_rate FROM usage_events WHERE created_at>=datetime('now',?,'start of day')",
+        ).bind(modifier).first(),
+        c.env.DB.prepare(
+          "SELECT substr(created_at,1,10) day,COUNT(*) requests,COALESCE(SUM(input_tokens+output_tokens+cached_tokens),0) tokens FROM usage_events WHERE created_at>=datetime('now',?,'start of day') GROUP BY substr(created_at,1,10) ORDER BY day",
+        ).bind(modifier).all(),
+        c.env.DB.prepare(
+          "SELECT COALESCE(providers.name,usage_events.model,'未知渠道') name,COUNT(*) requests,COALESCE(SUM(usage_events.input_tokens+usage_events.output_tokens+usage_events.cached_tokens),0) tokens,COALESCE(SUM(usage_events.cost_micros),0) cost_micros FROM usage_events LEFT JOIN providers ON providers.id=usage_events.provider_id WHERE usage_events.created_at>=datetime('now',?,'start of day') GROUP BY COALESCE(providers.name,usage_events.model,'未知渠道') ORDER BY cost_micros DESC,requests DESC",
+        ).bind(modifier).all(),
+        c.env.DB.prepare(
+          "SELECT COUNT(*) total,SUM(CASE WHEN status='indexed' THEN 1 ELSE 0 END) ready,SUM(CASE WHEN status IN ('uploaded','parsing','embedding') THEN 1 ELSE 0 END) processing,SUM(CASE WHEN status IN ('failed','needs_ocr') THEN 1 ELSE 0 END) failed FROM documents",
+        ).first(),
+        c.env.DB.prepare(
+          "SELECT documents.id,documents.title,documents.source_type,documents.status,documents.chunk_count,documents.ingestion_progress,documents.updated_at,categories.name category_name FROM documents LEFT JOIN categories ON categories.id=documents.category_id ORDER BY documents.updated_at DESC LIMIT 6",
+        ).all(),
+      ]);
+  return c.json({
+    days,
+    summary: summary ?? {
+      requests: 0,
+      tokens: 0,
+      cost_micros: 0,
+      avg_latency_ms: 0,
+      success_rate: 0,
+    },
+    trends: trends.results,
+    providerShare: providerShare.results,
+    documents: documentStats ?? { total: 0, ready: 0, processing: 0, failed: 0 },
+    recentDocuments: recentDocuments.results,
+  });
+});
+app.get("/api/admin/usage", async (c) => {
+  const days = boundedInteger(c.req.query("days"), 30, 1, 365),
+    page = boundedInteger(c.req.query("page"), 1, 1, 100000),
+    pageSize = boundedInteger(c.req.query("pageSize"), 20, 10, 100),
+    providerId = (c.req.query("providerId") ?? "").trim(),
+    scenario = (c.req.query("scenario") ?? "").trim(),
+    status = (c.req.query("status") ?? "").trim(),
+    where = ["usage_events.created_at>=datetime('now',?,'start of day')"],
+    params: Array<string | number> = [`-${days - 1} days`];
+  if (providerId) {
+    where.push("usage_events.provider_id=?");
+    params.push(providerId);
+  }
+  if (scenario) {
+    where.push("usage_events.scenario=?");
+    params.push(scenario);
+  }
+  if (status) {
+    where.push("usage_events.status=?");
+    params.push(status);
+  }
+  const clause = where.join(" AND "),
+    [items, total, summary, providers, scenarios] = await Promise.all([
+      c.env.DB.prepare(
+        `SELECT usage_events.id,usage_events.scenario,usage_events.model,usage_events.input_tokens,usage_events.output_tokens,usage_events.cached_tokens,usage_events.cost_micros,usage_events.currency,usage_events.latency_ms,usage_events.status,usage_events.estimated,usage_events.trace_id,usage_events.created_at,providers.name provider_name FROM usage_events LEFT JOIN providers ON providers.id=usage_events.provider_id WHERE ${clause} ORDER BY usage_events.created_at DESC LIMIT ? OFFSET ?`,
+      ).bind(...params, pageSize, (page - 1) * pageSize).all(),
+      c.env.DB.prepare(
+        `SELECT COUNT(*) count FROM usage_events WHERE ${clause}`,
+      ).bind(...params).first<{ count: number }>(),
+      c.env.DB.prepare(
+        `SELECT COUNT(*) requests,COALESCE(SUM(input_tokens+output_tokens+cached_tokens),0) tokens,COALESCE(SUM(cost_micros),0) cost_micros,COALESCE(AVG(latency_ms),0) avg_latency_ms,COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END)*100.0/NULLIF(COUNT(*),0),0) success_rate FROM usage_events WHERE ${clause}`,
+      ).bind(...params).first(),
+      c.env.DB.prepare(
+        "SELECT id,name,chat_model,embedding_model FROM providers ORDER BY is_default DESC,name",
+      ).all(),
+      c.env.DB.prepare(
+        "SELECT DISTINCT scenario FROM usage_events ORDER BY scenario",
+      ).all(),
+    ]);
+  return c.json({
+    items: items.results,
+    total: total?.count ?? 0,
+    page,
+    pageSize,
+    days,
+    summary: summary ?? {
+      requests: 0,
+      tokens: 0,
+      cost_micros: 0,
+      avg_latency_ms: 0,
+      success_rate: 0,
+    },
+    providers: providers.results,
+    scenarios: scenarios.results,
+  });
+});
+app.get("/api/admin/settings", async (c) => {
+  const row = await c.env.DB.prepare(
+    "SELECT value,updated_at FROM settings WHERE key='system_config'",
+  ).first<{ value: string; updated_at: string }>();
+  return c.json({
+    config: parseSystemConfig(row?.value),
+    updatedAt: row?.updated_at ?? null,
+  });
+});
+app.put("/api/admin/settings", async (c) => {
+  const parsed = systemSettingsSchema.safeParse(
+    await c.req.json().catch(() => null),
+  );
+  if (!parsed.success)
+    return c.json({ error: parsed.error.flatten() }, 400);
+  const now = new Date().toISOString();
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      "INSERT INTO settings (key,value,updated_at) VALUES ('system_config',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+    ).bind(JSON.stringify(parsed.data), now),
+    c.env.DB.prepare(
+      "INSERT INTO settings (key,value,updated_at) VALUES ('llms_full_enabled',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+    ).bind(String(parsed.data.llmsFullEnabled), now),
+  ]);
+  await audit(c.env, c.req.raw, "settings.update", "system", "system_config", {
+    publicOrigin: parsed.data.publicOrigin,
+    llmsFullEnabled: parsed.data.llmsFullEnabled,
+    cacheTtlSeconds: parsed.data.cacheTtlSeconds,
+  });
+  return c.json({ config: parsed.data, updatedAt: now });
+});
+app.post("/api/admin/maintenance/repair-document-metadata", async (c) => {
+  const result = await repairDocumentMetadata(c.env);
+  await audit(c.env, c.req.raw, "documents.repair_metadata", "document", undefined, result);
+  return c.json(result);
+});
 app.get("/api/admin/agent", async (c) => {
   const [setting, provider, documents, today] = await Promise.all([
     c.env.DB.prepare(
@@ -1721,10 +1877,64 @@ async function publishScheduledArticles(env: Env) {
     await env.DB.prepare("UPDATE articles SET document_id=? WHERE id=?").bind(documentId, article.id).run();
   }
 }
+async function repairDocumentMetadata(env: Env) {
+  const documents = (
+    await env.DB.prepare(
+      "SELECT id,r2_key,original_name,file_size,status,ingestion_progress,current_version FROM documents WHERE r2_key IS NOT NULL AND (file_size=0 OR original_name IS NULL OR original_name='' OR (status IN ('indexed','archived','failed','needs_ocr') AND ingestion_progress!=100)) LIMIT 200",
+    ).all<{
+      id: string;
+      r2_key: string;
+      original_name: string | null;
+      file_size: number;
+      status: string;
+      ingestion_progress: number;
+      current_version: number;
+    }>()
+  ).results;
+  let repaired = 0,
+    missing = 0;
+  for (const document of documents) {
+    const [object, version] = await Promise.all([
+      env.ASSETS_BUCKET.head(document.r2_key),
+      env.DB.prepare(
+        "SELECT original_name,file_size FROM document_versions WHERE document_id=? ORDER BY version_number DESC LIMIT 1",
+      )
+        .bind(document.id)
+        .first<{ original_name: string; file_size: number }>(),
+    ]);
+    if (!object) {
+      missing += 1;
+      continue;
+    }
+    const originalName =
+        document.original_name ||
+        version?.original_name ||
+        document.r2_key.split("/").pop() ||
+        "attachment",
+      fileSize = object.size || version?.file_size || document.file_size || 0,
+      progress = ["indexed", "archived", "failed", "needs_ocr"].includes(
+        document.status,
+      )
+        ? 100
+        : document.ingestion_progress;
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE documents SET original_name=?,file_size=?,ingestion_progress=?,updated_at=updated_at WHERE id=?",
+      ).bind(originalName, fileSize, progress, document.id),
+      env.DB.prepare(
+        "UPDATE document_versions SET original_name=?,file_size=? WHERE document_id=? AND version_number=?",
+      ).bind(originalName, fileSize, document.id, document.current_version),
+    ]);
+    repaired += 1;
+  }
+  return { scanned: documents.length, repaired, missing };
+}
 export default {
   fetch: app.fetch,
   queue: consume,
   scheduled: (_controller: ScheduledController, env: Env, ctx: ExecutionContext) => {
-    ctx.waitUntil(publishScheduledArticles(env));
+    ctx.waitUntil(
+      Promise.all([publishScheduledArticles(env), repairDocumentMetadata(env)]),
+    );
   },
 };

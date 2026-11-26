@@ -36,6 +36,51 @@ const defaultAgentConfig: AgentConfig = {
     "你好，我是站长的个人分身。你可以问我有关经历、项目和文章的问题。",
   systemInstruction: "请简洁、准确地依据知识库回答。",
 };
+type SystemConfig = {
+  publicOrigin: string;
+  defaultSeoDescription: string;
+  seoKeywords: string[];
+  llmsFullEnabled: boolean;
+  cacheTtlSeconds: number;
+};
+const defaultSystemConfig: SystemConfig = {
+  publicOrigin: "",
+  defaultSeoDescription: "个人简历、文章与 AI 分身",
+  seoKeywords: ["个人简历", "AI 分身", "RAG"],
+  llmsFullEnabled: false,
+  cacheTtlSeconds: 300,
+};
+async function systemConfig(env: Bindings) {
+  const row = await env.DB.prepare(
+    "SELECT value FROM settings WHERE key='system_config'",
+  ).first<{ value: string }>();
+  if (!row) return defaultSystemConfig;
+  try {
+    return { ...defaultSystemConfig, ...JSON.parse(row.value) } as SystemConfig;
+  } catch {
+    return defaultSystemConfig;
+  }
+}
+async function publicOrigin(env: Bindings, requestUrl: string) {
+  const config = await systemConfig(env);
+  return (
+    config.publicOrigin ||
+    env.PUBLIC_ORIGIN ||
+    new URL(requestUrl).origin
+  ).replace(/\/$/, "");
+}
+app.use("*", async (c, next) => {
+  await next();
+  if (
+    c.req.method === "GET" &&
+    !c.req.path.startsWith("/api/") &&
+    c.res.status < 400 &&
+    !c.res.headers.has("Cache-Control")
+  ) {
+    const config = await systemConfig(c.env);
+    c.header("Cache-Control", `public, max-age=${config.cacheTtlSeconds}`);
+  }
+});
 async function agentConfig(env: Bindings) {
   const row = await env.DB.prepare(
     "SELECT value FROM settings WHERE key='agent_config'",
@@ -79,7 +124,7 @@ async function visitorIdentity(request: Request, env: Bindings) {
       : `bunshin_visitor=${id}; Path=/; Max-Age=31536000; Secure; HttpOnly; SameSite=Lax`,
   };
 }
-function shanghaiParts(now = new Date()) {
+export function shanghaiParts(now = new Date()) {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Shanghai",
     year: "numeric",
@@ -262,7 +307,7 @@ function formatDate(value: string | null | undefined) {
   if (!value) return "";
   return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit", timeZone: "Asia/Shanghai" }).format(new Date(value));
 }
-function articleBodyWithoutDuplicateTitle(body: string, title: string) {
+export function articleBodyWithoutDuplicateTitle(body: string, title: string) {
   const normalized = body.replaceAll("\\n", "\n");
   const [first, ...rest] = normalized.split("\n");
   return first?.trim() === `# ${title}` ? rest.join("\n").trimStart() : normalized;
@@ -302,6 +347,7 @@ function layout(
   origin = "",
   canonicalPath = "/",
   article?: PublicArticle,
+  seoKeywords: string[] = [],
 ) {
   const pageLabel =
     active === "ask"
@@ -342,6 +388,9 @@ function layout(
         <meta name="viewport" content="width=device-width,initial-scale=1" />
         <title>${title}</title>
         <meta name="description" content="${description}" />
+        ${seoKeywords.length
+          ? html`<meta name="keywords" content=${seoKeywords.join(",")} />`
+          : ""}
         <link rel="canonical" href=${canonical} />
         <meta property="og:title" content="${title}" />
         <meta property="og:description" content="${description}" />
@@ -440,7 +489,11 @@ function layout(
 }
 
 app.get("/", async (c) => {
-  const profile = await publicProfile(c.env), origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin;
+  const [profile, config, origin] = await Promise.all([
+    publicProfile(c.env),
+    systemConfig(c.env),
+    publicOrigin(c.env, c.req.url),
+  ]);
   return c.html(
     layout(
       `${profile?.display_name || "个人分身"}-AI分身`,
@@ -471,11 +524,13 @@ app.get("/", async (c) => {
             ><button>有哪些代表文章？</button>
           </div>
         </section>`,
-      profile?.bio || "基于个人简历、文章与知识积累的 AI 分身",
+      profile?.bio || config.defaultSeoDescription,
       "ask",
       profile,
       origin,
       "/",
+      undefined,
+      config.seoKeywords,
     ),
   );
 });
@@ -483,7 +538,7 @@ app.get("/", async (c) => {
 app.get("/articles", async (c) => {
   const category = c.req.query("category"),
     [articles, profile] = await Promise.all([publicArticles(c.env, category), publicProfile(c.env)]),
-    origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin;
+    origin = await publicOrigin(c.env, c.req.url);
   return c.html(
     layout(
       `文章 · ${profile?.display_name || "个人分身"}-AI分身`,
@@ -537,7 +592,7 @@ app.get("/articles/:slug", async (c) => {
     publicProfile(c.env),
   ]);
   if (!article) return c.notFound();
-  const origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin;
+  const origin = await publicOrigin(c.env, c.req.url);
   return c.html(
     layout(
       `${article.seo_title || article.title} · ${profile?.display_name || "个人分身"}-AI分身`,
@@ -566,7 +621,7 @@ app.get("/categories", async (c) => {
   const [categories, profile] = await Promise.all([
     c.env.DB.prepare("SELECT categories.id,categories.name,categories.slug,categories.description,COUNT(articles.id) article_count FROM categories JOIN articles ON articles.category_id=categories.id AND articles.status='published' WHERE categories.scope IN ('article','shared','both') AND categories.show_in_portal=1 GROUP BY categories.id HAVING COUNT(articles.id)>0 ORDER BY categories.sort_order,categories.name").all<{ id: string; name: string; slug: string; description: string; article_count: number }>(),
     publicProfile(c.env),
-  ]), origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin;
+  ]), origin = await publicOrigin(c.env, c.req.url);
   return c.html(
     layout(
       `分类 · ${profile?.display_name || "个人分身"}-AI分身`,
@@ -592,11 +647,11 @@ app.get("/categories", async (c) => {
 app.get("/categories/:slug", async (c) => {
   const category = await c.env.DB.prepare("SELECT name,slug,description FROM categories WHERE slug=? AND scope IN ('article','shared','both') AND show_in_portal=1 LIMIT 1").bind(c.req.param("slug")).first<{ name: string; slug: string; description: string }>();
   if (!category) return c.notFound();
-  const [articles, profile] = await Promise.all([publicArticles(c.env, category.slug), publicProfile(c.env)]), origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin;
+  const [articles, profile] = await Promise.all([publicArticles(c.env, category.slug), publicProfile(c.env)]), origin = await publicOrigin(c.env, c.req.url);
   return c.html(layout(`${category.name} · ${profile?.display_name || "Bunshin"}-AI分身`, html`<section class="listing article-index"><a class="back" href="/categories">← 返回分类</a><h1>${category.name}</h1>${category.description ? html`<p class="lead">${category.description}</p>` : ""}<div class="article-list">${articles.length ? articles.map((article) => html`<article><a href=${`/articles/${article.slug}`}><h3>${article.title}</h3><p>${article.excerpt}</p><div class="meta"><time>${formatDate(article.published_at || article.updated_at)}</time></div></a></article>`) : html`<p class="empty-state">这个分类还没有已发布文章。</p>`}</div></section>`, category.description || `${category.name}分类文章`, "categories", profile, origin, `/categories/${category.slug}`));
 });
 app.get("/archives", async (c) => {
-  const [articles, profile] = await Promise.all([publicArticles(c.env), publicProfile(c.env)]), origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin;
+  const [articles, profile] = await Promise.all([publicArticles(c.env), publicProfile(c.env)]), origin = await publicOrigin(c.env, c.req.url);
   return c.html(
     layout(
       `归档 · ${profile?.display_name || "个人分身"}-AI分身`,
@@ -618,7 +673,7 @@ app.get("/archives", async (c) => {
   );
 });
 app.get("/about", async (c) => {
-  const profile = await publicProfile(c.env), origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin,
+  const profile = await publicProfile(c.env), origin = await publicOrigin(c.env, c.req.url),
     social = parseJson<Record<string, string>>(profile?.social_json, {}),
     experiences = parseJson<Array<{ title: string; organization: string; period: string; summary: string }>>(profile?.experience_json, []),
     projects = parseJson<Array<{ name: string; role: string; url: string; summary: string }>>(profile?.project_json, []),
@@ -1016,8 +1071,8 @@ app.post("/api/chat", async (c) => {
   }
 });
 
-app.get("/robots.txt", (c) => {
-  const origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin;
+app.get("/robots.txt", async (c) => {
+  const origin = await publicOrigin(c.env, c.req.url);
   return c.text(`User-agent: *\nAllow: /\nDisallow: /api/\nSitemap: ${origin}/sitemap.xml\n`);
 });
 app.get("/avatar", async (c) => {
@@ -1060,14 +1115,14 @@ app.get("/api/search", async (c) => {
   return c.json({ items }, 200, { "Cache-Control": "public, max-age=30" });
 });
 app.get("/sitemap.xml", async (c) => {
-  const origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin,
+  const origin = await publicOrigin(c.env, c.req.url),
     articles = await publicArticles(c.env),
     categories = (await c.env.DB.prepare("SELECT categories.slug FROM categories WHERE categories.scope IN ('article','shared','both') AND categories.show_in_portal=1 AND EXISTS (SELECT 1 FROM articles WHERE articles.category_id=categories.id AND articles.status='published')").all<{ slug: string }>()).results,
     paths = ["/", "/articles", "/categories", "/archives", "/about", ...articles.map((a) => `/articles/${a.slug}`), ...categories.map((item) => `/categories/${item.slug}`)];
   return c.body(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${paths.map((path) => `<url><loc>${origin}${path}</loc></url>`).join("")}</urlset>`, 200, { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "public, max-age=300" });
 });
 app.get("/feed.xml", async (c) => {
-  const origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin,
+  const origin = await publicOrigin(c.env, c.req.url),
     [profile, articles] = await Promise.all([publicProfile(c.env), publicArticles(c.env)]),
     escapeXml = (value: string) => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
   return c.body(`<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>${escapeXml(profile?.display_name || "Bunshin")}-AI分身</title><link>${origin}</link><description>${escapeXml(profile?.bio || "个人文章与知识积累")}</description>${articles.map((article) => `<item><title>${escapeXml(article.title)}</title><link>${origin}/articles/${article.slug}</link><guid>${origin}/articles/${article.slug}</guid><pubDate>${new Date(article.published_at || article.updated_at).toUTCString()}</pubDate><description>${escapeXml(article.excerpt)}</description></item>`).join("")}</channel></rss>`, 200, { "Content-Type": "application/rss+xml; charset=utf-8", "Cache-Control": "public, max-age=300" });
@@ -1077,10 +1132,8 @@ app.get("/llms.txt", async (c) => {
   return c.text(`# ${name}-AI分身\n\n${profile?.bio || "个人简历、文章与 AI 分身。"}\n\n- /about: ${name}的公开个人介绍\n- /archives: 文章归档\n${articles.map((article) => `- /articles/${article.slug}: ${article.title}`).join("\n")}\n`, 200, { "Cache-Control": "public, max-age=300" });
 });
 app.get("/llms-full.txt", async (c) => {
-  const setting = await c.env.DB.prepare(
-    "SELECT value FROM settings WHERE key='llms_full_enabled'",
-  ).first<{ value: string }>();
-  if (setting?.value !== "true") return c.notFound();
+  const config = await systemConfig(c.env);
+  if (!config.llmsFullEnabled) return c.notFound();
   const [profile, articles] = await Promise.all([publicProfile(c.env), publicArticles(c.env)]),
     name = profile?.display_name || "个人分身";
   return c.text(`# ${name}-AI分身\n\n${profile?.bio || ""}\n\n${profile?.markdown_bio || ""}\n\n${articles.map((article) => `# ${article.title}\n\n${article.excerpt}\n\n${article.body.replaceAll("\\n", "\n")}`).join("\n\n---\n\n")}`, 200, {
