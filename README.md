@@ -197,6 +197,14 @@ wrangler secret put ADMIN_BOOTSTRAP_TOKEN
 
 模型 API Key 由后台录入，经 `MASTER_ENCRYPTION_KEY` 加密后保存，不需要逐个写入 Wrangler。
 
+### 个人版最简配置
+
+后台内置 OpenAI、DeepSeek、OpenRouter 与自定义 OpenAI-compatible 预设。普通使用只需选择厂商并输入一个 API Key；Base URL、推荐 Chat 模型和向量策略由系统自动选择。DeepSeek/OpenRouter 默认使用本地隐私向量，不会把简历发送给第三方 Embedding 服务。OpenAI 可选择外部 Embedding，但必须由站长显式勾选数据外传授权。
+
+个人资料的结构化字段和 Markdown 原文保存在 D1，简历、头像等原始文件保存在 R2。文本型 PDF/TXT/Markdown 经 Queue 异步解析；本地隐私模式使用 D1 向量回退，显式授权外部 Embedding 后使用版本化 Vectorize 索引。切换模型应新建索引版本并重建，不能把不同维度混入同一索引。
+
+后台用量页和 ECharts 从 `usage_events` 读取真实 Chat/Embedding 请求、Token、延迟与状态。费用只有在渠道价格可确定时才是估算值；它不等同于厂商账户真实余额。
+
 ## Cloudflare 资源初始化
 
 正式部署需要：

@@ -26,6 +26,9 @@ importers:
 
   apps/admin:
     dependencies:
+      '@ai-bunshin/ai':
+        specifier: workspace:*
+        version: link:../../packages/ai
       '@ai-bunshin/crypto':
         specifier: workspace:*
         version: link:../../packages/crypto

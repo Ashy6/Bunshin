@@ -13,6 +13,7 @@
     "admin:init": "tsx scripts/init-admin.ts"
   },
   "dependencies": {
+    "@ai-bunshin/ai": "workspace:*",
     "@ai-bunshin/crypto": "workspace:*",
     "@ai-bunshin/rag": "workspace:*",
     "@ai-bunshin/validation": "workspace:*",

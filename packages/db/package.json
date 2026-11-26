@@ -1,5 +1,5 @@
 {
   "name":"@ai-bunshin/db","version":"0.1.0","private":true,"type":"module","exports":{".":"./src/index.ts","./schema":"./src/schema.ts"},
-  "scripts":{"build":"tsc --noEmit","typecheck":"tsc --noEmit","lint":"tsc --noEmit","test":"node --test","migrate:local":"wrangler d1 migrations apply ai-bunshin-local --local --config ../../apps/admin/wrangler.jsonc","migrate:remote":"wrangler d1 migrations apply ai-bunshin --remote --config ../../apps/admin/wrangler.jsonc"},
+  "scripts":{"build":"tsc --noEmit","typecheck":"tsc --noEmit","lint":"tsc --noEmit","test":"node --test","migrate:local":"wrangler d1 migrations apply ai-bunshin --local --config ../../apps/admin/wrangler.jsonc","migrate:remote":"wrangler d1 migrations apply ai-bunshin --remote --config ../../apps/admin/wrangler.jsonc"},
   "dependencies":{"drizzle-orm":"^0.44.7"},"devDependencies":{"drizzle-kit":"^0.31.7","typescript":"^5.9.3","wrangler":"^4.50.0"}
 }

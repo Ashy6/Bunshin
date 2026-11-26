@@ -116,6 +116,23 @@ function Chart({ type }: { type: "line" | "pie" }) {
             ],
           };
     chart.setOption(option);
+    if (type === "line")
+      fetch("/api/admin/analytics/trends")
+        .then(
+          (r) =>
+            r.json() as Promise<{
+              items: Array<{ day: string; requests: number; tokens: number }>;
+            }>,
+        )
+        .then(({ items }) =>
+          chart.setOption({
+            xAxis: { data: items.map((i) => i.day.slice(5)) },
+            series: [
+              { name: "请求", data: items.map((i) => i.requests) },
+              { name: "Token", data: items.map((i) => i.tokens) },
+            ],
+          }),
+        );
     const ro = new ResizeObserver(() => chart.resize());
     ro.observe(ref.current);
     return () => {
@@ -126,6 +143,30 @@ function Chart({ type }: { type: "line" | "pie" }) {
   return <div ref={ref} className="chart" />;
 }
 function Dashboard() {
+  const [overview, setOverview] = useState({ requests: 0, tokens: 0, cost: 0 });
+  useEffect(() => {
+    fetch("/api/admin/analytics/overview")
+      .then((r) => r.json() as Promise<typeof overview>)
+      .then(setOverview);
+  }, []);
+  const liveStats = [
+    {
+      label: "本月请求",
+      value: overview.requests.toLocaleString(),
+      delta: "真实调用记录",
+    },
+    {
+      label: "Token 消耗",
+      value: overview.tokens.toLocaleString(),
+      delta: "Chat + Embedding",
+    },
+    {
+      label: "预估费用",
+      value: `$${(overview.cost / 1_000_000).toFixed(4)}`,
+      delta: "按渠道价格估算",
+    },
+    { label: "RAG 文档", value: "—", delta: "在知识库查看" },
+  ];
   return (
     <>
       <header className="page-head">
@@ -136,7 +177,7 @@ function Dashboard() {
         <button className="primary">查看公开站点 ↗</button>
       </header>
       <section className="stats">
-        {stats.map((s) => (
+        {liveStats.map((s) => (
           <article key={s.label}>
             <span>{s.label}</span>
             <strong>{s.value}</strong>
@@ -350,24 +391,209 @@ function KnowledgeLegacy() {
     </>
   );
 }
-type KnowledgeDocument={id:string;title:string;source_type:string;visibility:string;status:string;chunk_count:number;error_message?:string;category_name?:string};
-type KnowledgeCategory={id:string;name:string};
+type KnowledgeDocument = {
+  id: string;
+  title: string;
+  source_type: string;
+  visibility: string;
+  status: string;
+  chunk_count: number;
+  error_message?: string;
+  category_name?: string;
+};
+type KnowledgeCategory = { id: string; name: string };
 function Knowledge() {
-  const [open,setOpen]=useState(false),[documents,setDocuments]=useState<KnowledgeDocument[]>([]),[categories,setCategories]=useState<KnowledgeCategory[]>([]),[busy,setBusy]=useState(false),[error,setError]=useState("");
-  const load=async()=>{const [docs,cats]=await Promise.all([fetch("/api/admin/documents"),fetch("/api/admin/categories")]);if(docs.status===401||cats.status===401){location.reload();return}setDocuments(((await docs.json()) as {items:KnowledgeDocument[]}).items);setCategories(((await cats.json()) as {items:KnowledgeCategory[]}).items)};
-  useEffect(()=>{void load();const timer=setInterval(()=>void load(),5000);return()=>clearInterval(timer)},[]);
-  const submit=async(event:React.FormEvent<HTMLFormElement>)=>{event.preventDefault();setBusy(true);setError("");const response=await fetch("/api/admin/documents",{method:"POST",body:new FormData(event.currentTarget)});const body=await response.json() as {error?:string};setBusy(false);if(!response.ok){setError(typeof body.error==="string"?body.error:"上传失败");return}setOpen(false);event.currentTarget.reset();await load()};
-  const statusLabel=(status:string)=>({uploaded:"等待处理",parsing:"解析中",indexed:"已索引",needs_ocr:"需要 OCR",failed:"失败"}[status]??status);
-  return <><header className="page-head"><div><p>知识库</p><h1>上传后自动解析并进入 RAG</h1></div><button className="primary" onClick={()=>setOpen(true)}>＋ 上传简历或资料</button></header><div className="notice">支持文本型 PDF、Markdown 和 TXT，最大 20 MB。扫描版 PDF 会标记为需要 OCR。</div><section className="panel"><table><thead><tr><th>名称</th><th>类型</th><th>分类</th><th>可见性</th><th>状态</th><th>切片</th></tr></thead><tbody>{documents.length===0?<tr><td colSpan={6}>还没有资料，请上传你的第一份简历。</td></tr>:documents.map(item=><tr key={item.id}><td><strong>{item.title}</strong>{item.error_message&&<small>{item.error_message}</small>}</td><td>{item.source_type.toUpperCase()}</td><td>{item.category_name??"未分类"}</td><td>{item.visibility==="public"?"公开引用":"仅供 RAG"}</td><td><span className={`status ${item.status==="indexed"?"ok":item.status==="parsing"?"running":""}`}>{statusLabel(item.status)}</span></td><td>{item.chunk_count}</td></tr>)}</tbody></table></section>{open&&<div className="modal-backdrop" onMouseDown={()=>setOpen(false)}><form className="modal" onMouseDown={e=>e.stopPropagation()} onSubmit={submit}><div className="modal-head"><h2>上传知识资料</h2><button type="button" onClick={()=>setOpen(false)}>×</button></div><label>标题<input name="title" required placeholder="例如：个人简历" /></label><label className="upload"><input name="file" required type="file" accept=".pdf,.md,.txt,application/pdf,text/plain,text/markdown"/><strong>选择 PDF / Markdown / TXT</strong><span>上传后自动解析、切片并建立索引</span></label><label>分类<select name="categoryId"><option value="">不分类</option>{categories.map(category=><option key={category.id} value={category.id}>{category.name}</option>)}</select></label><label>可见性<select name="visibility" defaultValue="rag_only"><option value="rag_only">仅供 RAG</option><option value="public">公开并允许引用</option><option value="private">私有，不参与检索</option></select></label>{error&&<div className="auth-error">{error}</div>}<div className="modal-actions"><button type="button" onClick={()=>setOpen(false)}>取消</button><button className="primary" disabled={busy}>{busy?"上传中…":"上传并建立索引"}</button></div></form></div>}</>;
+  const [open, setOpen] = useState(false),
+    [documents, setDocuments] = useState<KnowledgeDocument[]>([]),
+    [categories, setCategories] = useState<KnowledgeCategory[]>([]),
+    [busy, setBusy] = useState(false),
+    [error, setError] = useState("");
+  const load = async () => {
+    const [docs, cats] = await Promise.all([
+      fetch("/api/admin/documents"),
+      fetch("/api/admin/categories"),
+    ]);
+    if (docs.status === 401 || cats.status === 401) {
+      location.reload();
+      return;
+    }
+    setDocuments(((await docs.json()) as { items: KnowledgeDocument[] }).items);
+    setCategories(
+      ((await cats.json()) as { items: KnowledgeCategory[] }).items,
+    );
+  };
+  useEffect(() => {
+    void load();
+    const timer = setInterval(() => void load(), 5000);
+    return () => clearInterval(timer);
+  }, []);
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    const response = await fetch("/api/admin/documents", {
+      method: "POST",
+      body: new FormData(event.currentTarget),
+    });
+    const body = (await response.json()) as { error?: string };
+    setBusy(false);
+    if (!response.ok) {
+      setError(typeof body.error === "string" ? body.error : "上传失败");
+      return;
+    }
+    setOpen(false);
+    event.currentTarget.reset();
+    await load();
+  };
+  const statusLabel = (status: string) =>
+    ({
+      uploaded: "等待处理",
+      parsing: "解析中",
+      indexed: "已索引",
+      needs_ocr: "需要 OCR",
+      failed: "失败",
+    })[status] ?? status;
+  return (
+    <>
+      <header className="page-head">
+        <div>
+          <p>知识库</p>
+          <h1>上传后自动解析并进入 RAG</h1>
+        </div>
+        <button className="primary" onClick={() => setOpen(true)}>
+          ＋ 上传简历或资料
+        </button>
+      </header>
+      <div className="notice">
+        支持文本型 PDF、Markdown 和 TXT，最大 20 MB。扫描版 PDF 会标记为需要
+        OCR。
+      </div>
+      <section className="panel">
+        <table>
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>类型</th>
+              <th>分类</th>
+              <th>可见性</th>
+              <th>状态</th>
+              <th>切片</th>
+            </tr>
+          </thead>
+          <tbody>
+            {documents.length === 0 ? (
+              <tr>
+                <td colSpan={6}>还没有资料，请上传你的第一份简历。</td>
+              </tr>
+            ) : (
+              documents.map((item) => (
+                <tr key={item.id}>
+                  <td>
+                    <strong>{item.title}</strong>
+                    {item.error_message && <small>{item.error_message}</small>}
+                  </td>
+                  <td>{item.source_type.toUpperCase()}</td>
+                  <td>{item.category_name ?? "未分类"}</td>
+                  <td>
+                    {item.visibility === "public" ? "公开引用" : "仅供 RAG"}
+                  </td>
+                  <td>
+                    <span
+                      className={`status ${item.status === "indexed" ? "ok" : item.status === "parsing" ? "running" : ""}`}
+                    >
+                      {statusLabel(item.status)}
+                    </span>
+                  </td>
+                  <td>{item.chunk_count}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </section>
+      {open && (
+        <div className="modal-backdrop" onMouseDown={() => setOpen(false)}>
+          <form
+            className="modal"
+            onMouseDown={(e) => e.stopPropagation()}
+            onSubmit={submit}
+          >
+            <div className="modal-head">
+              <h2>上传知识资料</h2>
+              <button type="button" onClick={() => setOpen(false)}>
+                ×
+              </button>
+            </div>
+            <label>
+              标题
+              <input name="title" required placeholder="例如：个人简历" />
+            </label>
+            <label className="upload">
+              <input
+                name="file"
+                required
+                type="file"
+                accept=".pdf,.md,.txt,application/pdf,text/plain,text/markdown"
+              />
+              <strong>选择 PDF / Markdown / TXT</strong>
+              <span>上传后自动解析、切片并建立索引</span>
+            </label>
+            <label>
+              分类
+              <select name="categoryId">
+                <option value="">不分类</option>
+                {categories.map((category) => (
+                  <option key={category.id} value={category.id}>
+                    {category.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              可见性
+              <select name="visibility" defaultValue="rag_only">
+                <option value="rag_only">仅供 RAG</option>
+                <option value="public">公开并允许引用</option>
+                <option value="private">私有，不参与检索</option>
+              </select>
+            </label>
+            {error && <div className="auth-error">{error}</div>}
+            <div className="modal-actions">
+              <button type="button" onClick={() => setOpen(false)}>
+                取消
+              </button>
+              <button className="primary" disabled={busy}>
+                {busy ? "上传中…" : "上传并建立索引"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+    </>
+  );
 }
 
-function Providers() {
+function ProvidersLegacy() {
   const [open, setOpen] = useState(false);
   const [key, setKey] = useState("");
-  const [items, setItems] = useState<Array<{id:string;name:string;key_preview:string;chat_model:string;embedding_model:string;enabled:number}>>([]);
+  const [items, setItems] = useState<
+    Array<{
+      id: string;
+      name: string;
+      key_preview: string;
+      chat_model: string;
+      embedding_model: string;
+      enabled: number;
+    }>
+  >([]);
   const [error, setError] = useState("");
-  const load = () => fetch("/api/admin/providers").then((r)=>r.json() as Promise<{items:typeof items}>).then((r)=>setItems(r.items));
-  useEffect(()=>{void load()},[]);
+  const load = () =>
+    fetch("/api/admin/providers")
+      .then((r) => r.json() as Promise<{ items: typeof items }>)
+      .then((r) => setItems(r.items));
+  useEffect(() => {
+    void load();
+  }, []);
   return (
     <>
       <header className="page-head">
@@ -384,7 +610,30 @@ function Providers() {
         AES-256-GCM 保存。
       </div>
       <section className="provider-grid">
-        {items.map((item)=><article className="provider" key={item.id}><div><span className="provider-logo">{item.name[0]}</span><div><h2>{item.name}</h2><p>{item.key_preview}</p></div><span className="status ok">{item.enabled ? "正常" : "停用"}</span></div><dl><div><dt>Chat</dt><dd>{item.chat_model}</dd></div><div><dt>Embedding</dt><dd>{item.embedding_model}</dd></div></dl></article>)}
+        {items.map((item) => (
+          <article className="provider" key={item.id}>
+            <div>
+              <span className="provider-logo">{item.name[0]}</span>
+              <div>
+                <h2>{item.name}</h2>
+                <p>{item.key_preview}</p>
+              </div>
+              <span className="status ok">
+                {item.enabled ? "正常" : "停用"}
+              </span>
+            </div>
+            <dl>
+              <div>
+                <dt>Chat</dt>
+                <dd>{item.chat_model}</dd>
+              </div>
+              <div>
+                <dt>Embedding</dt>
+                <dd>{item.embedding_model}</dd>
+              </div>
+            </dl>
+          </article>
+        ))}
         <article className="provider add">
           <button onClick={() => setOpen(true)}>
             ＋<strong>添加任意 OpenAI-compatible 渠道</strong>
@@ -400,9 +649,24 @@ function Providers() {
             onSubmit={async (e) => {
               e.preventDefault();
               setError("");
-              const form=new FormData(e.currentTarget);
-              const response=await fetch("/api/admin/providers",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:form.get("name"),kind:"openai-compatible",baseUrl:form.get("baseUrl"),apiKey:key,chatModel:form.get("chatModel"),embeddingModel:form.get("embeddingModel"),monthlyBudgetMicros:0})});
-              if(!response.ok){setError("渠道保存失败，请检查字段");return}
+              const form = new FormData(e.currentTarget);
+              const response = await fetch("/api/admin/providers", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  name: form.get("name"),
+                  kind: "openai-compatible",
+                  baseUrl: form.get("baseUrl"),
+                  apiKey: key,
+                  chatModel: form.get("chatModel"),
+                  embeddingModel: form.get("embeddingModel"),
+                  monthlyBudgetMicros: 0,
+                }),
+              });
+              if (!response.ok) {
+                setError("渠道保存失败，请检查字段");
+                return;
+              }
               setOpen(false);
               setKey("");
               await load();
@@ -451,7 +715,11 @@ function Providers() {
               </label>
               <label>
                 Embedding 模型
-                <input name="embeddingModel" required defaultValue="local-hash-v1" />
+                <input
+                  name="embeddingModel"
+                  required
+                  defaultValue="local-hash-v1"
+                />
               </label>
             </div>
             {error && <div className="auth-error">{error}</div>}
@@ -473,6 +741,334 @@ function Providers() {
     </>
   );
 }
+function ProfileEditor() {
+  const [profile, setProfile] = useState({
+      displayName: "",
+      headline: "",
+      bio: "",
+      location: "",
+      markdownBio: "",
+      skills: "",
+      github: "",
+      published: true,
+    }),
+    [message, setMessage] = useState("");
+  useEffect(() => {
+    fetch("/api/admin/profile")
+      .then((r) => r.json() as Promise<{ profile: any }>)
+      .then(({ profile: p }) => {
+        if (p)
+          setProfile({
+            displayName: p.display_name ?? "",
+            headline: p.headline ?? "",
+            bio: p.bio ?? "",
+            location: p.location ?? "",
+            markdownBio: p.markdown_bio ?? "",
+            skills: JSON.parse(p.skills_json ?? "[]").join(", "),
+            github: JSON.parse(p.social_json ?? "{}").github ?? "",
+            published: Boolean(p.published),
+          });
+      });
+  }, []);
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setMessage("");
+    const response = await fetch("/api/admin/profile", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        displayName: profile.displayName,
+        headline: profile.headline,
+        bio: profile.bio,
+        location: profile.location || null,
+        markdownBio: profile.markdownBio,
+        skills: profile.skills
+          .split(/[,，]/)
+          .map((v) => v.trim())
+          .filter(Boolean),
+        social: { github: profile.github },
+        published: profile.published,
+      }),
+    });
+    setMessage(response.ok ? "已保存并同步到公开资料" : "保存失败");
+  };
+  const field = (key: keyof typeof profile, value: string | boolean) =>
+    setProfile((old) => ({ ...old, [key]: value }));
+  return (
+    <>
+      <header className="page-head">
+        <div>
+          <p>个人资料</p>
+          <h1>维护公开资料、Markdown 与简历</h1>
+        </div>
+      </header>
+      <form className="profile-layout" onSubmit={save}>
+        <section className="panel profile-form">
+          <h2>基本资料</h2>
+          <label>
+            显示名称
+            <input
+              value={profile.displayName}
+              onChange={(e) => field("displayName", e.target.value)}
+              required
+            />
+          </label>
+          <label>
+            职业标题
+            <input
+              value={profile.headline}
+              onChange={(e) => field("headline", e.target.value)}
+            />
+          </label>
+          <label>
+            简短介绍
+            <textarea
+              value={profile.bio}
+              onChange={(e) => field("bio", e.target.value)}
+              rows={4}
+            />
+          </label>
+          <label>
+            所在地
+            <input
+              value={profile.location}
+              onChange={(e) => field("location", e.target.value)}
+            />
+          </label>
+          <label>
+            技能标签
+            <input
+              value={profile.skills}
+              onChange={(e) => field("skills", e.target.value)}
+              placeholder="TypeScript, RAG, Cloudflare"
+            />
+          </label>
+          <label>
+            GitHub
+            <input
+              value={profile.github}
+              onChange={(e) => field("github", e.target.value)}
+              placeholder="https://github.com/..."
+            />
+          </label>
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={profile.published}
+              onChange={(e) => field("published", e.target.checked)}
+            />
+            公开展示个人资料
+          </label>
+        </section>
+        <section className="panel markdown-editor">
+          <h2>Markdown 个人介绍</h2>
+          <textarea
+            value={profile.markdownBio}
+            onChange={(e) => field("markdownBio", e.target.value)}
+            rows={22}
+            placeholder="# 关于我\n\n在这里编写工作经历、项目与个人介绍…"
+          />
+          <p>Markdown 原文存储在 D1，可用于公开页面和后续 RAG 索引。</p>
+        </section>
+        <div className="profile-actions">
+          {message && <span>{message}</span>}
+          <button className="primary">保存个人资料</button>
+        </div>
+      </form>
+      <section className="panel resume-entry">
+        <h2>个人简历</h2>
+        <p>
+          请在“知识库”上传 PDF、Markdown 或 TXT，并设置为仅供 RAG 或公开引用。
+        </p>
+      </section>
+    </>
+  );
+}
+
+type ProviderPreset = {
+  id: string;
+  name: string;
+  chatModel: string;
+  embeddingModel: string;
+  embeddingMode: string;
+};
+function Providers() {
+  const [items, setItems] = useState<
+      Array<{
+        id: string;
+        name: string;
+        key_preview: string;
+        chat_model: string;
+        embedding_model: string;
+        embedding_mode?: string;
+      }>
+    >([]),
+    [presets, setPresets] = useState<ProviderPreset[]>([]),
+    [open, setOpen] = useState(false),
+    [key, setKey] = useState(""),
+    [presetId, setPresetId] = useState("openai"),
+    [error, setError] = useState("");
+  const load = () =>
+    Promise.all([
+      fetch("/api/admin/providers").then((r) => r.json()),
+      fetch("/api/admin/provider-presets").then((r) => r.json()),
+    ]).then(([a, b]: any[]) => {
+      setItems(a.items);
+      setPresets(b.items);
+    });
+  useEffect(() => {
+    void load();
+  }, []);
+  const selected = presets.find((p) => p.id === presetId);
+  const submit = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setError("");
+    const data = new FormData(e.currentTarget),
+      response = await fetch("/api/admin/providers/simple", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          presetId,
+          apiKey: key,
+          monthlyBudgetMicros: Number(data.get("budget") || 0) * 1_000_000,
+          allowExternalEmbedding: data.get("externalEmbedding") === "on",
+          baseUrl: data.get("baseUrl") || undefined,
+          chatModel: data.get("chatModel") || undefined,
+        }),
+      });
+    if (!response.ok) {
+      setError("保存失败，请检查配置");
+      return;
+    }
+    setKey("");
+    setOpen(false);
+    await load();
+  };
+  return (
+    <>
+      <header className="page-head">
+        <div>
+          <p>模型渠道</p>
+          <h1>选择厂商，输入一个 API Key</h1>
+        </div>
+        <button className="primary" onClick={() => setOpen(true)}>
+          ＋ 配置渠道
+        </button>
+      </header>
+      <div className="notice">
+        系统自动选择推荐模型。本地向量化不会外传简历；外部向量化必须单独授权。
+      </div>
+      <section className="provider-grid">
+        {items.map((item) => (
+          <article className="provider" key={item.id}>
+            <div>
+              <span className="provider-logo">{item.name[0]}</span>
+              <div>
+                <h2>{item.name}</h2>
+                <p>{item.key_preview}</p>
+              </div>
+              <span className="status ok">正常</span>
+            </div>
+            <dl>
+              <div>
+                <dt>对话模型</dt>
+                <dd>{item.chat_model}</dd>
+              </div>
+              <div>
+                <dt>向量化</dt>
+                <dd>
+                  {item.embedding_mode === "provider"
+                    ? item.embedding_model
+                    : "本地隐私模式"}
+                </dd>
+              </div>
+            </dl>
+          </article>
+        ))}
+      </section>
+      {open && (
+        <div className="modal-backdrop" onMouseDown={() => setOpen(false)}>
+          <form
+            className="modal"
+            onSubmit={submit}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="modal-head">
+              <h2>配置模型渠道</h2>
+              <button type="button" onClick={() => setOpen(false)}>
+                ×
+              </button>
+            </div>
+            <label>
+              模型厂商
+              <select
+                value={presetId}
+                onChange={(e) => setPresetId(e.target.value)}
+              >
+                {presets.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              API Key
+              <div className="secret-field">
+                <input
+                  type="password"
+                  required
+                  value={key}
+                  onChange={(e) => setKey(e.target.value)}
+                  autoComplete="new-password"
+                />
+                <span>{key.length} 字符</span>
+              </div>
+              <small className="masked-preview">预览：{maskApiKey(key)}</small>
+            </label>
+            {presetId === "custom" && (
+              <>
+                <label>
+                  Base URL
+                  <input name="baseUrl" type="url" required />
+                </label>
+                <label>
+                  Chat 模型
+                  <input name="chatModel" required />
+                </label>
+              </>
+            )}
+            <label>
+              月度预算（USD）
+              <input
+                name="budget"
+                type="number"
+                min="0"
+                step="1"
+                defaultValue="10"
+              />
+            </label>
+            {selected?.embeddingMode === "provider" && (
+              <label className="checkbox consent">
+                <input name="externalEmbedding" type="checkbox" />
+                允许将知识片段发送给 {selected.name}{" "}
+                生成向量；不勾选则使用本地隐私模式
+              </label>
+            )}
+            {error && <div className="auth-error">{error}</div>}
+            <div className="modal-actions">
+              <button type="button" onClick={() => setOpen(false)}>
+                取消
+              </button>
+              <button className="primary">加密保存</button>
+            </div>
+          </form>
+        </div>
+      )}
+    </>
+  );
+}
+
 function Placeholder({ view }: { view: View }) {
   const labels = {
     content: "个人资料",
@@ -546,6 +1142,8 @@ function AdminApp({ onLogout }: { onLogout: () => void }) {
         <div className="mobile-title">{title}</div>
         {view === "dashboard" ? (
           <Dashboard />
+        ) : view === "content" ? (
+          <ProfileEditor />
         ) : view === "knowledge" ? (
           <Knowledge />
         ) : view === "providers" ? (
@@ -604,7 +1202,11 @@ function AuthGate() {
     try {
       result = JSON.parse(responseText) as { error?: string };
     } catch {
-      result = { error: response.ok ? undefined : `服务器返回异常（HTTP ${response.status}）` };
+      result = {
+        error: response.ok
+          ? undefined
+          : `服务器返回异常（HTTP ${response.status}）`,
+      };
     }
     if (!response.ok) {
       setError(result.error || "操作失败");
