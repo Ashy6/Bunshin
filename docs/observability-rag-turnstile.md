@@ -75,4 +75,6 @@ Site Key 本身不是秘密，但本项目仍通过 Worker 变量注入，避免
 
 ## 5. 数据保留建议
 
-当前版本保留完整运行事件，适合个人站点的低流量。长期运行时建议通过 Cron 清理 30 天前的 `observability_events`、90 天前已完成的 `queue_job_runs` 和已解决告警，同时保留聚合后的 `usage_events`。如流量明显增长，应把高频日志迁移至 Workers Analytics Engine 或 Logpush，而不是无限扩张 D1。
+当前版本保留完整运行事件，适合个人站点的低流量。系统不会在未得到站长明确授权时自动删除审计、用量或监控历史。长期运行时建议先导出或聚合，再由站长显式启用保留策略：清理 30 天前的 `observability_events`、90 天前已完成的 `queue_job_runs` 和已解决告警，同时保留聚合后的 `usage_events`。如流量明显增长，应把高频日志迁移至 Workers Analytics Engine 或 Logpush，而不是无限扩张 D1。
+
+后台登录复用 `rate_limit_buckets` 保存临时失败计数，键为来源 IP 与规范化邮箱组合后的 SHA-256。15 分钟内连续失败 8 次后拒绝继续尝试并返回 `Retry-After`；成功登录会移除该临时计数。登录失败与拦截事件只记录脱敏事件类型，不记录密码、原始邮箱或原始 IP。

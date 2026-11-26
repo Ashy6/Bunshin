@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { adminFetch } from "./api";
 
 type DocumentRow = {
   id: string; title: string; source_type: string; category_id?: string | null;
@@ -32,7 +33,7 @@ function json<T>(value: string | undefined, fallback: T): T {
   try { return value ? JSON.parse(value) as T : fallback; } catch { return fallback; }
 }
 async function api<T = Record<string, unknown>>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init), text = await response.text();
+  const response = await adminFetch(url, init), text = await response.text();
   let body: any = {};
   try { body = text ? JSON.parse(text) : {}; } catch { body = {}; }
   if (!response.ok) throw new Error(typeof body.error === "string" ? body.error : `请求失败（HTTP ${response.status}）`);

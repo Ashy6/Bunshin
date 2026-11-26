@@ -429,13 +429,44 @@ app.post("/api/admin/auth/login", async (c) => {
     .catch(() => ({}) as { email?: string; password?: string });
   if (!body.email || !body.password)
     return c.json({ error: "请输入邮箱和密码" }, 400);
+  const normalizedEmail = body.email.trim().toLowerCase(),
+    clientAddress = c.req.header("CF-Connecting-IP") ?? c.req.header("X-Forwarded-For")?.split(",")[0]?.trim() ?? "unknown",
+    loginKey = await sha256(`admin-login:${clientAddress}:${normalizedEmail}`),
+    nowIso = new Date().toISOString(),
+    attempts = await c.env.DB.prepare(
+      "SELECT count,expires_at FROM rate_limit_buckets WHERE visitor_hash=? AND bucket='admin_login' LIMIT 1",
+    ).bind(loginKey).first<{ count: number; expires_at: string }>();
+  if (attempts && attempts.expires_at > nowIso && attempts.count >= 8) {
+    c.header("Retry-After", "900");
+    await recordAdminTelemetry(c.env, {
+      eventType: "admin_login_blocked",
+      severity: "warning",
+      route: "/api/admin/auth/login",
+      statusCode: 429,
+    });
+    return c.json({ error: "登录尝试过于频繁，请 15 分钟后再试" }, 429);
+  }
   const admin = await c.env.DB.prepare(
     "SELECT id,email,password_hash FROM admin_users WHERE email=? LIMIT 1",
   )
-    .bind(body.email.toLowerCase())
+    .bind(normalizedEmail)
     .first<{ id: string; email: string; password_hash: string }>();
-  if (!admin || !(await verifyPassword(body.password, admin.password_hash)))
+  if (!admin || !(await verifyPassword(body.password, admin.password_hash))) {
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    await c.env.DB.prepare(
+      "INSERT INTO rate_limit_buckets (visitor_hash,bucket,count,expires_at,updated_at) VALUES (?,'admin_login',1,?,?) ON CONFLICT(visitor_hash,bucket) DO UPDATE SET count=CASE WHEN rate_limit_buckets.expires_at<=excluded.updated_at THEN 1 ELSE rate_limit_buckets.count+1 END,expires_at=CASE WHEN rate_limit_buckets.expires_at<=excluded.updated_at THEN excluded.expires_at ELSE rate_limit_buckets.expires_at END,updated_at=excluded.updated_at",
+    ).bind(loginKey, expiresAt, nowIso).run();
+    await recordAdminTelemetry(c.env, {
+      eventType: "admin_login_failed",
+      severity: "warning",
+      route: "/api/admin/auth/login",
+      statusCode: 401,
+    });
     return c.json({ error: "邮箱或密码错误" }, 401);
+  }
+  await c.env.DB.prepare(
+    "DELETE FROM rate_limit_buckets WHERE visitor_hash=? AND bucket='admin_login'",
+  ).bind(loginKey).run();
   const token = randomToken(),
     tokenHash = await sha256(token),
     now = new Date(),

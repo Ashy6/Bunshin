@@ -40,9 +40,9 @@
 
 - Admin 使用独立子域，例如 `admin.example.com`。
 - 会话 Cookie：`Secure`、`HttpOnly`、`SameSite=Strict`。
-- 写请求使用 Origin 校验与 CSRF Token。
-- 登录、MFA、模型测试、文件上传和删除分别限流。
-- 敏感操作要求近期重新认证：查看恢复码、更新 API Key、关闭 MFA。
+- 写请求使用同源 Origin 校验；会话 Cookie 使用 `SameSite=Strict`。当前个人版没有单独的 CSRF Token 表单流程。
+- 登录已按来源 IP 与邮箱组合哈希限流：15 分钟内连续失败 8 次后暂时阻断。访客问答另有分钟与每日额度；更细粒度的模型测试、上传和删除限流仍属于后续加固项。
+- TOTP MFA、恢复码和敏感操作近期重新认证尚未发布，不应在部署说明中视为已完成能力。
 - 文件上传检查 MIME、扩展名、大小和魔数；随机化对象 Key。
 - HTML/Markdown 渲染必须进行 allowlist 清洗，禁止任意脚本和事件属性。
 - CSP 默认禁止内联脚本；使用 nonce/hash 处理必要脚本。

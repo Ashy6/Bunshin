@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { adminFetch, watchAdminUpload } from "./api";
 
 type Category = {
   id: string; name: string; slug: string; scope: "article" | "knowledge" | "shared";
@@ -23,7 +24,7 @@ type Document = {
 };
 
 async function api<T = any>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init), raw = await response.text();
+  const response = await adminFetch(url, init), raw = await response.text();
   let body: any = {};
   try { body = raw ? JSON.parse(raw) : {}; } catch { body = {}; }
   if (!response.ok) throw new Error(typeof body.error === "string" ? body.error : `请求失败（HTTP ${response.status}）`);
@@ -34,6 +35,7 @@ function upload<T>(url: string, form: FormData, onProgress?: (value: number) => 
     const request = new XMLHttpRequest(); request.open(method, url);
     request.upload.onprogress = (event) => event.lengthComputable && onProgress?.(Math.round(event.loaded / event.total * 100));
     request.onload = () => {
+      watchAdminUpload(request);
       let body: any = {}; try { body = request.responseText ? JSON.parse(request.responseText) : {}; } catch { body = {}; }
       request.status >= 200 && request.status < 300 ? resolve(body as T) : reject(new Error(typeof body.error === "string" ? body.error : `上传失败（HTTP ${request.status}）`));
     };

@@ -1,22 +1,8 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import * as echarts from "echarts/core";
-import { LineChart, PieChart } from "echarts/charts";
-import {
-  GridComponent,
-  LegendComponent,
-  TooltipComponent,
-} from "echarts/components";
-import { CanvasRenderer } from "echarts/renderers";
+import React, { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { formatMicros, normalizeSeoKeywords, pageCount } from "./operations-utils";
+import { adminFetch } from "./api";
 
-echarts.use([
-  LineChart,
-  PieChart,
-  GridComponent,
-  LegendComponent,
-  TooltipComponent,
-  CanvasRenderer,
-]);
+const AnalyticsChart = lazy(() => import("./analytics-chart"));
 
 type Summary = {
   requests: number;
@@ -169,115 +155,6 @@ const navigateAdmin = (event: React.MouseEvent<HTMLAnchorElement>, path: string)
   location.hash = `/${path}`;
 };
 
-function AnalyticsChart({
-  kind,
-  trends = [],
-  shares = [],
-}: {
-  kind: "line" | "pie";
-  trends?: Trend[];
-  shares?: ProviderShare[];
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!ref.current) return;
-    const chart = echarts.init(ref.current),
-      option =
-        kind === "line"
-          ? {
-              animationDuration: 300,
-              grid: {
-                left: 12,
-                right: 18,
-                top: 56,
-                bottom: 16,
-                containLabel: true,
-              },
-              tooltip: { trigger: "axis" },
-              legend: {
-                data: ["请求", "Token"],
-                top: 8,
-                right: 8,
-                itemGap: 18,
-              },
-              xAxis: {
-                type: "category",
-                data: trends.map((item) => item.day.slice(5)),
-                axisLine: { lineStyle: { color: "#dfe3e8" } },
-                axisLabel: { margin: 12, hideOverlap: true },
-              },
-              yAxis: {
-                type: "value",
-                splitLine: { lineStyle: { color: "#eef0f2" } },
-              },
-              series: [
-                {
-                  name: "请求",
-                  type: "line",
-                  smooth: true,
-                  data: trends.map((item) => item.requests),
-                  itemStyle: { color: "#496d8d" },
-                  areaStyle: { color: "rgba(73,109,141,.08)" },
-                },
-                {
-                  name: "Token",
-                  type: "line",
-                  smooth: true,
-                  data: trends.map((item) => item.tokens),
-                  itemStyle: { color: "#96a9b9" },
-                },
-              ],
-              media: [
-                {
-                  query: { maxWidth: 520 },
-                  option: {
-                    legend: { top: 6, left: "center", right: "auto" },
-                    grid: { left: 6, right: 6, top: 52, bottom: 10 },
-                  },
-                },
-              ],
-            }
-          : {
-              tooltip: {
-                trigger: "item",
-                formatter: "{b}<br/>{c} 次 · {d}%",
-              },
-              legend: {
-                bottom: 0,
-                left: "center",
-                type: "scroll",
-              },
-              series: [
-                {
-                  type: "pie",
-                  radius: ["43%", "67%"],
-                  center: ["50%", "43%"],
-                  avoidLabelOverlap: true,
-                  data: shares.map((item) => ({
-                    name: item.name,
-                    value: item.requests,
-                  })),
-                  label: { show: shares.length <= 5, formatter: "{b}" },
-                  itemStyle: {
-                    borderRadius: 5,
-                    borderColor: "#fff",
-                    borderWidth: 3,
-                  },
-                  color: ["#496d8d", "#8aa4ba", "#c0ced9", "#718798"],
-                },
-              ],
-            };
-    chart.setOption(option);
-    const observer = new ResizeObserver(() => chart.resize());
-    observer.observe(ref.current);
-    return () => {
-      observer.disconnect();
-      chart.dispose();
-    };
-  }, [kind, shares, trends]);
-  return <div ref={ref} className="chart" />;
-}
-
 export function DashboardOperations() {
   const [days, setDays] = useState(7),
     [data, setData] = useState<DashboardData | null>(null),
@@ -286,11 +163,11 @@ export function DashboardOperations() {
   useEffect(() => {
     setError("");
     Promise.all([
-      fetch(`/api/admin/analytics/dashboard?days=${days}`).then((response) => {
+      adminFetch(`/api/admin/analytics/dashboard?days=${days}`).then((response) => {
         if (!response.ok) throw new Error("读取概览失败");
         return response.json() as Promise<DashboardData>;
       }),
-      fetch("/api/admin/settings")
+      adminFetch("/api/admin/settings")
         .then(
           (response) =>
             response.json() as Promise<{ config?: SystemConfig }>,
@@ -346,11 +223,11 @@ export function DashboardOperations() {
               <option value={90}>最近 90 天</option>
             </select>
           </div>
-          {data?.trends.length ? <AnalyticsChart kind="line" trends={data.trends} /> : <div className="chart-empty">暂无调用数据</div>}
+          {data?.trends.length ? <Suspense fallback={<div className="chart-empty">正在加载图表…</div>}><AnalyticsChart kind="line" trends={data.trends} /></Suspense> : <div className="chart-empty">暂无调用数据</div>}
         </article>
         <article className="panel">
           <div className="panel-title"><div><h2>渠道占比</h2><p>按真实请求次数统计</p></div></div>
-          {data?.providerShare.length ? <AnalyticsChart kind="pie" shares={data.providerShare} /> : <div className="chart-empty">暂无渠道数据</div>}
+          {data?.providerShare.length ? <Suspense fallback={<div className="chart-empty">正在加载图表…</div>}><AnalyticsChart kind="pie" shares={data.providerShare} /></Suspense> : <div className="chart-empty">暂无渠道数据</div>}
         </article>
         <article className="panel wide">
           <div className="panel-title">
@@ -397,7 +274,7 @@ export function UsageManager() {
     if (scenario) query.set("scenario", scenario);
     if (status) query.set("status", status);
     setError(""); setLoading(true);
-    fetch(`/api/admin/usage?${query}`)
+    adminFetch(`/api/admin/usage?${query}`)
       .then((response) => {
         if (!response.ok) throw new Error("读取用量明细失败");
         return response.json() as Promise<UsageData>;
@@ -509,9 +386,9 @@ type ObservabilityData = {
 
 export function ObservabilityManager(){
   const [hours,setHours]=useState(24),[data,setData]=useState<ObservabilityData|null>(null),[error,setError]=useState(""),[refresh,setRefresh]=useState(0);
-  useEffect(()=>{let active=true;const load=()=>fetch(`/api/admin/observability?hours=${hours}`).then((response)=>{if(!response.ok)throw new Error("读取生产监控失败");return response.json() as Promise<ObservabilityData>}).then((body)=>{if(active){setData(body);setError("")}}).catch((reason)=>active&&setError(reason instanceof Error?reason.message:"读取失败"));void load();const timer=setInterval(load,30000);return()=>{active=false;clearInterval(timer)}},[hours,refresh]);
+  useEffect(()=>{let active=true;const load=()=>adminFetch(`/api/admin/observability?hours=${hours}`).then((response)=>{if(!response.ok)throw new Error("读取生产监控失败");return response.json() as Promise<ObservabilityData>}).then((body)=>{if(active){setData(body);setError("")}}).catch((reason)=>active&&setError(reason instanceof Error?reason.message:"读取失败"));void load();const timer=setInterval(load,30000);return()=>{active=false;clearInterval(timer)}},[hours,refresh]);
   const requestErrorRate=data?.requests.total?data.requests.errors/data.requests.total*100:0,modelErrorRate=data?.usage.total?data.usage.errors/data.usage.total*100:0,noMatchRate=data?.rag.queries?data.rag.no_match/data.rag.queries*100:0;
-  const acknowledge=async(id:string)=>{await fetch(`/api/admin/observability/alerts/${id}/ack`,{method:"POST"});setRefresh((value)=>value+1)};
+  const acknowledge=async(id:string)=>{await adminFetch(`/api/admin/observability/alerts/${id}/ack`,{method:"POST"});setRefresh((value)=>value+1)};
   return <>
     <header className="page-head"><div><p>生产监控</p><h1>告警、错误率与卡死信号</h1></div><div className="monitor-actions"><select value={hours} onChange={(event)=>setHours(Number(event.target.value))}><option value={1}>最近 1 小时</option><option value={24}>最近 24 小时</option><option value={168}>最近 7 天</option></select><button className="secondary-button" onClick={()=>setRefresh((value)=>value+1)}>立即刷新</button></div></header>
     {error&&<div className="notice error-text">{error}</div>}
@@ -537,7 +414,7 @@ export function SystemSettings() {
   const load = async () => {
     setLoading(true);
     try {
-      const response = await fetch("/api/admin/settings");
+      const response = await adminFetch("/api/admin/settings");
       if (!response.ok) throw new Error("读取系统设置失败");
       const body = await response.json() as SystemSettingsData;
       setData(body); setConfig(body.config); setObservability(body.observability);
@@ -566,7 +443,7 @@ export function SystemSettings() {
     event.preventDefault();
     setSaving(true);
     setMessage("");
-    const response = await fetch("/api/admin/settings", {
+    const response = await adminFetch("/api/admin/settings", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ...config, seoKeywords: changedKeywords, observability }),
@@ -586,7 +463,7 @@ export function SystemSettings() {
   const repair = async () => {
     setRepairing(true);
     setMessage("");
-    const response = await fetch("/api/admin/maintenance/repair-document-metadata", { method: "POST" }),
+    const response = await adminFetch("/api/admin/maintenance/repair-document-metadata", { method: "POST" }),
       body = await response.json() as { scanned?: number; repaired?: number; missing?: number };
     setRepairing(false);
     setMessage(response.ok ? `扫描 ${body.scanned || 0} 份资料，修复 ${body.repaired || 0} 份，缺失 ${body.missing || 0} 份` : "附件元数据修复失败");

@@ -147,6 +147,7 @@ Agent 只有在“渠道测试成功 + 至少一份非私有资料完成索引 +
 - 系统设置保存在 D1 的 `system_config` 与 `observability_config` 中，包含公开站 Origin、默认 SEO 描述、关键词、`llms-full.txt` 开关、公开页面缓存时间，以及错误率、最少采样数、慢请求、卡死任务和预算告警阈值。页面同时汇总个人资料、模型渠道、知识索引和文章发布状态，并展示真实 SEO 入口与最近审计记录。自定义域名绑定后应立即更新公开站 Origin，保证 canonical、Sitemap、RSS 和结构化数据使用正式域名。
 - Admin Cron 除定时发布文章外，也会校准历史文档在 D1 中的文件名、大小和处理进度；后台“系统设置”可以手动触发同一维护任务。超过 1 分钟仍停在 `uploaded` 的资料会由 Cron 重新投递 Queue，避免首次投递遇到瞬时故障后永久卡住。
 - “生产监控”记录脱敏的 API、RAG 与 Queue 事件，通过同一 Trace ID 关联请求；内置模型错误率、慢请求、文档卡死、Queue 重试/死信、人机验证失败率和渠道预算告警。慢请求、卡死时长、错误率和预算阈值均读取 D1 中的当前系统设置，Admin Cron 每 5 分钟评估，打开监控页时也会立即评估。监控页自身的轮询不会计入请求量，避免污染错误率。Queue 最多重试 3 次后进入 DLQ。
+- 后台按路由加载个人资料、内容管理和运营模块，ECharts 仅在概览存在图表数据时下载；会话失效时所有管理请求统一返回登录页，避免页面停留在“读取失败”的伪登录状态。
 
 ## 安全
 
@@ -154,7 +155,8 @@ Agent 只有在“渠道测试成功 + 至少一份非私有资料完成索引 +
 - D1/R2 采用 Cloudflare 静态加密；Provider API Key 再使用 AES-256-GCM 应用层加密。
 - `MASTER_ENCRYPTION_KEY` 只放 Worker Secret。
 - 管理员密码使用强密码哈希，Session Cookie 使用 `Secure`、`HttpOnly`、`SameSite=Strict`。
-- 后台写请求执行 Origin/CSRF 校验。
+- 后台登录按“来源 IP + 规范化邮箱”的不可逆哈希计数；15 分钟内连续失败 8 次后返回 `429`，成功登录后清除该临时计数。原始 IP 和邮箱不会写入限流表或监控详情。
+- 后台写请求执行同源 Origin 校验，并配合 `SameSite=Strict` 会话 Cookie 防止跨站提交。
 - 后台左下角账号区只展示当前资料中的头像、姓名和无背景的“退出登录”入口；退出时会删除当前服务端 Session 并清除 Cookie。
 - 日志不记录 API Key、Cookie、Authorization、完整 prompt 或私密原文。
 - 访客 IP 仅与随机访客 ID、服务端 Secret 组合生成匿名 SHA-256 哈希，用于限流和统计。

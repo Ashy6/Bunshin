@@ -1,14 +1,16 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
-import { ProfileManager } from "./management";
-import { ArticlesManagerV2, CategoriesManager, KnowledgeManagerV2 } from "./content-management";
-import {
-  DashboardOperations,
-  ObservabilityManager,
-  SystemSettings,
-  UsageManager,
-} from "./operations";
+import { adminFetch } from "./api";
+
+const ProfileManager = lazy(() => import("./management").then((module) => ({ default: module.ProfileManager })));
+const ArticlesManagerV2 = lazy(() => import("./content-management").then((module) => ({ default: module.ArticlesManagerV2 })));
+const CategoriesManager = lazy(() => import("./content-management").then((module) => ({ default: module.CategoriesManager })));
+const KnowledgeManagerV2 = lazy(() => import("./content-management").then((module) => ({ default: module.KnowledgeManagerV2 })));
+const DashboardOperations = lazy(() => import("./operations").then((module) => ({ default: module.DashboardOperations })));
+const ObservabilityManager = lazy(() => import("./operations").then((module) => ({ default: module.ObservabilityManager })));
+const SystemSettings = lazy(() => import("./operations").then((module) => ({ default: module.SystemSettings })));
+const UsageManager = lazy(() => import("./operations").then((module) => ({ default: module.UsageManager })));
 type View =
   | "dashboard"
   | "content"
@@ -199,8 +201,8 @@ function Knowledge() {
     [error, setError] = useState("");
   const load = async () => {
     const [docs, cats] = await Promise.all([
-      fetch("/api/admin/documents"),
-      fetch("/api/admin/categories"),
+      adminFetch("/api/admin/documents"),
+      adminFetch("/api/admin/categories"),
     ]);
     if (docs.status === 401 || cats.status === 401) {
       location.reload();
@@ -220,7 +222,7 @@ function Knowledge() {
     event.preventDefault();
     setBusy(true);
     setError("");
-    const response = await fetch("/api/admin/documents", {
+    const response = await adminFetch("/api/admin/documents", {
       method: "POST",
       body: new FormData(event.currentTarget),
     });
@@ -369,7 +371,7 @@ function ProvidersLegacy() {
   >([]);
   const [error, setError] = useState("");
   const load = () =>
-    fetch("/api/admin/providers")
+    adminFetch("/api/admin/providers")
       .then((r) => r.json() as Promise<{ items: typeof items }>)
       .then((r) => setItems(r.items));
   useEffect(() => {
@@ -431,7 +433,7 @@ function ProvidersLegacy() {
               e.preventDefault();
               setError("");
               const form = new FormData(e.currentTarget);
-              const response = await fetch("/api/admin/providers", {
+              const response = await adminFetch("/api/admin/providers", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -543,13 +545,13 @@ function ProfileEditor() {
     [resumeDocument, setResumeDocument] =
       useState<KnowledgeDocument | null>(null);
   const loadResumeDocument = async (id: string) => {
-    const response = await fetch("/api/admin/documents");
+    const response = await adminFetch("/api/admin/documents");
     if (!response.ok) return;
     const body = (await response.json()) as { items: KnowledgeDocument[] };
     setResumeDocument(body.items.find((item) => item.id === id) ?? null);
   };
   useEffect(() => {
-    fetch("/api/admin/profile")
+    adminFetch("/api/admin/profile")
       .then((r) => r.json() as Promise<{ profile: any }>)
       .then(({ profile: p }) => {
         if (p) {
@@ -582,7 +584,7 @@ function ProfileEditor() {
   const save = async (e: React.FormEvent) => {
     e.preventDefault();
     setMessage("");
-    const response = await fetch("/api/admin/profile", {
+    const response = await adminFetch("/api/admin/profile", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -610,7 +612,7 @@ function ProfileEditor() {
     setUploadMessage("");
     const data = new FormData();
     data.set("file", file);
-    const response = await fetch("/api/admin/profile/avatar", {
+    const response = await adminFetch("/api/admin/profile/avatar", {
       method: "POST",
       body: data,
     });
@@ -897,8 +899,8 @@ function Providers() {
     [saving, setSaving] = useState(false);
   const load = () =>
     Promise.all([
-      fetch("/api/admin/providers").then((r) => r.json()),
-      fetch("/api/admin/provider-presets").then((r) => r.json()),
+      adminFetch("/api/admin/providers").then((r) => r.json()),
+      adminFetch("/api/admin/provider-presets").then((r) => r.json()),
     ]).then(([a, b]: any[]) => {
       setItems(a.items);
       setPresets(b.items);
@@ -910,7 +912,7 @@ function Providers() {
   const retest = async (id: string) => {
     setTestingId(id);
     setError("");
-    const response = await fetch(`/api/admin/providers/${id}/test`, {
+    const response = await adminFetch(`/api/admin/providers/${id}/test`, {
       method: "POST",
     });
     const result = (await response.json().catch(() => ({}))) as {
@@ -925,7 +927,7 @@ function Providers() {
     setError("");
     setSaving(true);
     const data = new FormData(e.currentTarget),
-      response = await fetch("/api/admin/providers/simple", {
+      response = await adminFetch("/api/admin/providers/simple", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1137,7 +1139,7 @@ function AgentSettings() {
   const [state, setState] = useState<AgentState | null>(null);
   const [message, setMessage] = useState("");
   const load = () =>
-    fetch("/api/admin/agent")
+    adminFetch("/api/admin/agent")
       .then((response) => response.json() as Promise<AgentState>)
       .then(setState);
   useEffect(() => {
@@ -1151,7 +1153,7 @@ function AgentSettings() {
   const save = async (event: React.FormEvent) => {
     event.preventDefault();
     setMessage("");
-    const response = await fetch("/api/admin/agent", {
+    const response = await adminFetch("/api/admin/agent", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(state.config),
@@ -1317,10 +1319,15 @@ function AdminApp() {
   const [shellProfile, setShellProfile] = useState<{ display_name: string; headline: string; avatar_position_x: number; avatar_position_y: number; updated_at: string } | null>(null);
   const loadShellProfile = async () => {
     try {
-      const response = await fetch("/api/admin/profile"), body = await response.json() as { profile?: { display_name: string; headline: string; avatar_position_x: number; avatar_position_y: number; updated_at: string } };
+      const response = await adminFetch("/api/admin/profile"), body = await response.json() as { profile?: { display_name: string; headline: string; avatar_position_x: number; avatar_position_y: number; updated_at: string } };
       if (response.ok && body.profile) setShellProfile(body.profile);
     } catch { /* Keep the safe fallback identity while the profile endpoint recovers. */ }
   };
+  useEffect(() => {
+    const expire = () => location.reload();
+    addEventListener("bunshin:session-expired", expire);
+    return () => removeEventListener("bunshin:session-expired", expire);
+  }, []);
   useEffect(() => {
     void loadShellProfile();
     const update = () => void loadShellProfile();
@@ -1404,13 +1411,14 @@ function AdminApp() {
             className="account-logout"
             type="button"
             onClick={async () => {
-              await fetch("/api/admin/auth/logout", { method: "POST" });
+              await adminFetch("/api/admin/auth/logout", { method: "POST" });
               location.reload();
             }}
           >退出登录</button>
         </div>
       </aside>
       <main>
+        <Suspense fallback={<section className="panel empty"><span>◌</span><h2>正在加载模块</h2><p>首次打开该模块时会按需下载资源。</p></section>}>
         {view === "dashboard" ? (
           <DashboardOperations />
         ) : view === "content" ? (
@@ -1434,6 +1442,7 @@ function AdminApp() {
         ) : (
           <Placeholder view={view} />
         )}
+        </Suspense>
       </main>
     </div>
   );
