@@ -215,6 +215,14 @@ pnpm cf:login
 pnpm cf:setup
 ```
 
+当前仓库已提供生产发布门禁。首次启用 R2 并完成资源配置后，执行：
+
+```bash
+pnpm deploy:production
+```
+
+脚本会依次检查 Cloudflare 登录和 R2、运行类型检查/测试/构建、应用远程 D1 迁移、部署两个 Worker、生成并安装生产 Secrets，最后输出一次性管理员初始化令牌。稳定密钥保存在本机被 Git 忽略的 `.deploy-secrets.json` 中；后续部署会复用，避免更换主密钥导致已保存的模型 API Key 无法解密。
+
 将命令返回的资源 ID 写入两个应用的 `wrangler.jsonc`，然后：
 
 ```bash
@@ -266,7 +274,7 @@ pnpm deploy
 
 ## 当前状态
 
-项目处于 MVP 开发阶段。完成 Cloudflare 账号绑定前，只进行本地实现和验证，不执行线上部署。
+访客端已部署到 Cloudflare Workers。管理后台等待账号启用 R2 后运行 `pnpm deploy:production` 完成发布；PDF 解析、真实用量看板和完整内容编辑仍属于后续功能迭代，不影响基础部署。
 
 ## License
 

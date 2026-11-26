@@ -4,6 +4,7 @@ dist/
 worker-dist/
 .wrangler/
 .dev.vars
+.deploy-secrets.json
 .env
 .env.*
 !.env.example
