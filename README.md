@@ -271,6 +271,18 @@ pnpm deploy
 - `example.com` → `ai-bunshin-web`
 - `admin.example.com` → `ai-bunshin-admin`
 
+`*.workers.dev` 只作为初始化和故障排查入口。生产环境应为两个 Worker 分别绑定 Cloudflare 托管区域中的 Custom Domain，而不是把普通 CNAME 直接指向 `workers.dev`：
+
+```jsonc
+// apps/web/wrangler.jsonc
+"routes": [{ "pattern": "example.com", "custom_domain": true }]
+
+// apps/admin/wrangler.jsonc
+"routes": [{ "pattern": "admin.example.com", "custom_domain": true }]
+```
+
+域名必须已接入当前 Cloudflare 账号且处于 Active 状态，目标主机名不能保留冲突的 CNAME。部署时 Cloudflare 会自动创建 DNS 记录并签发证书。建议公开站使用主域名或 `www`，后台使用独立的 `admin` 子域；如需进一步限制后台入口，可在该主机名上增加 Cloudflare Access。绑定自定义域名可以避开部分网络对 `workers.dev` 的特殊解析或访问限制，但普通 Cloudflare 全球网络不等同于中国大陆境内加速，不能承诺所有大陆运营商链路都稳定。
+
 ## CI/CD
 
 ```text

@@ -58,9 +58,20 @@ function Chart({ type }: { type: "line" | "pie" }) {
     const option =
       type === "line"
         ? {
-            grid: { left: 42, right: 18, top: 22, bottom: 30 },
+            grid: {
+              left: 12,
+              right: 18,
+              top: 52,
+              bottom: 12,
+              containLabel: true,
+            },
             tooltip: { trigger: "axis" },
-            legend: { data: ["请求", "Token"], bottom: 0 },
+            legend: {
+              data: ["请求", "Token"],
+              top: 8,
+              right: 8,
+              itemGap: 22,
+            },
             xAxis: {
               type: "category",
               data: [
@@ -73,6 +84,8 @@ function Chart({ type }: { type: "line" | "pie" }) {
                 "11/26",
               ],
               axisLine: { lineStyle: { color: "#dfe3e8" } },
+              axisTick: { alignWithLabel: true },
+              axisLabel: { margin: 12, hideOverlap: true },
             },
             yAxis: {
               type: "value",
@@ -93,6 +106,15 @@ function Chart({ type }: { type: "line" | "pie" }) {
                 smooth: true,
                 data: [90, 128, 112, 166, 150, 198, 183],
                 itemStyle: { color: "#96a9b9" },
+              },
+            ],
+            media: [
+              {
+                query: { maxWidth: 520 },
+                option: {
+                  legend: { top: 6, left: "center", right: "auto" },
+                  grid: { left: 8, right: 8, top: 48, bottom: 8 },
+                },
               },
             ],
           }
