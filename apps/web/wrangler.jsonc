@@ -5,8 +5,8 @@
   "compatibility_date":"2026-11-24",
   "compatibility_flags":["nodejs_compat"],
   "assets":{"directory":"./public","binding":"ASSETS","run_worker_first":["/*"]},
-  "d1_databases":[{"binding":"DB","database_name":"ai-bunshin-local","database_id":"local-development"}],
-  "kv_namespaces":[{"binding":"CACHE","id":"local-development"}],
+  "d1_databases":[{"binding":"DB","database_name":"ai-bunshin","database_id":"605fe3d9-1af8-48c2-b7de-ed836048c51e"}],
+  "kv_namespaces":[{"binding":"CACHE","id":"1d21d07a5c8d43ff99d7d4935879ae4b"}],
   "vectorize":[{"binding":"VECTORIZE","index_name":"ai-bunshin-knowledge-v1"}],
   "observability":{"enabled":true,"logs":{"enabled":true,"head_sampling_rate":1}}
 }
