@@ -207,7 +207,9 @@ wrangler secret put ADMIN_BOOTSTRAP_TOKEN
 
 如果 OpenAI 返回 `Missing scopes: model.request`，说明 Key 本身已被识别，但没有模型推理权限。请到对应 Project 的 API Keys 页面把 Key 设置为 `All`，或在 `Restricted` 权限中开启模型请求，并确认账号在该 Project 中是 Member 或 Owner。模型渠道表单使用右侧抽屉，Key 在输入和保存后都只显示固定五颗星及首尾字符。
 
-个人资料的结构化字段和 Markdown 原文保存在 D1，简历、头像等原始文件保存在私有 R2。后台“个人资料”页可直接修改显示名称、职业标题、头像和 Markdown 介绍，并上传 PDF/Markdown 简历；保存后主站侧边栏、头像和“关于我”页面读取同一份数据。头像通过 Worker 受控输出，不公开 R2 Bucket。文本型 PDF/TXT/Markdown 经 Queue 异步解析；本地隐私模式使用 D1 向量回退，显式授权外部 Embedding 后使用版本化 Vectorize 索引。切换模型应新建索引版本并重建，不能把不同维度混入同一索引。
+个人资料的结构化字段和 Markdown 原文保存在 D1，简历、头像等原始文件保存在私有 R2。后台“个人资料”页可直接修改显示名称、职业标题、头像和 Markdown 介绍，并上传 PDF/Markdown 简历；必填项统一使用红色星号标识。头像区域可直接点击上传或替换，未上传头像时由 Worker 根据显示名称的第一个汉字或字母生成 SVG 默认头像。简历上传展示浏览器上传进度，完成后继续显示 Queue 的解析、向量化和索引状态；当前简历附件保留在页面并通过登录态保护的下载接口读取 R2 原文件。保存后主站侧边栏、头像和“关于我”页面读取同一份数据。头像和附件都通过 Worker 受控输出，不公开 R2 Bucket。文本型 PDF/TXT/Markdown 经 Queue 异步解析；本地隐私模式使用 D1 向量回退，显式授权外部 Embedding 后使用版本化 Vectorize 索引。切换模型应新建索引版本并重建，不能把不同维度混入同一索引。
+
+公开站点导航由当前路径和首页锚点共同决定选中状态；移动端侧栏在点击内容空白区或选择导航后自动收起。导航图标统一使用同一套 20px 描边 SVG。公开标题会在读取个人资料后更新为“页面名称 · 显示名称-AI分身”，首页显示为“显示名称-AI分身”。
 
 后台用量页和 ECharts 从 `usage_events` 读取真实 Chat/Embedding 请求、Token、延迟与状态。费用只有在渠道价格可确定时才是估算值；它不等同于厂商账户真实余额。
 

@@ -6,11 +6,35 @@ document.querySelector("#theme-toggle")?.addEventListener("click", () => {
   root.dataset.theme = next;
   localStorage.setItem("bunshin-theme", next);
 });
-document
-  .querySelector("#menu-toggle")
-  ?.addEventListener("click", () =>
-    document.querySelector(".sidebar")?.classList.toggle("open"),
-  );
+const sidebar = document.querySelector(".sidebar");
+document.querySelector("#menu-toggle")?.addEventListener("click", (event) => {
+  event.stopPropagation();
+  sidebar?.classList.toggle("open");
+});
+document.querySelector(".page")?.addEventListener("click", () => {
+  if (window.matchMedia("(max-width: 980px)").matches)
+    sidebar?.classList.remove("open");
+});
+sidebar?.querySelectorAll("nav a").forEach((link) =>
+  link.addEventListener("click", () => {
+    if (window.matchMedia("(max-width: 980px)").matches)
+      sidebar.classList.remove("open");
+  }),
+);
+function syncHashNavigation() {
+  if (location.pathname !== "/") return;
+  const links = sidebar?.querySelectorAll("nav a");
+  links?.forEach((link) => link.classList.remove("active"));
+  const href =
+    location.hash === "#ask"
+      ? "/#ask"
+      : location.hash === "#articles"
+        ? "/#articles"
+        : "/";
+  sidebar?.querySelector(`nav a[href='${href}']`)?.classList.add("active");
+}
+syncHashNavigation();
+window.addEventListener("hashchange", syncHashNavigation);
 
 const input = document.querySelector("#ask-input");
 const form = document.querySelector("#ask-form");

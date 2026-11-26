@@ -236,11 +236,35 @@ const demoArticles = [
   },
 ];
 
+type PublicNav = "home" | "ask" | "articles" | "categories" | "archives" | "about";
+function navIcon(name: PublicNav) {
+  const path = {
+    home: html`<path d="M3 10.5 10 4l7 6.5v6a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 3 16.5z"/><path d="M8 18v-5h4v5"/>`,
+    ask: html`<circle cx="10" cy="10" r="7"/><path d="M7.5 8.5h.01M12.5 8.5h.01M7.5 12c1.5 1.2 3.5 1.2 5 0"/>`,
+    articles: html`<path d="M5 3h10a2 2 0 0 1 2 2v12H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z"/><path d="M7 7h6M7 10h6M7 13h4"/>`,
+    categories: html`<path d="M4 5h5l1.5 2H16a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z"/>`,
+    archives: html`<circle cx="10" cy="10" r="7"/><path d="M10 6v4l2.8 1.8"/>`,
+    about: html`<circle cx="10" cy="10" r="8"/><path d="M10 9v5M10 6h.01"/>`,
+  }[name];
+  return html`<svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${path}</svg>`;
+}
+
 function layout(
   title: string,
   content: ReturnType<typeof html>,
   description = "个人简历、文章与 AI 分身",
+  active: PublicNav = "home",
 ) {
+  const pageLabel =
+    active === "home"
+      ? ""
+      : ({
+          ask: "问问分身",
+          articles: "文章",
+          categories: "分类",
+          archives: "归档",
+          about: "关于",
+        } as const)[active];
   return html`<!doctype html>
     <html lang="zh-CN" data-theme="system">
       <head>
@@ -309,12 +333,12 @@ function layout(
             <p id="profile-headline">保持好奇，持续构建</p>
           </div>
           <nav aria-label="主导航">
-            <a class="active" href="/">⌂<span>首页</span></a
-            ><a href="/#ask">◌<span>问问分身</span></a
-            ><a href="/#articles">▤<span>文章</span></a
-            ><a href="/categories">≡<span>分类</span></a
-            ><a href="/archives">◷<span>归档</span></a
-            ><a href="/about">ⓘ<span>关于</span></a>
+            <a class=${active === "home" ? "active" : ""} href="/">${navIcon("home")}<span>首页</span></a
+            ><a class=${active === "ask" ? "active" : ""} href="/#ask">${navIcon("ask")}<span>问问分身</span></a
+            ><a class=${active === "articles" ? "active" : ""} href="/#articles">${navIcon("articles")}<span>文章</span></a
+            ><a class=${active === "categories" ? "active" : ""} href="/categories">${navIcon("categories")}<span>分类</span></a
+            ><a class=${active === "archives" ? "active" : ""} href="/archives">${navIcon("archives")}<span>归档</span></a
+            ><a class=${active === "about" ? "active" : ""} href="/about">${navIcon("about")}<span>关于</span></a>
           </nav>
           <div class="sidebar-foot">
             <button id="theme-toggle" aria-label="切换主题">◐</button
@@ -324,7 +348,7 @@ function layout(
         <div class="page">
           <header class="topbar">
             <button id="menu-toggle" aria-label="打开菜单">☰</button
-            ><span>${title}</span
+            ><span id="page-title" data-page-label=${pageLabel}>${title}</span
             ><button id="search-toggle" aria-label="搜索">⌕</button>
           </header>
           <main>${content}</main>
@@ -436,6 +460,7 @@ app.get("/articles/:slug", (c) => {
         </p>
       </article>`,
       article.excerpt,
+      "articles",
     ),
   );
 });
@@ -455,6 +480,8 @@ app.get("/categories", (c) =>
           )}
         </div>
       </section>`,
+      "文章分类",
+      "categories",
     ),
   ),
 );
@@ -471,6 +498,8 @@ app.get("/archives", (c) =>
             >`,
         )}
       </section>`,
+      "文章归档",
+      "archives",
     ),
   ),
 );
@@ -507,6 +536,8 @@ app.get("/about", async (c) => {
               </div>`
           : ""}
       </section>`,
+      "个人介绍",
+      "about",
     ),
   );
 });
@@ -857,8 +888,8 @@ app.get("/robots.txt", (c) =>
 );
 app.get("/avatar", async (c) => {
   const profile = await c.env.DB.prepare(
-    "SELECT avatar_url FROM profiles WHERE published=1 ORDER BY created_at LIMIT 1",
-  ).first<{ avatar_url: string | null }>();
+    "SELECT display_name,avatar_url FROM profiles WHERE published=1 ORDER BY created_at LIMIT 1",
+  ).first<{ display_name: string; avatar_url: string | null }>();
   if (profile?.avatar_url?.startsWith("r2://")) {
     const object = await c.env.ASSETS_BUCKET.get(profile.avatar_url.slice(5));
     if (object)
@@ -870,8 +901,15 @@ app.get("/avatar", async (c) => {
         },
       });
   }
+  const initial = Array.from(profile?.display_name?.trim() || "B")[0] ?? "B";
+  const safeInitial = initial
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
   return c.body(
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><defs><linearGradient id="g"><stop stop-color="#31516f"/><stop offset="1" stop-color="#7899b5"/></linearGradient></defs><rect width="100" height="100" rx="50" fill="url(#g)"/><text x="50" y="64" text-anchor="middle" font-family="system-ui" font-size="44" font-weight="700" fill="white">B</text></svg>',
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#31516f"/><stop offset="1" stop-color="#7899b5"/></linearGradient></defs><rect width="100" height="100" rx="50" fill="url(#g)"/><text x="50" y="64" text-anchor="middle" font-family="Inter,system-ui,sans-serif" font-size="44" font-weight="700" fill="white">${safeInitial}</text></svg>`,
     200,
     {
       "Content-Type": "image/svg+xml",

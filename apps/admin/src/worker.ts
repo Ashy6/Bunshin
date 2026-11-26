@@ -105,6 +105,16 @@ function providerErrorMessage(error: unknown) {
     return "模型不可用或当前项目没有该模型权限，请检查项目的 Model usage 设置。";
   return message;
 }
+function avatarSvg(displayName: string | null | undefined) {
+  const first = Array.from(displayName?.trim() || "B")[0] ?? "B";
+  const safe = first
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#31516f"/><stop offset="1" stop-color="#7899b5"/></linearGradient></defs><rect width="100" height="100" rx="50" fill="url(#g)"/><text x="50" y="64" text-anchor="middle" font-family="Inter,system-ui,sans-serif" font-size="44" font-weight="700" fill="white">${safe}</text></svg>`;
+}
 app.onError((error, c) => {
   console.error("Unhandled admin API error", error);
   return c.json(
@@ -377,16 +387,23 @@ app.put("/api/admin/profile", async (c) => {
 });
 app.get("/api/admin/profile/avatar", async (c) => {
   const profile = await c.env.DB.prepare(
-    "SELECT avatar_url FROM profiles ORDER BY created_at LIMIT 1",
-  ).first<{ avatar_url: string | null }>();
-  if (!profile?.avatar_url?.startsWith("r2://"))
-    return c.json({ error: "尚未上传头像" }, 404);
-  const object = await c.env.ASSETS_BUCKET.get(profile.avatar_url.slice(5));
-  if (!object) return c.json({ error: "头像文件不存在" }, 404);
-  return new Response(object.body, {
+    "SELECT display_name,avatar_url FROM profiles ORDER BY created_at LIMIT 1",
+  ).first<{ display_name: string; avatar_url: string | null }>();
+  if (profile?.avatar_url?.startsWith("r2://")) {
+    const object = await c.env.ASSETS_BUCKET.get(profile.avatar_url.slice(5));
+    if (object)
+      return new Response(object.body, {
+        headers: {
+          "Content-Type": object.httpMetadata?.contentType ?? "image/jpeg",
+          "Cache-Control": "private, max-age=300",
+          "X-Content-Type-Options": "nosniff",
+        },
+      });
+  }
+  return new Response(avatarSvg(profile?.display_name), {
     headers: {
-      "Content-Type": object.httpMetadata?.contentType ?? "image/jpeg",
-      "Cache-Control": "private, max-age=300",
+      "Content-Type": "image/svg+xml; charset=utf-8",
+      "Cache-Control": "private, max-age=60",
       "X-Content-Type-Options": "nosniff",
     },
   });
@@ -467,11 +484,32 @@ app.get("/api/admin/documents", async (c) =>
   c.json({
     items: (
       await c.env.DB.prepare(
-        "SELECT documents.id,documents.title,documents.source_type,documents.visibility,documents.status,documents.chunk_count,documents.error_message,documents.updated_at,categories.name category_name FROM documents LEFT JOIN categories ON categories.id=documents.category_id ORDER BY documents.updated_at DESC LIMIT 100",
+        "SELECT documents.id,documents.title,documents.source_type,documents.visibility,documents.status,documents.r2_key,documents.chunk_count,documents.error_message,documents.updated_at,categories.name category_name FROM documents LEFT JOIN categories ON categories.id=documents.category_id ORDER BY documents.updated_at DESC LIMIT 100",
       ).all()
     ).results,
   }),
 );
+app.get("/api/admin/documents/:id/download", async (c) => {
+  const document = await c.env.DB.prepare(
+    "SELECT title,r2_key,source_type FROM documents WHERE id=? LIMIT 1",
+  )
+    .bind(c.req.param("id"))
+    .first<{ title: string; r2_key: string | null; source_type: string }>();
+  if (!document?.r2_key) return c.json({ error: "附件不存在" }, 404);
+  const object = await c.env.ASSETS_BUCKET.get(document.r2_key);
+  if (!object) return c.json({ error: "R2 中未找到原文件" }, 404);
+  const storedName = document.r2_key.split("/").at(-1) ||
+    `${document.title}.${document.source_type === "pdf" ? "pdf" : "md"}`;
+  const fallbackName = storedName.replace(/[^a-zA-Z0-9._-]/g, "_");
+  return new Response(object.body, {
+    headers: {
+      "Content-Type": object.httpMetadata?.contentType ?? "application/octet-stream",
+      "Content-Disposition": `attachment; filename="${fallbackName}"; filename*=UTF-8''${encodeURIComponent(storedName)}`,
+      "Cache-Control": "private, no-store",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+});
 app.get("/api/admin/providers", async (c) =>
   c.json({
     items: (

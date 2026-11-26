@@ -402,8 +402,19 @@ type KnowledgeDocument = {
   chunk_count: number;
   error_message?: string;
   category_name?: string;
+  r2_key?: string;
+  updated_at?: string;
 };
 type KnowledgeCategory = { id: string; name: string };
+const documentStatusLabel = (status: string) =>
+  ({
+    uploaded: "等待处理",
+    parsing: "解析中",
+    embedding: "向量化中",
+    indexed: "已完成索引",
+    needs_ocr: "需要 OCR",
+    failed: "处理失败",
+  })[status] ?? status;
 function Knowledge() {
   const [open, setOpen] = useState(false),
     [documents, setDocuments] = useState<KnowledgeDocument[]>([]),
@@ -447,14 +458,6 @@ function Knowledge() {
     event.currentTarget.reset();
     await load();
   };
-  const statusLabel = (status: string) =>
-    ({
-      uploaded: "等待处理",
-      parsing: "解析中",
-      indexed: "已索引",
-      needs_ocr: "需要 OCR",
-      failed: "失败",
-    })[status] ?? status;
   return (
     <>
       <header className="page-head">
@@ -503,7 +506,7 @@ function Knowledge() {
                     <span
                       className={`status ${item.status === "indexed" ? "ok" : item.status === "parsing" ? "running" : ""}`}
                     >
-                      {statusLabel(item.status)}
+                      {documentStatusLabel(item.status)}
                     </span>
                   </td>
                   <td>{item.chunk_count}</td>
@@ -758,12 +761,22 @@ function ProfileEditor() {
     [avatarVersion, setAvatarVersion] = useState(0),
     [avatarBusy, setAvatarBusy] = useState(false),
     [resumeBusy, setResumeBusy] = useState(false),
-    [uploadMessage, setUploadMessage] = useState("");
+    [uploadMessage, setUploadMessage] = useState(""),
+    [uploadProgress, setUploadProgress] = useState<number | null>(null),
+    [selectedResumeName, setSelectedResumeName] = useState(""),
+    [resumeDocument, setResumeDocument] =
+      useState<KnowledgeDocument | null>(null);
+  const loadResumeDocument = async (id: string) => {
+    const response = await fetch("/api/admin/documents");
+    if (!response.ok) return;
+    const body = (await response.json()) as { items: KnowledgeDocument[] };
+    setResumeDocument(body.items.find((item) => item.id === id) ?? null);
+  };
   useEffect(() => {
     fetch("/api/admin/profile")
       .then((r) => r.json() as Promise<{ profile: any }>)
       .then(({ profile: p }) => {
-        if (p)
+        if (p) {
           setProfile({
             displayName: p.display_name ?? "",
             headline: p.headline ?? "",
@@ -774,8 +787,22 @@ function ProfileEditor() {
             github: JSON.parse(p.social_json ?? "{}").github ?? "",
             published: Boolean(p.published),
           });
+          if (p.resume_document_id) void loadResumeDocument(p.resume_document_id);
+        }
       });
   }, []);
+  useEffect(() => {
+    if (
+      !resumeDocument ||
+      ["indexed", "failed", "needs_ocr"].includes(resumeDocument.status)
+    )
+      return;
+    const timer = window.setInterval(
+      () => void loadResumeDocument(resumeDocument.id),
+      2500,
+    );
+    return () => window.clearInterval(timer);
+  }, [resumeDocument?.id, resumeDocument?.status]);
   const save = async (e: React.FormEvent) => {
     e.preventDefault();
     setMessage("");
@@ -824,16 +851,45 @@ function ProfileEditor() {
     e.preventDefault();
     setResumeBusy(true);
     setUploadMessage("");
-    const response = await fetch("/api/admin/documents", {
-      method: "POST",
-      body: new FormData(e.currentTarget),
-    });
-    const result = (await response.json().catch(() => ({}))) as {
+    setUploadProgress(0);
+    const form = e.currentTarget;
+    const result = await new Promise<{
+      ok: boolean;
+      id?: string;
       error?: string;
-    };
+    }>((resolve) => {
+      const request = new XMLHttpRequest();
+      request.open("POST", "/api/admin/documents");
+      request.upload.addEventListener("progress", (event) => {
+        if (event.lengthComputable)
+          setUploadProgress(Math.round((event.loaded / event.total) * 100));
+      });
+      request.addEventListener("load", () => {
+        let body: { id?: string; error?: string } = {};
+        try {
+          body = JSON.parse(request.responseText);
+        } catch {
+          body.error = "服务器返回了无法识别的响应";
+        }
+        resolve({ ok: request.status >= 200 && request.status < 300, ...body });
+      });
+      request.addEventListener("error", () =>
+        resolve({ ok: false, error: "网络中断，文件未上传" }),
+      );
+      request.send(new FormData(form));
+    });
     setResumeBusy(false);
-    if (!response.ok) return setUploadMessage(result.error ?? "简历上传失败");
-    e.currentTarget.reset();
+    if (!result.ok) {
+      setUploadProgress(null);
+      return setUploadMessage(result.error ?? "简历上传失败");
+    }
+    setUploadProgress(100);
+    form.reset();
+    setSelectedResumeName("");
+    if (result.id) {
+      await loadResumeDocument(result.id);
+      window.setTimeout(() => setUploadProgress(null), 1200);
+    }
     setUploadMessage("简历已上传，后台正在解析、切片并建立 RAG 索引");
   };
   return (
@@ -844,132 +900,194 @@ function ProfileEditor() {
           <h1>维护公开资料、Markdown 与简历</h1>
         </div>
       </header>
-      <form className="profile-layout" onSubmit={save}>
-        <section className="panel profile-form">
-          <h2>基本资料</h2>
-          <div className="avatar-editor">
-            <img
-              src={`/api/admin/profile/avatar?v=${avatarVersion}`}
-              alt="当前头像"
-            />
-            <div className="avatar-upload-control">
-              <label className="upload compact-upload">
+      <div className="profile-page">
+        <form className="profile-layout" onSubmit={save}>
+          <section className="panel profile-form">
+            <div className="section-heading">
+              <div>
+                <h2>基本资料</h2>
+                <p>这些信息会同步展示在公开站点。</p>
+              </div>
+            </div>
+            <div className="avatar-editor">
+              <label className="avatar-button" title="点击替换头像">
+                <img
+                  src={`/api/admin/profile/avatar?v=${avatarVersion}`}
+                  alt="当前头像"
+                />
+                <span>{avatarBusy ? "上传中" : "更换"}</span>
                 <input
                   name="file"
-                  required
                   type="file"
                   accept="image/jpeg,image/png,image/webp,image/gif"
                   onChange={uploadAvatar}
                   disabled={avatarBusy}
                 />
-                <strong>{avatarBusy ? "上传中…" : "选择并上传头像"}</strong>
-                <span>JPG、PNG、WebP 或 GIF，最大 5MB</span>
               </label>
+              <div className="avatar-upload-control">
+                <strong>头像</strong>
+                <span>点击头像上传或替换；未上传时自动显示名称首字。</span>
+                <small>JPG、PNG、WebP 或 GIF，最大 5MB</small>
+              </div>
+            </div>
+            <label>
+              <span>显示名称 <b className="required-mark">*</b></span>
+              <input
+                value={profile.displayName}
+                onChange={(e) => field("displayName", e.target.value)}
+                required
+              />
+            </label>
+            <label>
+              <span>职业标题</span>
+              <input
+                value={profile.headline}
+                onChange={(e) => field("headline", e.target.value)}
+              />
+            </label>
+            <label>
+              <span>简短介绍</span>
+              <textarea
+                value={profile.bio}
+                onChange={(e) => field("bio", e.target.value)}
+                rows={4}
+              />
+            </label>
+            <label>
+              <span>所在地</span>
+              <input
+                value={profile.location}
+                onChange={(e) => field("location", e.target.value)}
+              />
+            </label>
+            <label>
+              <span>技能标签</span>
+              <input
+                value={profile.skills}
+                onChange={(e) => field("skills", e.target.value)}
+                placeholder="TypeScript, RAG, Cloudflare"
+              />
+            </label>
+            <label>
+              <span>GitHub</span>
+              <input
+                value={profile.github}
+                onChange={(e) => field("github", e.target.value)}
+                placeholder="https://github.com/..."
+              />
+            </label>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={profile.published}
+                onChange={(e) => field("published", e.target.checked)}
+              />
+              公开展示个人资料
+            </label>
+          </section>
+          <section className="panel markdown-editor">
+            <div className="section-heading">
+              <div>
+                <h2>Markdown 个人介绍</h2>
+                <p>适合维护完整经历、项目和个人介绍。</p>
+              </div>
+            </div>
+            <textarea
+              value={profile.markdownBio}
+              onChange={(e) => field("markdownBio", e.target.value)}
+              rows={22}
+              placeholder="# 关于我\n\n在这里编写工作经历、项目与个人介绍…"
+            />
+            <p>Markdown 原文存储在 D1，可用于公开页面和后续 RAG 索引。</p>
+          </section>
+          <div className="profile-actions">
+            {message && <span>{message}</span>}
+            <button className="primary">保存个人资料</button>
+          </div>
+        </form>
+        <section className="panel resume-entry">
+          <div className="section-heading">
+            <div>
+              <h2>个人简历</h2>
+              <p>上传 PDF 或 Markdown，文件会进入 RAG 解析与索引流程。</p>
             </div>
           </div>
-          <label>
-            显示名称
-            <input
-              value={profile.displayName}
-              onChange={(e) => field("displayName", e.target.value)}
-              required
-            />
-          </label>
-          <label>
-            职业标题
-            <input
-              value={profile.headline}
-              onChange={(e) => field("headline", e.target.value)}
-            />
-          </label>
-          <label>
-            简短介绍
-            <textarea
-              value={profile.bio}
-              onChange={(e) => field("bio", e.target.value)}
-              rows={4}
-            />
-          </label>
-          <label>
-            所在地
-            <input
-              value={profile.location}
-              onChange={(e) => field("location", e.target.value)}
-            />
-          </label>
-          <label>
-            技能标签
-            <input
-              value={profile.skills}
-              onChange={(e) => field("skills", e.target.value)}
-              placeholder="TypeScript, RAG, Cloudflare"
-            />
-          </label>
-          <label>
-            GitHub
-            <input
-              value={profile.github}
-              onChange={(e) => field("github", e.target.value)}
-              placeholder="https://github.com/..."
-            />
-          </label>
-          <label className="checkbox">
-            <input
-              type="checkbox"
-              checked={profile.published}
-              onChange={(e) => field("published", e.target.checked)}
-            />
-            公开展示个人资料
-          </label>
+          <form className="resume-upload" onSubmit={uploadResume}>
+            <input type="hidden" name="purpose" value="resume" />
+            <label>
+              <span>简历标题 <b className="required-mark">*</b></span>
+              <input name="title" required placeholder="例如：我的个人简历" />
+            </label>
+            <label className="upload">
+              <input
+                name="file"
+                required
+                type="file"
+                accept=".pdf,.md,application/pdf,text/markdown,text/plain"
+                onChange={(event) =>
+                  setSelectedResumeName(event.target.files?.[0]?.name ?? "")
+                }
+              />
+              <strong>
+                选择 PDF / Markdown <b className="required-mark">*</b>
+              </strong>
+              <span>{selectedResumeName || "单文件最大 20MB"}</span>
+            </label>
+            <label>
+              <span>可见性</span>
+              <select name="visibility" defaultValue="rag_only">
+                <option value="rag_only">仅供 AI 分身检索</option>
+                <option value="public">公开并允许引用</option>
+                <option value="private">私有，不参与检索</option>
+              </select>
+            </label>
+            <button className="primary" disabled={resumeBusy}>
+              {resumeBusy ? "上传处理中…" : "上传简历"}
+            </button>
+          </form>
+          {uploadProgress !== null && (
+            <div className="upload-progress" aria-live="polite">
+              <div>
+                <span>{uploadProgress < 100 ? "正在上传" : "上传完成"}</span>
+                <strong>{uploadProgress}%</strong>
+              </div>
+              <progress max="100" value={uploadProgress} />
+            </div>
+          )}
+          {uploadMessage && (
+            <div className="upload-message">{uploadMessage}</div>
+          )}
+          <div className="attachment-list">
+            <h3>当前简历附件</h3>
+            {resumeDocument ? (
+              <article className="attachment-item">
+                <div className="attachment-icon">
+                  {resumeDocument.source_type === "pdf" ? "PDF" : "MD"}
+                </div>
+                <div className="attachment-info">
+                  <strong>{resumeDocument.title}</strong>
+                  <span>
+                    {resumeDocument.r2_key?.split("/").at(-1) ?? "简历文件"}
+                    {" · "}
+                    {documentStatusLabel(resumeDocument.status)}
+                  </span>
+                  {resumeDocument.error_message && (
+                    <small>{resumeDocument.error_message}</small>
+                  )}
+                </div>
+                <a
+                  className="attachment-download"
+                  href={`/api/admin/documents/${resumeDocument.id}/download`}
+                >
+                  下载原文件
+                </a>
+              </article>
+            ) : (
+              <div className="attachment-empty">还没有上传简历附件</div>
+            )}
+          </div>
         </section>
-        <section className="panel markdown-editor">
-          <h2>Markdown 个人介绍</h2>
-          <textarea
-            value={profile.markdownBio}
-            onChange={(e) => field("markdownBio", e.target.value)}
-            rows={22}
-            placeholder="# 关于我\n\n在这里编写工作经历、项目与个人介绍…"
-          />
-          <p>Markdown 原文存储在 D1，可用于公开页面和后续 RAG 索引。</p>
-        </section>
-        <div className="profile-actions">
-          {message && <span>{message}</span>}
-          <button className="primary">保存个人资料</button>
-        </div>
-      </form>
-      <section className="panel resume-entry">
-        <h2>个人简历</h2>
-        <p>在这里直接上传 PDF 或 Markdown，文件会进入现有 RAG 处理流程。</p>
-        <form className="resume-upload" onSubmit={uploadResume}>
-          <input type="hidden" name="purpose" value="resume" />
-          <label>
-            简历标题
-            <input name="title" required placeholder="例如：我的个人简历" />
-          </label>
-          <label className="upload">
-            <input
-              name="file"
-              required
-              type="file"
-              accept=".pdf,.md,application/pdf,text/markdown,text/plain"
-            />
-            <strong>选择 PDF / Markdown</strong>
-            <span>上传后自动解析、切片并建立索引</span>
-          </label>
-          <label>
-            可见性
-            <select name="visibility" defaultValue="rag_only">
-              <option value="rag_only">仅供 AI 分身检索</option>
-              <option value="public">公开并允许引用</option>
-              <option value="private">私有，不参与检索</option>
-            </select>
-          </label>
-          <button className="primary" disabled={resumeBusy}>
-            {resumeBusy ? "上传处理中…" : "上传简历"}
-          </button>
-        </form>
-        {uploadMessage && <div className="upload-message">{uploadMessage}</div>}
-      </section>
+      </div>
     </>
   );
 }

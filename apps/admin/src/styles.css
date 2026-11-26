@@ -774,45 +774,76 @@ td small {
   color: #a33d3d;
   font-size: 12px;
 }
+.profile-page {
+  width: min(1180px, 100%);
+  margin: 0 auto;
+}
 .profile-layout {
   display: grid;
-  grid-template-columns: 1fr 1.4fr;
-  gap: 16px;
+  grid-template-columns: minmax(320px, 0.9fr) minmax(440px, 1.35fr);
+  gap: 18px;
 }
 .profile-form,
 .markdown-editor {
   display: grid;
   align-content: start;
-  gap: 12px;
+  gap: 14px;
+  padding: 24px;
 }
-.profile-form h2,
-.markdown-editor h2,
-.resume-entry h2 {
-  font-size: 16px;
-  margin: 0 0 8px;
+.section-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding-bottom: 14px;
+  border-bottom: 1px solid #edf0f2;
 }
-.profile-form label {
-  display: grid;
-  gap: 6px;
+.section-heading h2 {
+  margin: 0;
+  font-size: 17px;
+}
+.section-heading p {
+  margin: 4px 0 0;
+  color: #89949b;
   font-size: 12px;
+}
+.profile-form > label,
+.resume-upload > label {
+  display: grid;
+  gap: 7px;
   color: #66747d;
+  font-size: 12px;
+}
+.required-mark {
+  color: #c34f4f;
+  font-size: 13px;
+  font-weight: 700;
 }
 .profile-form input,
 .profile-form textarea,
 .markdown-editor textarea {
+  width: 100%;
   border: 1px solid #dfe4e8;
-  border-radius: 8px;
-  padding: 10px;
+  border-radius: 9px;
+  padding: 10px 11px;
   font: inherit;
+  outline: none;
   resize: vertical;
 }
-.markdown-editor textarea {
-  width: 100%;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  line-height: 1.6;
+.profile-form input:focus,
+.profile-form textarea:focus,
+.markdown-editor textarea:focus,
+.resume-upload input:focus,
+.resume-upload select:focus {
+  border-color: #547891;
+  box-shadow: 0 0 0 3px rgba(84, 120, 145, 0.11);
 }
-.markdown-editor p,
-.resume-entry p {
+.markdown-editor textarea {
+  min-height: 472px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  line-height: 1.65;
+}
+.markdown-editor > p {
+  margin: 0;
   color: #7d8991;
   font-size: 12px;
 }
@@ -822,66 +853,199 @@ td small {
   justify-content: flex-end;
   align-items: center;
   gap: 14px;
+  padding: 14px 16px;
+  border: 1px solid #e4e8eb;
+  border-radius: 12px;
+  background: #fff;
 }
 .profile-actions span {
   color: #397453;
   font-size: 12px;
 }
 .resume-entry {
-  margin-top: 16px;
+  margin-top: 18px;
+  padding: 24px;
 }
 .avatar-editor {
   display: grid;
-  grid-template-columns: 88px 1fr;
-  gap: 14px;
+  grid-template-columns: 82px 1fr;
+  gap: 16px;
   align-items: center;
-  padding: 12px;
+  padding: 14px;
   border: 1px solid #e6eaed;
   border-radius: 12px;
   background: #fafbfc;
 }
-.avatar-editor > img {
-  width: 88px;
-  height: 88px;
+.avatar-button {
+  position: relative;
+  width: 82px;
+  height: 82px;
+  overflow: hidden;
   border-radius: 50%;
+  cursor: pointer;
+}
+.avatar-button img {
+  display: block;
+  width: 100%;
+  height: 100%;
   object-fit: cover;
   background: linear-gradient(135deg, #31516f, #7899b5);
 }
+.avatar-button > span {
+  position: absolute;
+  inset: auto 0 0;
+  padding: 4px 0 6px;
+  background: rgba(21, 35, 45, 0.72);
+  color: #fff;
+  text-align: center;
+  font-size: 10px;
+  opacity: 0;
+  transition: opacity 0.18s ease;
+}
+.avatar-button:hover > span,
+.avatar-button:focus-within > span {
+  opacity: 1;
+}
+.avatar-button input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
 .avatar-upload-control {
   display: grid;
-  gap: 8px;
+  gap: 3px;
 }
-.compact-upload {
-  min-height: auto;
-  padding: 10px !important;
+.avatar-upload-control strong {
+  color: #34434d;
+  font-size: 13px;
+}
+.avatar-upload-control span,
+.avatar-upload-control small {
+  color: #7d8991;
+  font-size: 11px;
+  line-height: 1.5;
 }
 .resume-upload {
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) minmax(260px, 1.5fr) 180px auto;
-  gap: 12px;
+  grid-template-columns: minmax(180px, 1fr) minmax(240px, 1.4fr) minmax(180px, 0.8fr);
+  gap: 14px;
   align-items: end;
+  margin-top: 18px;
 }
-.resume-upload > label {
-  display: grid;
-  gap: 6px;
-  color: #66747d;
-  font-size: 12px;
+.resume-upload > .primary {
+  grid-column: 1/-1;
+  justify-self: end;
+  min-width: 132px;
 }
 .resume-upload input,
 .resume-upload select {
-  min-height: 40px;
+  min-height: 42px;
   border: 1px solid #dfe4e8;
-  border-radius: 8px;
+  border-radius: 9px;
   padding: 9px 10px;
+  background: #fff;
   font: inherit;
+  outline: none;
 }
 .resume-upload .upload {
-  min-height: 72px;
+  min-height: 74px;
+  padding: 13px 16px;
+  justify-content: center;
+  cursor: pointer;
+}
+.upload-progress {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: #f2f6f8;
+}
+.upload-progress > div {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 7px;
+  color: #526872;
+  font-size: 12px;
+}
+.upload-progress progress {
+  display: block;
+  width: 100%;
+  height: 7px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  accent-color: #496d8d;
 }
 .upload-message {
   margin-top: 12px;
   color: #397453;
   font-size: 12px;
+}
+.attachment-list {
+  margin-top: 20px;
+  padding-top: 18px;
+  border-top: 1px solid #edf0f2;
+}
+.attachment-list h3 {
+  margin: 0 0 11px;
+  color: #4c5962;
+  font-size: 13px;
+}
+.attachment-item {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 13px;
+  border: 1px solid #e3e8eb;
+  border-radius: 11px;
+  background: #fafbfc;
+}
+.attachment-icon {
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  background: #e7eef3;
+  color: #43647b;
+  font-size: 11px;
+  font-weight: 800;
+}
+.attachment-info {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+.attachment-info strong,
+.attachment-info span,
+.attachment-info small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attachment-info strong {
+  font-size: 13px;
+}
+.attachment-info span,
+.attachment-info small,
+.attachment-empty {
+  color: #7d8991;
+  font-size: 11px;
+}
+.attachment-info small {
+  color: #ad5555;
+}
+.attachment-download {
+  color: #426786;
+  font-size: 12px;
+  text-decoration: none;
+}
+.attachment-empty {
+  padding: 18px;
+  border: 1px dashed #cfd7dc;
+  border-radius: 10px;
+  text-align: center;
 }
 .agent-state {
   padding: 8px 12px;
@@ -943,6 +1107,10 @@ td small {
   }
   .resume-upload {
     grid-template-columns: 1fr;
+  }
+  .resume-upload > .primary {
+    grid-column: auto;
+    justify-self: stretch;
   }
   .agent-limits {
     grid-template-columns: 1fr;
