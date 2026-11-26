@@ -1,0 +1,12 @@
+{
+  "$schema":"../../node_modules/wrangler/config-schema.json",
+  "name":"ai-bunshin-web",
+  "main":"src/index.tsx",
+  "compatibility_date":"2026-11-26",
+  "compatibility_flags":["nodejs_compat"],
+  "assets":{"directory":"./public","binding":"ASSETS","run_worker_first":["/*"]},
+  "d1_databases":[{"binding":"DB","database_name":"ai-bunshin-local","database_id":"local-development"}],
+  "kv_namespaces":[{"binding":"CACHE","id":"local-development"}],
+  "vectorize":[{"binding":"VECTORIZE","index_name":"ai-bunshin-knowledge-v1"}],
+  "observability":{"enabled":true,"logs":{"enabled":true,"head_sampling_rate":1}}
+}

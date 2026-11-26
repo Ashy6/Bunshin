@@ -1,0 +1,5 @@
+MASTER_ENCRYPTION_KEY=base64-encoded-32-byte-key
+SESSION_SECRET=replace-with-at-least-32-random-bytes
+ADMIN_BOOTSTRAP_TOKEN=replace-with-one-time-bootstrap-token
+PUBLIC_ORIGIN=http://localhost:8787
+ADMIN_ORIGIN=http://localhost:8788

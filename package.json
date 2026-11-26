@@ -1,0 +1,27 @@
+{
+  "name": "ai-bunshin",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.25.0",
+  "engines": { "node": ">=22.13.0" },
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "lint": "turbo lint",
+    "typecheck": "turbo typecheck",
+    "test": "turbo test",
+    "deploy": "turbo deploy",
+    "db:migrate:local": "pnpm --filter @ai-bunshin/db migrate:local",
+    "db:migrate:remote": "pnpm --filter @ai-bunshin/db migrate:remote",
+    "admin:init": "pnpm --filter @ai-bunshin/admin admin:init",
+    "cf:login": "wrangler login",
+    "cf:setup": "tsx infra/cloudflare/setup.ts"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261125.1",
+    "tsx": "^4.20.6",
+    "turbo": "^2.6.1",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.50.0"
+  }
+}
