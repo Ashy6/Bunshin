@@ -116,6 +116,7 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.account .account-logout{padding:0;border:0;background:transparent;color:#91a0aa;font:inherit;font-size:11px;white-space:nowrap;cursor:pointer}.account .account-logout:hover{color:#fff}
 .shell > main {
   margin-left: 228px;
   padding: 34px 38px 80px;

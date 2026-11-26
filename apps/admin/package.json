@@ -9,7 +9,7 @@
     "deploy": "vite build && wrangler deploy",
     "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit",
-    "test": "vitest run --config vitest.config.ts",
+    "test": "vitest run --config vitest.config.ts --configLoader runner",
     "admin:init": "tsx scripts/init-admin.ts"
   },
   "dependencies": {

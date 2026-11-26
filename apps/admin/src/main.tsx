@@ -1400,6 +1400,14 @@ function AdminApp() {
             <img src={`/api/admin/profile/avatar?v=${encodeURIComponent(shellProfile?.updated_at || "default")}`} style={{ objectPosition: `${shellProfile?.avatar_position_x ?? 50}% ${shellProfile?.avatar_position_y ?? 50}%` }} alt="站长头像" />
             <span><strong>{shellProfile?.display_name || "站长"}</strong></span>
           </button>
+          <button
+            className="account-logout"
+            type="button"
+            onClick={async () => {
+              await fetch("/api/admin/auth/logout", { method: "POST" });
+              location.reload();
+            }}
+          >退出登录</button>
         </div>
       </aside>
       <main>

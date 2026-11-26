@@ -378,7 +378,8 @@ app.use("/api/*", async (c, next) => {
   const started=Date.now(),traceId=c.req.header("cf-ray")??crypto.randomUUID();
   await next();
   const durationMs=Date.now()-started,statusCode=c.res.status;
-  c.executionCtx.waitUntil(recordAdminTelemetry(c.env,{eventType:"http_request",severity:statusCode>=500?"error":statusCode>=400?"warning":"info",route:c.req.path,durationMs,statusCode,traceId,detail:{method:c.req.method}}));
+  if (c.req.path !== "/api/admin/observability")
+    c.executionCtx.waitUntil(recordAdminTelemetry(c.env,{eventType:"http_request",severity:statusCode>=500?"error":statusCode>=400?"warning":"info",route:c.req.path,durationMs,statusCode,traceId,detail:{method:c.req.method}}));
   c.header("X-Trace-Id",traceId);
   c.header("Cache-Control", "no-store");
   c.header("X-Robots-Tag", "noindex, nofollow");
@@ -663,17 +664,19 @@ app.post("/api/admin/maintenance/repair-document-metadata", async (c) => {
 app.get("/api/admin/observability", async (c) => {
   const hours=boundedInteger(c.req.query("hours"),24,1,168),modifier=`-${hours} hours`;
   await evaluateOperationalAlerts(c.env);
-  const [requests,usage,rag,queue,alerts,events,budgets,stuck]=await Promise.all([
-    c.env.DB.prepare("SELECT COUNT(*) total,SUM(CASE WHEN severity IN ('error','critical') OR status_code>=500 THEN 1 ELSE 0 END) errors,COALESCE(AVG(duration_ms),0) avg_duration_ms,SUM(CASE WHEN duration_ms>=12000 THEN 1 ELSE 0 END) slow FROM observability_events WHERE created_at>=datetime('now',?)").bind(modifier).first(),
+  const observabilityRow=await c.env.DB.prepare("SELECT value FROM settings WHERE key='observability_config'").first<{value:string}>(),
+    config=parseObservabilityConfig(observabilityRow?.value),
+    [requests,usage,rag,queue,alerts,events,budgets,stuck]=await Promise.all([
+    c.env.DB.prepare("SELECT COUNT(*) total,SUM(CASE WHEN severity IN ('error','critical') OR status_code>=500 THEN 1 ELSE 0 END) errors,COALESCE(AVG(duration_ms),0) avg_duration_ms,SUM(CASE WHEN duration_ms>=? THEN 1 ELSE 0 END) slow FROM observability_events WHERE created_at>=datetime('now',?)").bind(config.slowRequestMs,modifier).first(),
     c.env.DB.prepare("SELECT COUNT(*) total,SUM(CASE WHEN status!='success' THEN 1 ELSE 0 END) errors,COALESCE(AVG(latency_ms),0) avg_latency_ms,COALESCE(SUM(cost_micros),0) cost_micros FROM usage_events WHERE created_at>=datetime('now',?)").bind(modifier).first(),
     c.env.DB.prepare("SELECT COUNT(*) queries,COALESCE(AVG(retrieval_ms),0) avg_retrieval_ms,SUM(CASE WHEN answer_status='no_match' THEN 1 ELSE 0 END) no_match,COALESCE(AVG(top_score),0) avg_top_score FROM rag_query_events WHERE created_at>=datetime('now',?)").bind(modifier).first(),
     c.env.DB.prepare("SELECT COUNT(*) total,SUM(CASE WHEN status='processing' THEN 1 ELSE 0 END) processing,SUM(CASE WHEN status IN ('retrying','dead_letter_risk') THEN 1 ELSE 0 END) retrying,SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) completed FROM queue_job_runs WHERE heartbeat_at>=datetime('now',?)").bind(modifier).first(),
     c.env.DB.prepare("SELECT * FROM operational_alerts WHERE status!='resolved' ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'error' THEN 1 WHEN 'warning' THEN 2 ELSE 3 END,last_seen_at DESC LIMIT 100").all(),
     c.env.DB.prepare("SELECT * FROM observability_events WHERE created_at>=datetime('now',?) ORDER BY created_at DESC LIMIT 100").bind(modifier).all(),
     c.env.DB.prepare("SELECT providers.id,providers.name,providers.monthly_budget_micros,COALESCE(SUM(usage_events.cost_micros),0) spent_micros FROM providers LEFT JOIN usage_events ON usage_events.provider_id=providers.id AND usage_events.created_at>=datetime('now','start of month') GROUP BY providers.id ORDER BY providers.is_default DESC,providers.name").all(),
-    c.env.DB.prepare("SELECT id,title,status,ingestion_progress,updated_at FROM documents WHERE status IN ('parsing','embedding') AND updated_at<datetime('now','-15 minutes') ORDER BY updated_at").all(),
+    c.env.DB.prepare("SELECT id,title,status,ingestion_progress,updated_at FROM documents WHERE status IN ('parsing','embedding') AND updated_at<datetime('now',?) ORDER BY updated_at").bind(`-${config.stuckMinutes} minutes`).all(),
   ]);
-  return c.json({hours,requests:requests??{},usage:usage??{},rag:rag??{},queue:queue??{},alerts:alerts.results,events:events.results,budgets:budgets.results,stuck:stuck.results});
+  return c.json({hours,config,requests:requests??{},usage:usage??{},rag:rag??{},queue:queue??{},alerts:alerts.results,events:events.results,budgets:budgets.results,stuck:stuck.results});
 });
 app.post("/api/admin/observability/alerts/:id/ack", async (c) => {
   await c.env.DB.prepare("UPDATE operational_alerts SET status='acknowledged',acknowledged_at=? WHERE id=? AND status='open'").bind(new Date().toISOString(),c.req.param("id")).run();
@@ -1784,17 +1787,19 @@ async function currentAdmin(request: Request, env: Env) {
 
 async function syncOperationalAlert(env:Env,input:{fingerprint:string;active:boolean;kind:string;severity:"warning"|"error"|"critical";title:string;message:string;metric?:number;threshold?:number}){const now=new Date().toISOString();if(!input.active){await env.DB.prepare("UPDATE operational_alerts SET status='resolved',resolved_at=?,last_seen_at=? WHERE fingerprint=? AND status!='resolved'").bind(now,now,input.fingerprint).run();return}await env.DB.prepare("INSERT INTO operational_alerts (id,fingerprint,kind,severity,title,message,status,metric_value,threshold_value,first_seen_at,last_seen_at) VALUES (?,?,?,?,?,?,'open',?,?,?,?) ON CONFLICT(fingerprint) DO UPDATE SET kind=excluded.kind,severity=excluded.severity,title=excluded.title,message=excluded.message,metric_value=excluded.metric_value,threshold_value=excluded.threshold_value,last_seen_at=excluded.last_seen_at,status=CASE WHEN operational_alerts.status='resolved' THEN 'open' ELSE operational_alerts.status END,resolved_at=NULL").bind(crypto.randomUUID(),input.fingerprint,input.kind,input.severity,input.title,input.message,input.metric??null,input.threshold??null,now,now).run()}
 
-async function evaluateOperationalAlerts(env:Env){const setting=await env.DB.prepare("SELECT value FROM settings WHERE key='observability_config'").first<{value:string}>(),config={errorRateThreshold:20,minimumRequests:5,stuckMinutes:15,budgetWarningPercent:80,slowRequestMs:12000,...(setting?.value?JSON.parse(setting.value):{})},[usage,stuck,queue,budgets,turnstile]=await Promise.all([
+async function evaluateOperationalAlerts(env:Env){const setting=await env.DB.prepare("SELECT value FROM settings WHERE key='observability_config'").first<{value:string}>(),config=parseObservabilityConfig(setting?.value),[usage,stuck,queue,budgets,turnstile,slow]=await Promise.all([
   env.DB.prepare("SELECT COUNT(*) total,SUM(CASE WHEN status!='success' THEN 1 ELSE 0 END) errors FROM usage_events WHERE created_at>=datetime('now','-15 minutes')").first<{total:number;errors:number}>(),
   env.DB.prepare("SELECT COUNT(*) count FROM documents WHERE status IN ('parsing','embedding') AND updated_at<datetime('now',?)").bind(`-${config.stuckMinutes} minutes`).first<{count:number}>(),
   env.DB.prepare("SELECT COUNT(*) count FROM queue_job_runs WHERE status IN ('retrying','dead_letter_risk') OR (status='processing' AND heartbeat_at<datetime('now',?))").bind(`-${config.stuckMinutes} minutes`).first<{count:number}>(),
   env.DB.prepare("SELECT providers.id,providers.name,providers.monthly_budget_micros,COALESCE(SUM(usage_events.cost_micros),0) spent FROM providers LEFT JOIN usage_events ON usage_events.provider_id=providers.id AND usage_events.created_at>=datetime('now','start of month') GROUP BY providers.id").all<{id:string;name:string;monthly_budget_micros:number;spent:number}>(),
   env.DB.prepare("SELECT COUNT(*) total,SUM(CASE WHEN event_type='turnstile_fail' THEN 1 ELSE 0 END) failed FROM observability_events WHERE event_type IN ('turnstile_pass','turnstile_fail') AND created_at>=datetime('now','-15 minutes')").first<{total:number;failed:number}>(),
+  env.DB.prepare("SELECT COUNT(*) total,SUM(CASE WHEN duration_ms>=? THEN 1 ELSE 0 END) slow FROM observability_events WHERE created_at>=datetime('now','-15 minutes')").bind(config.slowRequestMs).first<{total:number;slow:number}>(),
 ]);const errorRate=(usage?.total??0)>0?((usage?.errors??0)/(usage?.total??1))*100:0,turnstileRate=(turnstile?.total??0)>0?((turnstile?.failed??0)/(turnstile?.total??1))*100:0;await Promise.all([
   syncOperationalAlert(env,{fingerprint:"usage_error_rate",active:(usage?.total??0)>=config.minimumRequests&&errorRate>=config.errorRateThreshold,kind:"error_rate",severity:"error",title:"模型调用错误率升高",message:`最近 15 分钟错误率 ${errorRate.toFixed(1)}%`,metric:errorRate,threshold:config.errorRateThreshold}),
   syncOperationalAlert(env,{fingerprint:"stuck_documents",active:(stuck?.count??0)>0,kind:"stuck",severity:"critical",title:"文档处理可能卡死",message:`${stuck?.count??0} 个任务超过 ${config.stuckMinutes} 分钟未推进`,metric:stuck?.count??0,threshold:1}),
   syncOperationalAlert(env,{fingerprint:"queue_retry_risk",active:(queue?.count??0)>0,kind:"dead_letter",severity:"critical",title:"Queue 重试或死信风险",message:`${queue?.count??0} 个 Queue 任务正在重试或心跳超时`,metric:queue?.count??0,threshold:1}),
   syncOperationalAlert(env,{fingerprint:"turnstile_failure_rate",active:(turnstile?.total??0)>=10&&turnstileRate>=50,kind:"security",severity:"warning",title:"人机验证失败率异常",message:`最近 15 分钟 Turnstile 失败率 ${turnstileRate.toFixed(1)}%`,metric:turnstileRate,threshold:50}),
+  syncOperationalAlert(env,{fingerprint:"slow_requests",active:(slow?.slow??0)>0,kind:"latency",severity:"warning",title:"检测到慢请求",message:`最近 15 分钟有 ${slow?.slow??0} 次请求超过 ${config.slowRequestMs} ms`,metric:slow?.slow??0,threshold:config.slowRequestMs}),
   ...budgets.results.map((provider)=>{const percent=provider.monthly_budget_micros>0?provider.spent/provider.monthly_budget_micros*100:0;return syncOperationalAlert(env,{fingerprint:`budget:${provider.id}`,active:provider.monthly_budget_micros>0&&percent>=config.budgetWarningPercent,kind:"budget",severity:percent>=100?"critical":"warning",title:`${provider.name} 预算预警`,message:`本月预算已使用 ${percent.toFixed(1)}%`,metric:percent,threshold:config.budgetWarningPercent})}),
 ]);}
 
