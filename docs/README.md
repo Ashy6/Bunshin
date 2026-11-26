@@ -12,6 +12,7 @@
 - [Monorepo 项目结构](./repository-structure.md)
 - [数据、安全、GEO/SEO 与 Cloudflare 部署](./security-seo-deployment.md)
 - [生产监控、混合 RAG 与 Turnstile](./observability-rag-turnstile.md)
+- [生产环境端到端验收记录（2026-11-27）](./production-acceptance-2026-11-27.md)
 
 ## 已确认的产品边界
 

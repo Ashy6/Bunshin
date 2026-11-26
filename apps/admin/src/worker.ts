@@ -2041,12 +2041,52 @@ async function repairDocumentMetadata(env: Env) {
   }
   return { scanned: documents.length, repaired, missing };
 }
+async function recoverPendingIngestion(env: Env) {
+  const documents = (
+    await env.DB.prepare(
+      "SELECT id,r2_key,source_type FROM documents WHERE status='uploaded' AND r2_key IS NOT NULL AND updated_at<datetime('now','-1 minute') ORDER BY updated_at LIMIT 20",
+    ).all<{ id: string; r2_key: string; source_type: string }>()
+  ).results;
+  let queued = 0,
+    failed = 0;
+  for (const document of documents) {
+    const claimed = await env.DB.prepare(
+      "UPDATE documents SET status='parsing',ingestion_progress=20,error_message=NULL,updated_at=? WHERE id=? AND status='uploaded'",
+    ).bind(new Date().toISOString(), document.id).run();
+    if ((claimed.meta.changes ?? 0) === 0) continue;
+    try {
+      await env.INGESTION_QUEUE.send({
+        type: "ingest",
+        documentId: document.id,
+        r2Key: document.r2_key,
+        mimeType: document.source_type === "pdf" ? "application/pdf" : document.source_type === "text" ? "text/plain" : "text/markdown",
+      } satisfies Job);
+      queued += 1;
+      await recordAdminTelemetry(env, {
+        eventType: "ingestion_recovered",
+        severity: "info",
+        scenario: "cron",
+        detail: { documentId: document.id },
+      });
+    } catch (error) {
+      failed += 1;
+      await env.DB.prepare(
+        "UPDATE documents SET status='uploaded',ingestion_progress=10,error_message=?,updated_at=? WHERE id=? AND status='parsing'",
+      ).bind(
+        `Queue 重投失败：${error instanceof Error ? error.message : "unknown error"}`.slice(0, 500),
+        new Date().toISOString(),
+        document.id,
+      ).run();
+    }
+  }
+  return { scanned: documents.length, queued, failed };
+}
 export default {
   fetch: app.fetch,
   queue: consume,
   scheduled: (_controller: ScheduledController, env: Env, ctx: ExecutionContext) => {
     ctx.waitUntil(
-      Promise.all([publishScheduledArticles(env), repairDocumentMetadata(env),evaluateOperationalAlerts(env)]),
+      Promise.all([publishScheduledArticles(env), repairDocumentMetadata(env), recoverPendingIngestion(env), evaluateOperationalAlerts(env)]),
     );
   },
 };
