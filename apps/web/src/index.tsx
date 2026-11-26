@@ -19,6 +19,169 @@ type Bindings = {
   MASTER_ENCRYPTION_KEY: string;
 };
 const app = new Hono<{ Bindings: Bindings }>();
+type AgentConfig = {
+  enabled: boolean;
+  dailyLimit: number;
+  minuteLimit: number;
+  globalDailyLimit: number;
+  welcomeMessage: string;
+  systemInstruction: string;
+};
+const defaultAgentConfig: AgentConfig = {
+  enabled: true,
+  dailyLimit: 25,
+  minuteLimit: 5,
+  globalDailyLimit: 500,
+  welcomeMessage:
+    "你好，我是站长的个人分身。你可以问我有关经历、项目和文章的问题。",
+  systemInstruction: "请简洁、准确地依据知识库回答。",
+};
+async function agentConfig(env: Bindings) {
+  const row = await env.DB.prepare(
+    "SELECT value FROM settings WHERE key='agent_config'",
+  ).first<{ value: string }>();
+  if (!row) return defaultAgentConfig;
+  try {
+    return { ...defaultAgentConfig, ...JSON.parse(row.value) } as AgentConfig;
+  } catch {
+    return defaultAgentConfig;
+  }
+}
+function cookieValue(request: Request, name: string) {
+  const cookies = request.headers.get("Cookie") ?? "";
+  for (const part of cookies.split(";")) {
+    const [key, ...value] = part.trim().split("=");
+    if (key === name) return decodeURIComponent(value.join("="));
+  }
+  return null;
+}
+async function sha256Text(value: string) {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  );
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+async function visitorIdentity(request: Request, env: Bindings) {
+  const existing = cookieValue(request, "bunshin_visitor"),
+    id =
+      existing && /^[a-f0-9-]{36}$/.test(existing)
+        ? existing
+        : crypto.randomUUID(),
+    ip = request.headers.get("CF-Connecting-IP") ?? "local",
+    hash = await sha256Text(`${env.MASTER_ENCRYPTION_KEY}:${id}:${ip}`);
+  return {
+    hash,
+    setCookie: existing
+      ? null
+      : `bunshin_visitor=${id}; Path=/; Max-Age=31536000; Secure; HttpOnly; SameSite=Lax`,
+  };
+}
+function shanghaiParts(now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(now);
+  const get = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((part) => part.type === type)?.value ?? "00";
+  return {
+    day: `${get("year")}-${get("month")}-${get("day")}`,
+    minute: `${get("year")}-${get("month")}-${get("day")}-${get("hour")}-${get("minute")}`,
+  };
+}
+async function incrementLimit(
+  env: Bindings,
+  visitorHash: string,
+  bucket: string,
+  limit: number,
+  expiresAt: string,
+) {
+  const row = await env.DB.prepare(
+    "INSERT INTO rate_limit_buckets (visitor_hash,bucket,count,expires_at,updated_at) VALUES (?,?,1,?,?) ON CONFLICT(visitor_hash,bucket) DO UPDATE SET count=count+1,updated_at=excluded.updated_at WHERE count<? RETURNING count",
+  )
+    .bind(visitorHash, bucket, expiresAt, new Date().toISOString(), limit)
+    .first<{ count: number }>();
+  return row?.count ?? null;
+}
+async function releaseLimit(
+  env: Bindings,
+  visitorHash: string,
+  bucket: string,
+) {
+  await env.DB.prepare(
+    "UPDATE rate_limit_buckets SET count=MAX(0,count-1),updated_at=? WHERE visitor_hash=? AND bucket=?",
+  )
+    .bind(new Date().toISOString(), visitorHash, bucket)
+    .run();
+}
+async function reserveAgentQuota(
+  env: Bindings,
+  visitorHash: string,
+  config: AgentConfig,
+) {
+  const parts = shanghaiParts(),
+    expires = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(),
+    buckets = [
+      { hash: visitorHash, name: `day:${parts.day}`, limit: config.dailyLimit },
+      {
+        hash: visitorHash,
+        name: `minute:${parts.minute}`,
+        limit: config.minuteLimit,
+      },
+      {
+        hash: "__global__",
+        name: `day:${parts.day}`,
+        limit: config.globalDailyLimit,
+      },
+    ],
+    reserved: Array<{ hash: string; name: string }> = [];
+  for (const bucket of buckets) {
+    const count = await incrementLimit(
+      env,
+      bucket.hash,
+      bucket.name,
+      bucket.limit,
+      expires,
+    );
+    if (count === null) {
+      await Promise.all(
+        reserved.map((item) => releaseLimit(env, item.hash, item.name)),
+      );
+      return {
+        ok: false as const,
+        reason: bucket.name.startsWith("minute:")
+          ? "请求过于频繁，请一分钟后再试"
+          : bucket.hash === "__global__"
+            ? "今日全站问答额度已用完"
+            : `你今天的 ${config.dailyLimit} 次问答额度已用完`,
+      };
+    }
+    reserved.push({ hash: bucket.hash, name: bucket.name });
+  }
+  return {
+    ok: true as const,
+    remaining: Math.max(
+      0,
+      config.dailyLimit -
+        (await env.DB.prepare(
+          "SELECT count FROM rate_limit_buckets WHERE visitor_hash=? AND bucket=?",
+        )
+          .bind(visitorHash, `day:${parts.day}`)
+          .first<{ count: number }>())!.count,
+    ),
+    release: () =>
+      Promise.all(
+        reserved.map((item) => releaseLimit(env, item.hash, item.name)),
+      ),
+  };
+}
 function renderSafeMarkdown(markdown: string) {
   const escape = (value: string) =>
     value
@@ -99,6 +262,34 @@ function layout(
             height: 100%;
             object-fit: cover;
           }
+          .agent-meta {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            margin-top: 9px;
+            color: var(--muted);
+            font-size: 12px;
+          }
+          .ask-form button:disabled,
+          .ask-form textarea:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+          }
+          .answer-sources {
+            margin-top: 10px;
+            padding: 12px 16px;
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            color: var(--muted);
+            font-size: 12px;
+          }
+          .answer-sources strong {
+            color: var(--text);
+          }
+          .answer-sources ul {
+            margin: 6px 0 0;
+            padding-left: 18px;
+          }
         </style>
         <script type="application/ld+json">
           ${JSON.stringify({
@@ -143,7 +334,7 @@ function layout(
           </footer>
         </div>
         <script src="/profile.js" defer></script>
-        <script src="/app.js" defer></script>
+        <script src="/agent.js" defer></script>
       </body>
     </html>`;
 }
@@ -164,7 +355,12 @@ app.get("/", (c) =>
             ></textarea
             ><button type="submit" aria-label="发送">↑</button>
           </form>
+          <div class="agent-meta">
+            <span id="agent-status">正在读取 Agent 状态…</span
+            ><span id="agent-quota"></span>
+          </div>
           <div id="answer" class="answer" hidden></div>
+          <div id="answer-sources" class="answer-sources" hidden></div>
           <div class="suggestions">
             <button>介绍一下你的核心经历</button
             ><button>你如何设计 RAG 系统？</button
@@ -324,14 +520,68 @@ app.get("/api/profile", async (c) => {
   });
 });
 
+app.get("/api/agent/status", async (c) => {
+  const [config, provider, documents, visitor] = await Promise.all([
+    agentConfig(c.env),
+    c.env.DB.prepare(
+      "SELECT id,health_status,monthly_budget_micros,(SELECT COALESCE(SUM(cost_micros),0) FROM usage_events WHERE provider_id=providers.id AND created_at>=datetime('now','start of month')) month_spent_micros FROM providers WHERE enabled=1 AND is_default=1 LIMIT 1",
+    ).first<{
+      health_status: string;
+      monthly_budget_micros: number;
+      month_spent_micros: number;
+    }>(),
+    c.env.DB.prepare(
+      "SELECT COUNT(*) count FROM documents WHERE status='indexed' AND visibility!='private'",
+    ).first<{ count: number }>(),
+    visitorIdentity(c.req.raw, c.env),
+  ]);
+  const parts = shanghaiParts(),
+    usage = await c.env.DB.prepare(
+      "SELECT count FROM rate_limit_buckets WHERE visitor_hash=? AND bucket=?",
+    )
+      .bind(visitor.hash, `day:${parts.day}`)
+      .first<{ count: number }>(),
+    ready = Boolean(
+      config.enabled &&
+        provider?.health_status === "healthy" &&
+        (provider.monthly_budget_micros === 0 ||
+          provider.month_spent_micros < provider.monthly_budget_micros) &&
+        (documents?.count ?? 0) > 0,
+    );
+  if (visitor.setCookie) c.header("Set-Cookie", visitor.setCookie);
+  return c.json(
+    {
+      enabled: config.enabled,
+      ready,
+      remaining: Math.max(0, config.dailyLimit - (usage?.count ?? 0)),
+      dailyLimit: config.dailyLimit,
+      welcomeMessage: config.welcomeMessage,
+      reason: !config.enabled
+        ? "站长暂时关闭了 Agent 问答"
+        : provider?.health_status !== "healthy"
+          ? "模型渠道尚未完成验证"
+          : provider.monthly_budget_micros > 0 &&
+              provider.month_spent_micros >= provider.monthly_budget_micros
+            ? "本月模型预算已用完"
+            : (documents?.count ?? 0) === 0
+              ? "知识库尚未准备完成"
+              : null,
+    },
+    200,
+    { "Cache-Control": "no-store" },
+  );
+});
+
 app.post("/api/chat", async (c) => {
   const parsed = chatRequestSchema.safeParse(
     await c.req.json().catch(() => null),
   );
   if (!parsed.success) return c.json({ error: "问题格式不正确" }, 400);
-  const question = parsed.data.message;
+  const question = parsed.data.message,
+    config = await agentConfig(c.env),
+    visitor = await visitorIdentity(c.req.raw, c.env);
   const provider = await c.env.DB.prepare(
-    "SELECT id,base_url,encrypted_api_key,chat_model,embedding_model,embedding_mode FROM providers WHERE enabled=1 ORDER BY is_default DESC,updated_at DESC LIMIT 1",
+    "SELECT id,base_url,encrypted_api_key,chat_model,embedding_model,embedding_mode,health_status,input_price_micros,output_price_micros,monthly_budget_micros,(SELECT COALESCE(SUM(cost_micros),0) FROM usage_events WHERE provider_id=providers.id AND created_at>=datetime('now','start of month')) month_spent_micros FROM providers WHERE enabled=1 ORDER BY is_default DESC,updated_at DESC LIMIT 1",
   ).first<{
     id: string;
     base_url: string;
@@ -339,7 +589,27 @@ app.post("/api/chat", async (c) => {
     chat_model: string;
     embedding_model: string;
     embedding_mode: string;
+    health_status: string;
+    input_price_micros: number;
+    output_price_micros: number;
+    monthly_budget_micros: number;
+    month_spent_micros: number;
   }>();
+  const readyDocuments = await c.env.DB.prepare(
+    "SELECT COUNT(*) count FROM documents WHERE status='indexed' AND visibility!='private'",
+  ).first<{ count: number }>();
+  if (
+    !config.enabled ||
+    provider?.health_status !== "healthy" ||
+    (provider.monthly_budget_micros > 0 &&
+      provider.month_spent_micros >= provider.monthly_budget_micros) ||
+    (readyDocuments?.count ?? 0) === 0
+  )
+    return c.json(
+      { error: "Agent 尚未就绪，请稍后再试" },
+      503,
+      visitor.setCookie ? { "Set-Cookie": visitor.setCookie } : undefined,
+    );
   let apiKey: string | null = null;
   if (provider)
     apiKey = await decryptSecret(
@@ -428,6 +698,7 @@ app.post("/api/chat", async (c) => {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache, no-transform",
     "X-Accel-Buffering": "no",
+    ...(visitor.setCookie ? { "Set-Cookie": visitor.setCookie } : {}),
   };
   if (!contexts.length) {
     return new Response(
@@ -435,6 +706,13 @@ app.post("/api/chat", async (c) => {
       { headers },
     );
   }
+  const quota = await reserveAgentQuota(c.env, visitor.hash, config);
+  if (!quota.ok)
+    return c.json(
+      { error: quota.reason },
+      429,
+      visitor.setCookie ? { "Set-Cookie": visitor.setCookie } : undefined,
+    );
   if (!provider) {
     const evidence = contexts
       .map((item, index) => `[${index + 1}] ${item.title}：${item.content}`)
@@ -452,10 +730,14 @@ app.post("/api/chat", async (c) => {
       [
         {
           role: "system",
-          content: buildGroundedPrompt(
-            question,
-            contexts.map((item) => ({ title: item.title, text: item.content })),
-          ),
+          content:
+            buildGroundedPrompt(
+              question,
+              contexts.map((item) => ({
+                title: item.title,
+                text: item.content,
+              })),
+            ) + `\n\n附加要求：${config.systemInstruction}`,
         },
         { role: "user", content: question },
       ],
@@ -465,8 +747,15 @@ app.post("/api/chat", async (c) => {
         const reader = upstream.body!.getReader(),
           decoder = new TextDecoder();
         let buffer = "",
-          outputChars = 0;
+          outputChars = 0,
+          providerInputTokens = 0,
+          providerOutputTokens = 0;
         try {
+          controller.enqueue(
+            enc.encode(
+              `data: ${JSON.stringify({ type: "sources", items: contexts.map((item) => ({ title: item.title, score: item.score })) })}\n\n`,
+            ),
+          );
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
@@ -480,7 +769,15 @@ app.post("/api/chat", async (c) => {
               try {
                 const event = JSON.parse(raw) as {
                   choices?: Array<{ delta?: { content?: string } }>;
+                  usage?: {
+                    prompt_tokens?: number;
+                    completion_tokens?: number;
+                  };
                 };
+                if (event.usage) {
+                  providerInputTokens = event.usage.prompt_tokens ?? 0;
+                  providerOutputTokens = event.usage.completion_tokens ?? 0;
+                }
                 const text = event.choices?.[0]?.delta?.content;
                 if (text) {
                   outputChars += text.length;
@@ -494,32 +791,40 @@ app.post("/api/chat", async (c) => {
             }
           }
           controller.enqueue(
-            enc.encode(`data: ${JSON.stringify({ type: "done" })}\n\n`),
+            enc.encode(
+              `data: ${JSON.stringify({ type: "done", remaining: quota.remaining })}\n\n`,
+            ),
           );
+          const estimatedInput = Math.ceil(
+              (question.length +
+                contexts.reduce((sum, item) => sum + item.content.length, 0)) /
+                3,
+            ),
+            inputTokens = providerInputTokens || estimatedInput,
+            outputTokens = providerOutputTokens || Math.ceil(outputChars / 3),
+            costMicros = Math.ceil(
+              (inputTokens * provider.input_price_micros +
+                outputTokens * provider.output_price_micros) /
+                1_000_000,
+            );
           c.executionCtx.waitUntil(
             c.env.DB.prepare(
-              "INSERT INTO usage_events (id,scenario,provider_id,model,input_tokens,output_tokens,cached_tokens,cost_micros,currency,latency_ms,status,estimated,trace_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              "INSERT INTO usage_events (id,scenario,provider_id,model,input_tokens,output_tokens,cached_tokens,cost_micros,currency,latency_ms,status,estimated,visitor_hash,trace_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             )
               .bind(
                 crypto.randomUUID(),
                 "chat",
                 provider.id,
                 provider.chat_model,
-                Math.ceil(
-                  (question.length +
-                    contexts.reduce(
-                      (sum, item) => sum + item.content.length,
-                      0,
-                    )) /
-                    3,
-                ),
-                Math.ceil(outputChars / 3),
+                inputTokens,
+                outputTokens,
                 0,
-                0,
+                costMicros,
                 "USD",
                 Date.now() - chatStarted,
                 "success",
-                1,
+                providerInputTokens > 0 ? 0 : 1,
+                visitor.hash,
                 crypto.randomUUID(),
                 new Date().toISOString(),
               )
@@ -527,6 +832,7 @@ app.post("/api/chat", async (c) => {
           );
           controller.close();
         } catch {
+          await quota.release();
           controller.enqueue(
             enc.encode(
               `data: ${JSON.stringify({ type: "error", text: "模型响应中断" })}\n\n`,
@@ -538,6 +844,7 @@ app.post("/api/chat", async (c) => {
     });
     return new Response(stream, { headers });
   } catch (error) {
+    await quota.release();
     return new Response(
       `data: ${JSON.stringify({ type: "error", text: "模型渠道暂时不可用，请稍后重试。" })}\n\n`,
       { status: 502, headers },

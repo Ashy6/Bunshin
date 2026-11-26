@@ -22,6 +22,7 @@ type View =
   | "content"
   | "articles"
   | "knowledge"
+  | "agent"
   | "providers"
   | "usage"
   | "settings";
@@ -30,6 +31,7 @@ const nav: Array<{ id: View; label: string; icon: string }> = [
   { id: "content", label: "个人资料", icon: "◎" },
   { id: "articles", label: "文章管理", icon: "▤" },
   { id: "knowledge", label: "知识库", icon: "◇" },
+  { id: "agent", label: "Agent 设置", icon: "◉" },
   { id: "providers", label: "模型渠道", icon: "⌘" },
   { id: "usage", label: "用量明细", icon: "⌁" },
   { id: "settings", label: "系统设置", icon: "⚙" },
@@ -988,13 +990,16 @@ function Providers() {
         chat_model: string;
         embedding_model: string;
         embedding_mode?: string;
+        health_status?: string;
+        last_error?: string | null;
       }>
     >([]),
     [presets, setPresets] = useState<ProviderPreset[]>([]),
     [open, setOpen] = useState(false),
     [key, setKey] = useState(""),
     [presetId, setPresetId] = useState("openai"),
-    [error, setError] = useState("");
+    [error, setError] = useState(""),
+    [testingId, setTestingId] = useState<string | null>(null);
   const load = () =>
     Promise.all([
       fetch("/api/admin/providers").then((r) => r.json()),
@@ -1007,6 +1012,19 @@ function Providers() {
     void load();
   }, []);
   const selected = presets.find((p) => p.id === presetId);
+  const retest = async (id: string) => {
+    setTestingId(id);
+    setError("");
+    const response = await fetch(`/api/admin/providers/${id}/test`, {
+      method: "POST",
+    });
+    const result = (await response.json().catch(() => ({}))) as {
+      error?: string;
+    };
+    setTestingId(null);
+    if (!response.ok) setError(result.error ?? "连接测试失败");
+    await load();
+  };
   const submit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setError("");
@@ -1024,7 +1042,10 @@ function Providers() {
         }),
       });
     if (!response.ok) {
-      setError("保存失败，请检查配置");
+      const result = (await response.json().catch(() => ({}))) as {
+        error?: string;
+      };
+      setError(result.error ?? "测试失败，请检查配置");
       return;
     }
     setKey("");
@@ -1054,7 +1075,11 @@ function Providers() {
                 <h2>{item.name}</h2>
                 <p>{item.key_preview}</p>
               </div>
-              <span className="status ok">正常</span>
+              <span
+                className={`status ${item.health_status === "healthy" ? "ok" : ""}`}
+              >
+                {item.health_status === "healthy" ? "已验证" : "待验证"}
+              </span>
             </div>
             <dl>
               <div>
@@ -1070,9 +1095,17 @@ function Providers() {
                 </dd>
               </div>
             </dl>
+            <button
+              className="secondary"
+              onClick={() => void retest(item.id)}
+              disabled={testingId === item.id}
+            >
+              {testingId === item.id ? "测试中…" : "重新测试连接"}
+            </button>
           </article>
         ))}
       </section>
+      {error && !open && <div className="auth-error">{error}</div>}
       {open && (
         <div className="modal-backdrop" onMouseDown={() => setOpen(false)}>
           <form
@@ -1147,11 +1180,175 @@ function Providers() {
               <button type="button" onClick={() => setOpen(false)}>
                 取消
               </button>
-              <button className="primary">加密保存</button>
+              <button className="primary">测试并启用</button>
             </div>
           </form>
         </div>
       )}
+    </>
+  );
+}
+
+type AgentState = {
+  config: {
+    enabled: boolean;
+    dailyLimit: number;
+    minuteLimit: number;
+    globalDailyLimit: number;
+    welcomeMessage: string;
+    systemInstruction: string;
+  };
+  ready: boolean;
+  provider: null | {
+    name: string;
+    chat_model: string;
+    embedding_mode: string;
+    health_status: string;
+    last_error?: string | null;
+  };
+  documents: {
+    total: number;
+    ready: number;
+    processing: number;
+    failed: number;
+  };
+  today: { requests: number; tokens: number; cost_micros: number };
+};
+function AgentSettings() {
+  const [state, setState] = useState<AgentState | null>(null);
+  const [message, setMessage] = useState("");
+  const load = () =>
+    fetch("/api/admin/agent")
+      .then((response) => response.json() as Promise<AgentState>)
+      .then(setState);
+  useEffect(() => {
+    void load();
+  }, []);
+  if (!state) return <section className="panel">正在读取 Agent 状态…</section>;
+  const update = <K extends keyof AgentState["config"]>(
+    key: K,
+    value: AgentState["config"][K],
+  ) => setState({ ...state, config: { ...state.config, [key]: value } });
+  const save = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setMessage("");
+    const response = await fetch("/api/admin/agent", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(state.config),
+    });
+    setMessage(response.ok ? "Agent 设置已保存" : "保存失败");
+    if (response.ok) await load();
+  };
+  return (
+    <>
+      <header className="page-head">
+        <div>
+          <p>Agent 设置</p>
+          <h1>控制公开问答、额度和事实边界</h1>
+        </div>
+        <span className={`agent-state ${state.ready ? "ready" : ""}`}>
+          {state.ready ? "运行中" : "尚未就绪"}
+        </span>
+      </header>
+      <section className="stats agent-stats">
+        <article>
+          <span>模型渠道</span>
+          <strong>{state.provider?.name ?? "未配置"}</strong>
+          <small>{state.provider?.chat_model ?? "请先测试并启用渠道"}</small>
+        </article>
+        <article>
+          <span>知识库</span>
+          <strong>
+            {state.documents.ready}/{state.documents.total}
+          </strong>
+          <small>
+            {state.documents.processing} 处理中 · {state.documents.failed} 异常
+          </small>
+        </article>
+        <article>
+          <span>今日问答</span>
+          <strong>{state.today.requests}</strong>
+          <small>{state.today.tokens.toLocaleString()} Token</small>
+        </article>
+        <article>
+          <span>向量方案</span>
+          <strong>
+            {state.provider?.embedding_mode === "provider" ? "外部" : "本地"}
+          </strong>
+          <small>资料不足时拒绝编造</small>
+        </article>
+      </section>
+      <form className="panel agent-form" onSubmit={save}>
+        <label className="checkbox">
+          <input
+            type="checkbox"
+            checked={state.config.enabled}
+            onChange={(event) => update("enabled", event.target.checked)}
+          />
+          启用公开 Agent 问答
+        </label>
+        <div className="agent-limits">
+          <label>
+            每位访客每日次数
+            <input
+              type="number"
+              min="1"
+              max="1000"
+              value={state.config.dailyLimit}
+              onChange={(event) =>
+                update("dailyLimit", Number(event.target.value))
+              }
+            />
+          </label>
+          <label>
+            每位访客每分钟次数
+            <input
+              type="number"
+              min="1"
+              max="100"
+              value={state.config.minuteLimit}
+              onChange={(event) =>
+                update("minuteLimit", Number(event.target.value))
+              }
+            />
+          </label>
+          <label>
+            全站每日次数
+            <input
+              type="number"
+              min="1"
+              max="100000"
+              value={state.config.globalDailyLimit}
+              onChange={(event) =>
+                update("globalDailyLimit", Number(event.target.value))
+              }
+            />
+          </label>
+        </div>
+        <label>
+          欢迎语
+          <textarea
+            rows={3}
+            value={state.config.welcomeMessage}
+            onChange={(event) => update("welcomeMessage", event.target.value)}
+          />
+        </label>
+        <label>
+          附加系统要求
+          <textarea
+            rows={5}
+            value={state.config.systemInstruction}
+            onChange={(event) =>
+              update("systemInstruction", event.target.value)
+            }
+          />
+        </label>
+        <div className="profile-actions">
+          {message && <span>{message}</span>}
+          <button className="primary">保存 Agent 设置</button>
+        </div>
+      </form>
     </>
   );
 }
@@ -1165,6 +1362,7 @@ function Placeholder({ view }: { view: View }) {
     dashboard: "",
     knowledge: "",
     providers: "",
+    agent: "",
   };
   return (
     <>
@@ -1235,6 +1433,8 @@ function AdminApp({ onLogout }: { onLogout: () => void }) {
           <Knowledge />
         ) : view === "providers" ? (
           <Providers />
+        ) : view === "agent" ? (
+          <AgentSettings />
         ) : (
           <Placeholder view={view} />
         )}

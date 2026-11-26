@@ -4,11 +4,12 @@ import {
   encryptSecret,
   type EncryptedSecret,
 } from "@ai-bunshin/crypto";
-import { createEmbedding } from "@ai-bunshin/ai";
+import { createEmbedding, testChatConnection } from "@ai-bunshin/ai";
 import { chunkText, createLocalEmbedding } from "@ai-bunshin/rag";
 import { extractText, getDocumentProxy } from "unpdf";
 import {
   articleSchema,
+  agentSettingsSchema,
   categorySchema,
   providerSchema,
   profileSchema,
@@ -46,35 +47,52 @@ const providerPresets = {
     name: "OpenAI",
     kind: "openai",
     baseUrl: "https://api.openai.com/v1",
-    chatModel: "gpt-4.1-mini",
+    chatModel: "gpt-5.4-mini",
     embeddingModel: "text-embedding-3-small",
     embeddingMode: "provider",
+    inputPriceMicros: 750_000,
+    outputPriceMicros: 4_500_000,
   },
   deepseek: {
     name: "DeepSeek",
     kind: "openai-compatible",
     baseUrl: "https://api.deepseek.com/v1",
-    chatModel: "deepseek-chat",
+    chatModel: "deepseek-flash",
     embeddingModel: "local-hash-v1",
     embeddingMode: "local",
+    inputPriceMicros: 300_000,
+    outputPriceMicros: 1_200_000,
   },
   openrouter: {
     name: "OpenRouter",
     kind: "openai-compatible",
     baseUrl: "https://openrouter.ai/api/v1",
-    chatModel: "openai/gpt-4.1-mini",
+    chatModel: "openai/gpt-5.4-mini",
     embeddingModel: "local-hash-v1",
     embeddingMode: "local",
+    inputPriceMicros: 0,
+    outputPriceMicros: 0,
   },
   custom: {
     name: "自定义兼容渠道",
     kind: "openai-compatible",
     baseUrl: "https://api.openai.com/v1",
-    chatModel: "gpt-4.1-mini",
+    chatModel: "gpt-5.4-mini",
     embeddingModel: "local-hash-v1",
     embeddingMode: "local",
+    inputPriceMicros: 0,
+    outputPriceMicros: 0,
   },
 } as const;
+const defaultAgentConfig = {
+  enabled: true,
+  dailyLimit: 25,
+  minuteLimit: 5,
+  globalDailyLimit: 500,
+  welcomeMessage:
+    "你好，我是站长的个人分身。你可以问我有关经历、项目和文章的问题。",
+  systemInstruction: "请简洁、准确地依据知识库回答。",
+};
 app.onError((error, c) => {
   console.error("Unhandled admin API error", error);
   return c.json(
@@ -181,6 +199,12 @@ app.use("/api/admin/*", async (c, next) => {
     return next();
   const admin = await currentAdmin(c.req.raw, c.env);
   if (!admin) return c.json({ error: "请先登录" }, 401);
+  if (!["GET", "HEAD", "OPTIONS"].includes(c.req.method)) {
+    const origin = c.req.header("Origin"),
+      expected = new URL(c.req.url).origin;
+    if (origin && origin !== expected)
+      return c.json({ error: "请求来源校验失败" }, 403);
+  }
   await next();
 });
 app.get("/api/admin/analytics/overview", async (c) => {
@@ -198,6 +222,63 @@ app.get("/api/admin/analytics/trends", async (c) =>
     ).results,
   }),
 );
+app.get("/api/admin/agent", async (c) => {
+  const [setting, provider, documents, today] = await Promise.all([
+    c.env.DB.prepare(
+      "SELECT value FROM settings WHERE key='agent_config'",
+    ).first<{
+      value: string;
+    }>(),
+    c.env.DB.prepare(
+      "SELECT id,name,chat_model,embedding_model,embedding_mode,health_status,last_checked_at,last_error,monthly_budget_micros,(SELECT COALESCE(SUM(cost_micros),0) FROM usage_events WHERE provider_id=providers.id AND created_at>=datetime('now','start of month')) month_spent_micros FROM providers WHERE enabled=1 AND is_default=1 LIMIT 1",
+    ).first(),
+    c.env.DB.prepare(
+      "SELECT COUNT(*) total,SUM(CASE WHEN status='indexed' AND visibility!='private' THEN 1 ELSE 0 END) ready,SUM(CASE WHEN status IN ('uploaded','parsing','embedding') THEN 1 ELSE 0 END) processing,SUM(CASE WHEN status IN ('failed','needs_ocr') THEN 1 ELSE 0 END) failed FROM documents",
+    ).first(),
+    c.env.DB.prepare(
+      "SELECT COUNT(*) requests,COALESCE(SUM(input_tokens+output_tokens),0) tokens,COALESCE(SUM(cost_micros),0) cost_micros FROM usage_events WHERE scenario='chat' AND status='success' AND created_at>=datetime('now','start of day')",
+    ).first(),
+  ]);
+  const config = setting?.value
+    ? { ...defaultAgentConfig, ...JSON.parse(setting.value) }
+    : defaultAgentConfig;
+  return c.json({
+    config,
+    provider: provider ?? null,
+    documents: documents ?? { total: 0, ready: 0, processing: 0, failed: 0 },
+    today: today ?? { requests: 0, tokens: 0, cost_micros: 0 },
+    ready: Boolean(
+      config.enabled &&
+        provider &&
+        (provider as { health_status?: string }).health_status === "healthy" &&
+        (Number(
+          (provider as { monthly_budget_micros?: number })
+            .monthly_budget_micros ?? 0,
+        ) === 0 ||
+          Number(
+            (provider as { month_spent_micros?: number }).month_spent_micros ??
+              0,
+          ) <
+            Number(
+              (provider as { monthly_budget_micros?: number })
+                .monthly_budget_micros ?? 0,
+            )) &&
+        Number((documents as { ready?: number } | null)?.ready ?? 0) > 0,
+    ),
+  });
+});
+app.put("/api/admin/agent", async (c) => {
+  const parsed = agentSettingsSchema.safeParse(
+    await c.req.json().catch(() => null),
+  );
+  if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
+  await c.env.DB.prepare(
+    "INSERT INTO settings (key,value,updated_at) VALUES ('agent_config',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+  )
+    .bind(JSON.stringify(parsed.data), new Date().toISOString())
+    .run();
+  return c.json({ config: parsed.data });
+});
 app.get("/api/admin/profile", async (c) => {
   const row = await c.env.DB.prepare(
     "SELECT id,display_name,headline,bio,location,avatar_url,social_json,published,markdown_bio,skills_json,resume_document_id FROM profiles ORDER BY created_at LIMIT 1",
@@ -248,6 +329,38 @@ app.put("/api/admin/profile", async (c) => {
         now,
       )
       .run();
+  const profileDocumentId = "generated-profile",
+    profileKey = "generated/profile.md",
+    profileMarkdown = `# ${p.displayName}\n\n${p.headline}\n\n${p.bio}\n\n${p.markdownBio}\n\n## 技能\n\n${p.skills.join("、")}`;
+  if (p.published) {
+    await c.env.ASSETS_BUCKET.put(profileKey, profileMarkdown, {
+      httpMetadata: { contentType: "text/markdown; charset=utf-8" },
+    });
+    await c.env.DB.prepare(
+      "INSERT INTO documents (id,title,source_type,visibility,status,r2_key,created_at,updated_at) VALUES (?,?,?,'rag_only','uploaded',?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,visibility='rag_only',status='uploaded',r2_key=excluded.r2_key,error_message=NULL,updated_at=excluded.updated_at",
+    )
+      .bind(
+        profileDocumentId,
+        `${p.displayName}的个人资料`,
+        "markdown",
+        profileKey,
+        now,
+        now,
+      )
+      .run();
+    await c.env.INGESTION_QUEUE.send({
+      type: "ingest",
+      documentId: profileDocumentId,
+      r2Key: profileKey,
+      mimeType: "text/markdown",
+    } satisfies Job);
+  } else {
+    await c.env.DB.prepare(
+      "UPDATE documents SET visibility='private',updated_at=? WHERE id=?",
+    )
+      .bind(now, profileDocumentId)
+      .run();
+  }
   return c.json({ id });
 });
 app.get("/api/admin/profile/avatar", async (c) => {
@@ -351,7 +464,7 @@ app.get("/api/admin/providers", async (c) =>
   c.json({
     items: (
       await c.env.DB.prepare(
-        "SELECT id,name,kind,base_url,key_preview,chat_model,embedding_model,embedding_mode,preset_id,monthly_budget_micros,enabled,is_default,updated_at FROM providers ORDER BY updated_at DESC",
+        "SELECT id,name,kind,base_url,key_preview,chat_model,embedding_model,embedding_mode,preset_id,monthly_budget_micros,enabled,is_default,health_status,last_checked_at,last_error,updated_at FROM providers ORDER BY updated_at DESC",
       ).all()
     ).results,
   }),
@@ -440,9 +553,26 @@ app.post("/api/admin/providers/simple", async (c) => {
       input.allowExternalEmbedding && preset.embeddingMode === "provider"
         ? "provider"
         : "local";
+  try {
+    await testChatConnection({
+      baseUrl,
+      apiKey: input.apiKey,
+      model: chatModel,
+    });
+  } catch (error) {
+    return c.json(
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : "模型连接测试失败，请检查 API Key",
+      },
+      400,
+    );
+  }
   await c.env.DB.prepare("UPDATE providers SET is_default=0").run();
   await c.env.DB.prepare(
-    "INSERT INTO providers (id,name,kind,base_url,encrypted_api_key,key_preview,chat_model,embedding_model,monthly_budget_micros,is_default,preset_id,embedding_mode,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    "INSERT INTO providers (id,name,kind,base_url,encrypted_api_key,key_preview,chat_model,embedding_model,input_price_micros,output_price_micros,monthly_budget_micros,is_default,preset_id,embedding_mode,health_status,last_checked_at,last_error,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
   )
     .bind(
       id,
@@ -453,15 +583,88 @@ app.post("/api/admin/providers/simple", async (c) => {
       preview,
       chatModel,
       preset.embeddingModel,
+      preset.inputPriceMicros,
+      preset.outputPriceMicros,
       input.monthlyBudgetMicros,
       1,
       input.presetId,
       embeddingMode,
+      "healthy",
+      now,
+      null,
       now,
       now,
     )
     .run();
-  return c.json({ id, keyPreview: preview, embeddingMode }, 201);
+  if (embeddingMode === "provider") {
+    const documents = (
+      await c.env.DB.prepare(
+        "SELECT id,r2_key,source_type FROM documents WHERE visibility!='private' AND r2_key IS NOT NULL",
+      ).all<{ id: string; r2_key: string; source_type: string }>()
+    ).results;
+    for (const document of documents) {
+      await c.env.DB.prepare(
+        "UPDATE documents SET status='uploaded',error_message=NULL,updated_at=? WHERE id=?",
+      )
+        .bind(now, document.id)
+        .run();
+      await c.env.INGESTION_QUEUE.send({
+        type: "ingest",
+        documentId: document.id,
+        r2Key: document.r2_key,
+        mimeType:
+          document.source_type === "pdf" ? "application/pdf" : "text/plain",
+      } satisfies Job);
+    }
+  }
+  return c.json(
+    {
+      id,
+      keyPreview: preview,
+      embeddingMode,
+      healthStatus: "healthy",
+    },
+    201,
+  );
+});
+app.post("/api/admin/providers/:id/test", async (c) => {
+  const provider = await c.env.DB.prepare(
+    "SELECT id,base_url,encrypted_api_key,chat_model FROM providers WHERE id=? LIMIT 1",
+  )
+    .bind(c.req.param("id"))
+    .first<{
+      id: string;
+      base_url: string;
+      encrypted_api_key: string;
+      chat_model: string;
+    }>();
+  if (!provider) return c.json({ error: "渠道不存在" }, 404);
+  const now = new Date().toISOString();
+  try {
+    const apiKey = await decryptSecret(
+      JSON.parse(provider.encrypted_api_key) as EncryptedSecret,
+      c.env.MASTER_ENCRYPTION_KEY,
+    );
+    await testChatConnection({
+      baseUrl: provider.base_url,
+      apiKey,
+      model: provider.chat_model,
+    });
+    await c.env.DB.prepare(
+      "UPDATE providers SET health_status='healthy',last_checked_at=?,last_error=NULL,updated_at=? WHERE id=?",
+    )
+      .bind(now, now, provider.id)
+      .run();
+    return c.json({ healthStatus: "healthy" });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "连接测试失败";
+    await c.env.DB.prepare(
+      "UPDATE providers SET health_status='error',last_checked_at=?,last_error=?,updated_at=? WHERE id=?",
+    )
+      .bind(now, message, now, provider.id)
+      .run();
+    return c.json({ error: message }, 400);
+  }
 });
 app.post("/api/admin/documents", async (c) => {
   const form = await c.req.formData(),

@@ -720,6 +720,43 @@ td small {
   color: #397453;
   font-size: 12px;
 }
+.agent-state {
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: #f4e8e8;
+  color: #8b4a4a;
+  font-size: 12px;
+}
+.agent-state.ready {
+  background: #e7f4ec;
+  color: #397453;
+}
+.agent-form {
+  display: grid;
+  gap: 16px;
+}
+.agent-form > label,
+.agent-limits label {
+  display: grid;
+  gap: 7px;
+  color: #66747d;
+  font-size: 12px;
+}
+.agent-form textarea,
+.agent-limits input {
+  border: 1px solid #dfe4e8;
+  border-radius: 8px;
+  padding: 10px;
+  font: inherit;
+}
+.agent-limits {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+.agent-stats {
+  margin-bottom: 16px;
+}
 .checkbox {
   display: flex !important;
   grid-template-columns: auto 1fr !important;
@@ -742,6 +779,9 @@ td small {
     grid-template-columns: 1fr;
   }
   .resume-upload {
+    grid-template-columns: 1fr;
+  }
+  .agent-limits {
     grid-template-columns: 1fr;
   }
 }

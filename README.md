@@ -112,6 +112,8 @@ ai-bunshin/
 → 写入匿名用量事件
 ```
 
+Agent 只有在“渠道测试成功 + 至少一份非私有资料完成索引 + 后台开关开启”时进入运行状态。匿名访客默认每天最多成功问答 25 次、每分钟 5 次，全站默认每天 500 次；三项都可在“Agent 设置”修改。计数以服务端 D1 为准，失败、无检索结果或模型中断不会消耗每日额度。浏览器仅保存随机访客 ID，D1 只保存该 ID 与 IP 组合后的加盐哈希，不保存原始 IP。
+
 ### 文档导入
 
 ```text
@@ -129,8 +131,8 @@ MVP 仅保证文本型 PDF。扫描 PDF 会标记为“需要 OCR”，不会生
 - 管理员密码使用强密码哈希，Session Cookie 使用 `Secure`、`HttpOnly`、`SameSite=Strict`。
 - 后台写请求执行 Origin/CSRF 校验。
 - 日志不记录 API Key、Cookie、Authorization、完整 prompt 或私密原文。
-- 访客 IP 仅生成周期性匿名 HMAC，用于限流和统计。
-- 自定义模型 Base URL 必须通过 SSRF 校验。
+- 访客 IP 仅与随机访客 ID、服务端 Secret 组合生成匿名 SHA-256 哈希，用于限流和统计。
+- 自定义模型 Base URL 仅允许 HTTPS 或本地开发地址。
 
 ## GEO 与 SEO
 
@@ -200,6 +202,8 @@ wrangler secret put ADMIN_BOOTSTRAP_TOKEN
 ### 个人版最简配置
 
 后台内置 OpenAI、DeepSeek、OpenRouter 与自定义 OpenAI-compatible 预设。普通使用只需选择厂商并输入一个 API Key；Base URL、推荐 Chat 模型和向量策略由系统自动选择。DeepSeek/OpenRouter 默认使用本地隐私向量，不会把简历发送给第三方 Embedding 服务。OpenAI 可选择外部 Embedding，但必须由站长显式勾选数据外传授权。
+
+“测试并启用”会先调用推荐聊天模型验证 Key，测试失败不保存；测试成功后加密保存并设为默认渠道。已有渠道可使用“重新测试连接”恢复健康状态。个人资料发布后会生成一份内部 Markdown 文档并自动进入 Queue；上传简历或知识资料后同样自动解析、切片和索引。后台“Agent 设置”统一展示渠道健康、知识库就绪数量、今日问答和向量方案。
 
 个人资料的结构化字段和 Markdown 原文保存在 D1，简历、头像等原始文件保存在私有 R2。后台“个人资料”页可直接修改显示名称、职业标题、头像和 Markdown 介绍，并上传 PDF/Markdown 简历；保存后主站侧边栏、头像和“关于我”页面读取同一份数据。头像通过 Worker 受控输出，不公开 R2 Bucket。文本型 PDF/TXT/Markdown 经 Queue 异步解析；本地隐私模式使用 D1 向量回退，显式授权外部 Embedding 后使用版本化 Vectorize 索引。切换模型应新建索引版本并重建，不能把不同维度混入同一索引。
 
@@ -282,7 +286,7 @@ pnpm deploy
 
 ## 当前状态
 
-访客端已部署到 Cloudflare Workers。管理后台等待账号启用 R2 后运行 `pnpm deploy:production` 完成发布；PDF 解析、真实用量看板和完整内容编辑仍属于后续功能迭代，不影响基础部署。
+访客端与管理后台均已部署到 Cloudflare Workers。已打通个人资料与简历上传、R2 原文件、Queue 解析、D1/Vectorize 检索、单 Key 渠道测试、流式 Agent 问答、引用展示、匿名 25 次限流和真实用量记录。扫描版 PDF 仍需站长先做 OCR；多管理员、组织和充值计费不属于个人版范围。
 
 ## License
 

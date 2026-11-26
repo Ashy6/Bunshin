@@ -45,6 +45,14 @@ export const profileSchema = z.object({
   social: z.record(z.string(), z.string().max(500)),
   published: z.boolean(),
 });
+export const agentSettingsSchema = z.object({
+  enabled: z.boolean(),
+  dailyLimit: z.number().int().min(1).max(1000),
+  minuteLimit: z.number().int().min(1).max(100),
+  globalDailyLimit: z.number().int().min(1).max(100000),
+  welcomeMessage: z.string().trim().min(1).max(500),
+  systemInstruction: z.string().trim().max(2000),
+});
 export const articleSchema = z.object({
   title: z.string().trim().min(1).max(160),
   slug: z
