@@ -170,7 +170,7 @@ pnpm dev
 - 访客端：`http://localhost:8787`
 - 后台：`http://localhost:8788`
 
-本地知识库流程为：上传 TXT/Markdown → R2 本地模拟存储 → Queue 消费 → 切片 → D1 本地向量索引 → 访客端相似度检索。未配置模型渠道时，Chat 会直接展示带来源的检索结果；配置 OpenAI-compatible 渠道后，会将检索上下文交给模型生成回答。Cloudflare 生产环境可继续将索引实现迁移为 Vectorize。当前 PDF 上传会被安全标记为 `needs_ocr`，文本型 PDF 解析适配器将在后续版本接入。
+知识库流程为：上传文本型 PDF/TXT/Markdown → R2 存储 → Queue 消费 → PDF 文字提取 → 切片 → D1 向量索引 → 访客端相似度检索。未配置模型渠道时，Chat 会直接展示带来源的检索结果；配置 OpenAI-compatible 渠道后，会将检索上下文交给模型生成回答。扫描版 PDF 无可提取文字时会标记为 `needs_ocr`，需要先进行 OCR。
 
 ### 首次初始化
 

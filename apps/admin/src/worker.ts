@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { encryptSecret } from "@ai-bunshin/crypto";
 import { chunkText, createLocalEmbedding } from "@ai-bunshin/rag";
+import { extractText, getDocumentProxy } from "unpdf";
 import {
   articleSchema,
   categorySchema,
@@ -275,16 +276,19 @@ async function consume(batch: MessageBatch<Job>, env: Env) {
         .run();
       const object = await env.ASSETS_BUCKET.get(job.r2Key);
       if (!object) throw new Error("R2 object missing");
+      let text: string;
       if (job.mimeType === "application/pdf") {
-        await env.DB.prepare(
-          "UPDATE documents SET status='needs_ocr', error_message='PDF parser adapter is not configured', updated_at=? WHERE id=?",
-        )
-          .bind(new Date().toISOString(), job.documentId)
-          .run();
-        message.ack();
-        continue;
-      }
-      const text = await object.text(),
+        const pdf = await getDocumentProxy(new Uint8Array(await object.arrayBuffer()), { maxImageSize: 16_777_216 });
+        if (pdf.numPages > 100) throw new Error("PDF 页数不能超过 100 页");
+        const extracted = await extractText(pdf, { mergePages: true });
+        text = String(extracted.text).trim();
+        if (text.length < 40) {
+          await env.DB.prepare("UPDATE documents SET status='needs_ocr', error_message='未检测到足够的可复制文字，可能是扫描版 PDF', updated_at=? WHERE id=?").bind(new Date().toISOString(), job.documentId).run();
+          message.ack();
+          continue;
+        }
+      } else text = await object.text();
+      const
         chunks = chunkText(text);
       await env.DB.prepare("DELETE FROM local_vectors WHERE document_id=?").bind(job.documentId).run();
       await env.DB.prepare("DELETE FROM chunks WHERE document_id=?").bind(job.documentId).run();

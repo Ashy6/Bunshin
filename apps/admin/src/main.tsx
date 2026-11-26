@@ -220,7 +220,7 @@ function Dashboard() {
     </>
   );
 }
-function Knowledge() {
+function KnowledgeLegacy() {
   const [open, setOpen] = useState(false);
   return (
     <>
@@ -350,6 +350,17 @@ function Knowledge() {
     </>
   );
 }
+type KnowledgeDocument={id:string;title:string;source_type:string;visibility:string;status:string;chunk_count:number;error_message?:string;category_name?:string};
+type KnowledgeCategory={id:string;name:string};
+function Knowledge() {
+  const [open,setOpen]=useState(false),[documents,setDocuments]=useState<KnowledgeDocument[]>([]),[categories,setCategories]=useState<KnowledgeCategory[]>([]),[busy,setBusy]=useState(false),[error,setError]=useState("");
+  const load=async()=>{const [docs,cats]=await Promise.all([fetch("/api/admin/documents"),fetch("/api/admin/categories")]);if(docs.status===401||cats.status===401){location.reload();return}setDocuments(((await docs.json()) as {items:KnowledgeDocument[]}).items);setCategories(((await cats.json()) as {items:KnowledgeCategory[]}).items)};
+  useEffect(()=>{void load();const timer=setInterval(()=>void load(),5000);return()=>clearInterval(timer)},[]);
+  const submit=async(event:React.FormEvent<HTMLFormElement>)=>{event.preventDefault();setBusy(true);setError("");const response=await fetch("/api/admin/documents",{method:"POST",body:new FormData(event.currentTarget)});const body=await response.json() as {error?:string};setBusy(false);if(!response.ok){setError(typeof body.error==="string"?body.error:"上传失败");return}setOpen(false);event.currentTarget.reset();await load()};
+  const statusLabel=(status:string)=>({uploaded:"等待处理",parsing:"解析中",indexed:"已索引",needs_ocr:"需要 OCR",failed:"失败"}[status]??status);
+  return <><header className="page-head"><div><p>知识库</p><h1>上传后自动解析并进入 RAG</h1></div><button className="primary" onClick={()=>setOpen(true)}>＋ 上传简历或资料</button></header><div className="notice">支持文本型 PDF、Markdown 和 TXT，最大 20 MB。扫描版 PDF 会标记为需要 OCR。</div><section className="panel"><table><thead><tr><th>名称</th><th>类型</th><th>分类</th><th>可见性</th><th>状态</th><th>切片</th></tr></thead><tbody>{documents.length===0?<tr><td colSpan={6}>还没有资料，请上传你的第一份简历。</td></tr>:documents.map(item=><tr key={item.id}><td><strong>{item.title}</strong>{item.error_message&&<small>{item.error_message}</small>}</td><td>{item.source_type.toUpperCase()}</td><td>{item.category_name??"未分类"}</td><td>{item.visibility==="public"?"公开引用":"仅供 RAG"}</td><td><span className={`status ${item.status==="indexed"?"ok":item.status==="parsing"?"running":""}`}>{statusLabel(item.status)}</span></td><td>{item.chunk_count}</td></tr>)}</tbody></table></section>{open&&<div className="modal-backdrop" onMouseDown={()=>setOpen(false)}><form className="modal" onMouseDown={e=>e.stopPropagation()} onSubmit={submit}><div className="modal-head"><h2>上传知识资料</h2><button type="button" onClick={()=>setOpen(false)}>×</button></div><label>标题<input name="title" required placeholder="例如：个人简历" /></label><label className="upload"><input name="file" required type="file" accept=".pdf,.md,.txt,application/pdf,text/plain,text/markdown"/><strong>选择 PDF / Markdown / TXT</strong><span>上传后自动解析、切片并建立索引</span></label><label>分类<select name="categoryId"><option value="">不分类</option>{categories.map(category=><option key={category.id} value={category.id}>{category.name}</option>)}</select></label><label>可见性<select name="visibility" defaultValue="rag_only"><option value="rag_only">仅供 RAG</option><option value="public">公开并允许引用</option><option value="private">私有，不参与检索</option></select></label>{error&&<div className="auth-error">{error}</div>}<div className="modal-actions"><button type="button" onClick={()=>setOpen(false)}>取消</button><button className="primary" disabled={busy}>{busy?"上传中…":"上传并建立索引"}</button></div></form></div>}</>;
+}
+
 function Providers() {
   const [open, setOpen] = useState(false);
   const [key, setKey] = useState("");
@@ -440,7 +451,7 @@ function Providers() {
               </label>
               <label>
                 Embedding 模型
-                <input name="embeddingModel" required placeholder="text-embedding-3-small" />
+                <input name="embeddingModel" required defaultValue="local-hash-v1" />
               </label>
             </div>
             {error && <div className="auth-error">{error}</div>}
