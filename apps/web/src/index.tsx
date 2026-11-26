@@ -187,54 +187,85 @@ function renderSafeMarkdown(markdown: string) {
     value
       .replaceAll("&", "&amp;")
       .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;");
-  return raw(
-    markdown
-      .split(/\n{2,}/)
-      .map((block) => {
-        const value = escape(block.trim());
-        if (value.startsWith("### ")) return `<h3>${value.slice(4)}</h3>`;
-        if (value.startsWith("## ")) return `<h2>${value.slice(3)}</h2>`;
-        if (value.startsWith("# ")) return `<h1>${value.slice(2)}</h1>`;
-        if (value.split("\n").every((line) => line.startsWith("- ")))
-          return `<ul>${value
-            .split("\n")
-            .map((line) => `<li>${line.slice(2)}</li>`)
-            .join("")}</ul>`;
-        return `<p>${value.replaceAll("\n", "<br>")}</p>`;
-      })
-      .join(""),
-  );
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
+  const inline = (value: string) =>
+    escape(value)
+      .replace(/`([^`]+)`/g, "<code>$1</code>")
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/(^|[^*])\*([^*]+)\*/g, "$1<em>$2</em>")
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+|mailto:[^\s)]+)\)/g, '<a href="$2" rel="noreferrer">$1</a>');
+  const lines = markdown.replaceAll("\\n", "\n").replace(/\r/g, "").split("\n"), output: string[] = [];
+  for (let index = 0; index < lines.length;) {
+    const line = lines[index] ?? "";
+    if (!line.trim()) { index += 1; continue; }
+    if (line.startsWith("```")) {
+      const language = escape(line.slice(3).trim());
+      const code: string[] = [];
+      index += 1;
+      while (index < lines.length && !lines[index]!.startsWith("```")) code.push(lines[index++]!);
+      index += 1;
+      output.push(`<pre><code${language ? ` data-language="${language}"` : ""}>${escape(code.join("\n"))}</code></pre>`);
+      continue;
+    }
+    const heading = /^(#{1,4})\s+(.+)$/.exec(line);
+    if (heading) { const level = heading[1]!.length; output.push(`<h${level}>${inline(heading[2]!)}</h${level}>`); index += 1; continue; }
+    if (/^>\s?/.test(line)) {
+      const parts: string[] = [];
+      while (index < lines.length && /^>\s?/.test(lines[index]!)) parts.push(lines[index++]!.replace(/^>\s?/, ""));
+      output.push(`<blockquote>${inline(parts.join("<br>"))}</blockquote>`); continue;
+    }
+    if (/^[-*+]\s+/.test(line)) {
+      const items: string[] = [];
+      while (index < lines.length && /^[-*+]\s+/.test(lines[index]!)) items.push(`<li>${inline(lines[index++]!.replace(/^[-*+]\s+/, ""))}</li>`);
+      output.push(`<ul>${items.join("")}</ul>`); continue;
+    }
+    if (/^\d+[.)]\s+/.test(line)) {
+      const items: string[] = [];
+      while (index < lines.length && /^\d+[.)]\s+/.test(lines[index]!)) items.push(`<li>${inline(lines[index++]!.replace(/^\d+[.)]\s+/, ""))}</li>`);
+      output.push(`<ol>${items.join("")}</ol>`); continue;
+    }
+    if (/^---+$/.test(line.trim())) { output.push("<hr>"); index += 1; continue; }
+    const paragraph = [line]; index += 1;
+    while (index < lines.length && lines[index]!.trim() && !/^(#{1,4})\s|^```|^>\s?|^[-*+]\s+|^\d+[.)]\s+/.test(lines[index]!)) paragraph.push(lines[index++]!);
+    output.push(`<p>${inline(paragraph.join("\n")).replaceAll("\n", "<br>")}</p>`);
+  }
+  return raw(output.join(""));
 }
-
-const demoArticles = [
-  {
-    slug: "building-a-personal-ai-twin",
-    title: "如何构建可信的个人 AI 分身",
-    excerpt:
-      "从个人资料、文章和项目中建立可追溯的知识库，让回答有依据，也知道什么时候应该说不知道。",
-    date: "2026/11/24",
-    category: "AI 与 Agent",
-    tags: ["RAG", "Agent"],
-  },
-  {
-    slug: "knowledge-that-compounds",
-    title: "让知识持续复利：我的记录与整理方法",
-    excerpt: "把零散笔记转化为可检索、可引用、可继续演进的知识资产。",
-    date: "2026/11/18",
-    category: "知识管理",
-    tags: ["写作", "知识库"],
-  },
-  {
-    slug: "engineering-notes",
-    title: "从产品想法到可维护的工程",
-    excerpt:
-      "用清晰边界、渐进交付和可观测性，将一个个人项目做成真正可长期运行的系统。",
-    date: "2026/11/05",
-    category: "工程实践",
-    tags: ["架构", "Cloudflare"],
-  },
-];
+type PublicProfile = {
+  display_name: string; headline: string; bio: string; location: string | null;
+  avatar_url: string | null; social_json: string; markdown_bio: string;
+  skills_json: string; website_url: string | null; public_email: string | null;
+  experience_json: string; project_json: string; education_json: string;
+  avatar_position_x: number; avatar_position_y: number; updated_at: string;
+};
+type PublicArticle = {
+  id: string; title: string; slug: string; excerpt: string; body: string;
+  category_id: string | null; category_name: string | null; category_slug: string | null;
+  published_at: string | null; updated_at: string; seo_description: string | null;
+};
+const parseJson = <T,>(value: string | null | undefined, fallback: T): T => {
+  try { return value ? JSON.parse(value) as T : fallback; } catch { return fallback; }
+};
+async function publicProfile(env: Bindings) {
+  return env.DB.prepare(
+    "SELECT display_name,headline,bio,location,avatar_url,social_json,markdown_bio,skills_json,website_url,public_email,experience_json,project_json,education_json,avatar_position_x,avatar_position_y,updated_at FROM profiles WHERE published=1 ORDER BY created_at LIMIT 1",
+  ).first<PublicProfile>();
+}
+async function publicArticles(env: Bindings, categorySlug?: string | null) {
+  const sql = `SELECT articles.id,articles.title,articles.slug,articles.excerpt,articles.body,articles.category_id,articles.published_at,articles.updated_at,articles.seo_description,categories.name category_name,categories.slug category_slug FROM articles LEFT JOIN categories ON categories.id=articles.category_id WHERE articles.status='published'${categorySlug ? " AND categories.slug=?" : ""} ORDER BY COALESCE(articles.published_at,articles.updated_at) DESC`;
+  return (categorySlug ? await env.DB.prepare(sql).bind(categorySlug).all<PublicArticle>() : await env.DB.prepare(sql).all<PublicArticle>()).results;
+}
+function formatDate(value: string | null | undefined) {
+  if (!value) return "";
+  return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit", timeZone: "Asia/Shanghai" }).format(new Date(value));
+}
+function articleBodyWithoutDuplicateTitle(body: string, title: string) {
+  const normalized = body.replaceAll("\\n", "\n");
+  const [first, ...rest] = normalized.split("\n");
+  return first?.trim() === `# ${title}` ? rest.join("\n").trimStart() : normalized;
+}
 
 type PublicNav = "ask" | "articles" | "categories" | "archives" | "about";
 function navIcon(name: PublicNav) {
@@ -253,6 +284,10 @@ function layout(
   content: ReturnType<typeof html>,
   description = "个人简历、文章与 AI 分身",
   active: PublicNav = "ask",
+  profile: PublicProfile | null = null,
+  origin = "",
+  canonicalPath = "/",
+  article?: PublicArticle,
 ) {
   const pageLabel =
     active === "ask"
@@ -263,6 +298,29 @@ function layout(
           archives: "归档",
           about: "关于",
         } as const)[active];
+  const ownerName = profile?.display_name || "个人分身",
+    siteTitle = `${ownerName}-AI分身`,
+    social = parseJson<Record<string, string>>(profile?.social_json, {}),
+    canonical = `${origin}${canonicalPath}`,
+    personLd = {
+      "@context": "https://schema.org", "@type": "Person", name: ownerName,
+      url: `${origin}/`, description: profile?.bio || description,
+      jobTitle: profile?.headline || undefined,
+      homeLocation: profile?.location || undefined,
+      sameAs: [profile?.website_url, ...Object.values(social)].filter((value) => value?.startsWith("http")),
+    },
+    structuredData = article ? [personLd, {
+      "@context": "https://schema.org", "@type": "Article", headline: article.title,
+      description: article.seo_description || article.excerpt, datePublished: article.published_at,
+      dateModified: article.updated_at, mainEntityOfPage: canonical,
+      author: { "@type": "Person", name: ownerName },
+    }, {
+      "@context": "https://schema.org", "@type": "BreadcrumbList", itemListElement: [
+        { "@type": "ListItem", position: 1, name: "首页", item: `${origin}/` },
+        { "@type": "ListItem", position: 2, name: "文章", item: `${origin}/articles` },
+        { "@type": "ListItem", position: 3, name: article.title, item: canonical },
+      ],
+    }] : [personLd, { "@context": "https://schema.org", "@type": "WebSite", name: siteTitle, url: `${origin}/`, description }];
   return html`<!doctype html>
     <html lang="zh-CN" data-theme="system">
       <head>
@@ -270,10 +328,12 @@ function layout(
         <meta name="viewport" content="width=device-width,initial-scale=1" />
         <title>${title}</title>
         <meta name="description" content="${description}" />
-        <link rel="canonical" href="/" />
+        <link rel="canonical" href=${canonical} />
         <meta property="og:title" content="${title}" />
         <meta property="og:description" content="${description}" />
-        <meta property="og:type" content="website" />
+        <meta property="og:type" content=${article ? "article" : "website"} />
+        <meta property="og:url" content=${canonical} />
+        <meta name="author" content=${ownerName} />
         <link rel="stylesheet" href="/styles.css" />
         <style>
           .avatar {
@@ -308,38 +368,29 @@ function layout(
           .answer-sources strong {
             color: var(--text);
           }
-          .answer-sources ul {
-            margin: 6px 0 0;
-            padding-left: 18px;
-          }
+          .answer-sources ul { margin: 6px 0 0; padding-left: 18px; }
         </style>
         <script type="application/ld+json">
-          ${JSON.stringify({
-            "@context": "https://schema.org",
-            "@type": "Person",
-            name: "你的名字",
-            url: "/",
-            description,
-          })}
+          ${raw(JSON.stringify(structuredData).replaceAll("<", "\\u003c"))}
         </script>
       </head>
       <body>
         <aside class="sidebar">
           <div class="profile">
-            <div class="avatar"><img src="/avatar" alt="站长头像" /></div>
-            <a class="site-title" id="profile-name" href="/">Bunshin</a>
-            <p id="profile-headline">保持好奇，持续构建</p>
+            <div class="avatar"><img src="/avatar" alt=${`${ownerName}的头像`} style=${`object-position:${profile?.avatar_position_x ?? 50}% ${profile?.avatar_position_y ?? 50}%`} /></div>
+            <a class="site-title" id="profile-name" href="/">${ownerName}</a>
+            <p id="profile-headline">${profile?.headline || "个人资料暂未公开"}</p>
           </div>
           <nav aria-label="主导航">
-            <a class=${active === "ask" ? "active" : ""} href="/">${navIcon("ask")}<span>问问分身</span></a
-            ><a class=${active === "articles" ? "active" : ""} href="/articles">${navIcon("articles")}<span>文章</span></a
-            ><a class=${active === "categories" ? "active" : ""} href="/categories">${navIcon("categories")}<span>分类</span></a
-            ><a class=${active === "archives" ? "active" : ""} href="/archives">${navIcon("archives")}<span>归档</span></a
-            ><a class=${active === "about" ? "active" : ""} href="/about">${navIcon("about")}<span>关于</span></a>
+            <a class=${active === "ask" ? "active" : "nav-link"} href="/">${navIcon("ask")}<span>问问分身</span></a
+            ><a class=${active === "articles" ? "active" : "nav-link"} href="/articles">${navIcon("articles")}<span>文章</span></a
+            ><a class=${active === "categories" ? "active" : "nav-link"} href="/categories">${navIcon("categories")}<span>分类</span></a
+            ><a class=${active === "archives" ? "active" : "nav-link"} href="/archives">${navIcon("archives")}<span>归档</span></a
+            ><a class=${active === "about" ? "active" : "nav-link"} href="/about">${navIcon("about")}<span>关于</span></a>
           </nav>
           <div class="sidebar-foot">
             <button id="theme-toggle" aria-label="切换主题">◐</button
-            ><a href="https://github.com/Ashy6" rel="noreferrer">GitHub</a>
+            >${social.github ? html`<a href=${social.github} rel="noreferrer">GitHub</a>` : ""}
           </div>
         </aside>
         <div class="page">
@@ -350,23 +401,23 @@ function layout(
           </header>
           <main class=${active === "ask" ? "agent-main" : ""}>${content}</main>
           <footer>
-            © ${new Date().getFullYear()} Bunshin · 内容由站长维护，AI
+            © ${new Date().getFullYear()} ${ownerName} · 内容由站长维护，AI
             回答请以引用来源为准。
           </footer>
         </div>
-        <script src="/profile.js" defer></script>
         <script src="/agent.js" defer></script>
       </body>
     </html>`;
 }
 
-app.get("/", (c) =>
-  c.html(
+app.get("/", async (c) => {
+  const profile = await publicProfile(c.env), origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin;
+  return c.html(
     layout(
-      "Bunshin · 个人分身",
+      `${profile?.display_name || "个人分身"}-AI分身`,
       html`<section class="hero agent-home" id="ask">
           <p class="eyebrow">AI PERSONAL TWIN</p>
-          <h1 id="agent-greeting">你好，我是站长的 AI 分身</h1>
+          <h1 id="agent-greeting">你好，我是${profile?.display_name || "站长"}的 AI 分身</h1>
           <p class="agent-intro">
             你可以直接问我的经历、项目、文章和知识积累；回答只依据已录入的资料。
           </p>
@@ -383,7 +434,7 @@ app.get("/", (c) =>
             <span id="agent-status">正在读取 Agent 状态…</span
             ><span id="agent-quota"></span>
           </div>
-          <div id="answer" class="answer" hidden></div>
+          <div id="answer" class="answer answer-rich" hidden aria-live="polite"></div>
           <div id="answer-sources" class="answer-sources" hidden></div>
           <div class="suggestions">
             <button>介绍一下你的核心经历</button
@@ -391,20 +442,24 @@ app.get("/", (c) =>
             ><button>有哪些代表文章？</button>
           </div>
         </section>`,
+      profile?.bio || "基于个人简历、文章与知识积累的 AI 分身",
+      "ask",
+      profile,
+      origin,
+      "/",
     ),
-  ),
-);
+  );
+});
 
-app.get("/articles", (c) => {
+app.get("/articles", async (c) => {
   const category = c.req.query("category"),
-    articles = category
-      ? demoArticles.filter((article) => article.category === category)
-      : demoArticles;
+    [articles, profile] = await Promise.all([publicArticles(c.env, category), publicProfile(c.env)]),
+    origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin;
   return c.html(
     layout(
-      "文章 · Bunshin",
+      `文章 · ${profile?.display_name || "个人分身"}-AI分身`,
       html`<section class="listing article-index">
-        <h1>${category ? `${category}文章` : "全部文章"}</h1>
+        <h1>${category ? `${articles[0]?.category_name || "分类"}文章` : "全部文章"}</h1>
         <p class="lead">记录项目实践、技术思考与持续积累的知识。</p>
         <div class="article-list">
           ${articles.length
@@ -414,8 +469,8 @@ app.get("/articles", (c) => {
                     <h3>${article.title}</h3>
                     <p>${article.excerpt}</p>
                     <div class="meta">
-                      <time>${article.date}</time>
-                      <span>${article.category}</span>
+                      <time>${formatDate(article.published_at || article.updated_at)}</time>
+                      ${article.category_name ? html`<span>${article.category_name}</span>` : ""}
                     </div>
                   </a>
                 </article>`,
@@ -425,123 +480,140 @@ app.get("/articles", (c) => {
       </section>`,
       category ? `${category}分类文章` : "个人文章与知识积累",
       "articles",
+      profile,
+      origin,
+      category ? `/articles?category=${encodeURIComponent(category)}` : "/articles",
     ),
   );
 });
 
-app.get("/articles/:slug", (c) => {
-  const article = demoArticles.find(
-    (item) => item.slug === c.req.param("slug"),
-  );
+app.get("/articles/:slug", async (c) => {
+  const [article, profile] = await Promise.all([
+    c.env.DB.prepare("SELECT articles.id,articles.title,articles.slug,articles.excerpt,articles.body,articles.category_id,articles.published_at,articles.updated_at,articles.seo_description,categories.name category_name,categories.slug category_slug FROM articles LEFT JOIN categories ON categories.id=articles.category_id WHERE articles.slug=? AND articles.status='published' LIMIT 1").bind(c.req.param("slug")).first<PublicArticle>(),
+    publicProfile(c.env),
+  ]);
   if (!article) return c.notFound();
+  const origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin;
   return c.html(
     layout(
-      `${article.title} · Bunshin`,
+      `${article.title} · ${profile?.display_name || "个人分身"}-AI分身`,
       html`<article class="post">
-        <a class="back" href="/">← 返回首页</a>
+        <a class="back" href="/articles">← 返回文章</a>
         <h1>${article.title}</h1>
         <div class="post-meta">
-          <time>${article.date}</time><span>${article.category}</span>
+          <time>${formatDate(article.published_at || article.updated_at)}</time>${article.category_name ? html`<span>${article.category_name}</span>` : ""}
         </div>
         <p class="lead">${article.excerpt}</p>
-        <h2>从内容开始，而不是从模型开始</h2>
-        <p>
-          一个可信的个人分身，首先需要明确、结构化并且能够持续更新的资料。模型负责表达，知识库负责事实边界。
-        </p>
-        <blockquote>
-          当资料不足时，系统应该诚实地说不知道，而不是用流畅的语言补全不存在的经历。
-        </blockquote>
-        <h2>可追溯的回答</h2>
-        <p>
-          每个关键事实都应该关联到简历条目、项目说明或公开文章，让访客能够继续核实和阅读。
-        </p>
+        <div class="rich-content">${renderSafeMarkdown(articleBodyWithoutDuplicateTitle(article.body, article.title))}</div>
       </article>`,
-      article.excerpt,
+      article.seo_description || article.excerpt,
       "articles",
+      profile,
+      origin,
+      `/articles/${article.slug}`,
+      article,
     ),
   );
 });
 
-app.get("/categories", (c) =>
-  c.html(
+app.get("/categories", async (c) => {
+  const [categories, profile] = await Promise.all([
+    c.env.DB.prepare("SELECT categories.id,categories.name,categories.slug,categories.description,COUNT(articles.id) article_count FROM categories LEFT JOIN articles ON articles.category_id=categories.id AND articles.status='published' WHERE categories.scope IN ('article','shared','both') GROUP BY categories.id ORDER BY categories.sort_order,categories.name").all<{ id: string; name: string; slug: string; description: string; article_count: number }>(),
+    publicProfile(c.env),
+  ]), origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin;
+  return c.html(
     layout(
-      "分类 · Bunshin",
+      `分类 · ${profile?.display_name || "个人分身"}-AI分身`,
       html`<section class="listing">
         <h1>分类</h1>
         <div class="category-grid">
-          ${["AI 与 Agent", "知识管理", "工程实践"].map(
-            (name, index) =>
-              html`<a href="/articles?category=${encodeURIComponent(name)}"
-                ><strong>${name}</strong><span>${index + 1} 篇文章</span></a
+          ${categories.results.map(
+            (category) =>
+              html`<a href=${`/categories/${category.slug}`}
+                ><span><strong>${category.name}</strong>${category.description ? html`<small>${category.description}</small>` : ""}</span><em>${category.article_count} 篇文章</em></a
               >`,
           )}
         </div>
       </section>`,
       "文章分类",
       "categories",
+      profile,
+      origin,
+      "/categories",
     ),
-  ),
-);
-app.get("/archives", (c) =>
-  c.html(
+  );
+});
+app.get("/categories/:slug", async (c) => {
+  const category = await c.env.DB.prepare("SELECT name,slug,description FROM categories WHERE slug=? LIMIT 1").bind(c.req.param("slug")).first<{ name: string; slug: string; description: string }>();
+  if (!category) return c.notFound();
+  const [articles, profile] = await Promise.all([publicArticles(c.env, category.slug), publicProfile(c.env)]), origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin;
+  return c.html(layout(`${category.name} · ${profile?.display_name || "Bunshin"}-AI分身`, html`<section class="listing article-index"><a class="back" href="/categories">← 返回分类</a><h1>${category.name}</h1>${category.description ? html`<p class="lead">${category.description}</p>` : ""}<div class="article-list">${articles.length ? articles.map((article) => html`<article><a href=${`/articles/${article.slug}`}><h3>${article.title}</h3><p>${article.excerpt}</p><div class="meta"><time>${formatDate(article.published_at || article.updated_at)}</time></div></a></article>`) : html`<p class="empty-state">这个分类还没有已发布文章。</p>`}</div></section>`, category.description || `${category.name}分类文章`, "categories", profile, origin, `/categories/${category.slug}`));
+});
+app.get("/archives", async (c) => {
+  const [articles, profile] = await Promise.all([publicArticles(c.env), publicProfile(c.env)]), origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin;
+  return c.html(
     layout(
-      "归档 · Bunshin",
+      `归档 · ${profile?.display_name || "个人分身"}-AI分身`,
       html`<section class="listing">
         <h1>文章归档</h1>
-        ${demoArticles.map(
+        ${articles.map(
           (article) =>
             html`<a class="archive-row" href="/articles/${article.slug}"
-              ><time>${article.date}</time><span>${article.title}</span></a
+              ><time>${formatDate(article.published_at || article.updated_at)}</time><span>${article.title}</span></a
             >`,
         )}
       </section>`,
       "文章归档",
       "archives",
+      profile,
+      origin,
+      "/archives",
     ),
-  ),
-);
+  );
+});
 app.get("/about", async (c) => {
-  const profile = await c.env.DB.prepare(
-    "SELECT display_name,headline,bio,location,markdown_bio,skills_json,social_json FROM profiles WHERE published=1 ORDER BY created_at LIMIT 1",
-  ).first<{
-    display_name: string;
-    headline: string;
-    bio: string;
-    location: string | null;
-    markdown_bio: string;
-    skills_json: string;
-    social_json: string;
-  }>();
+  const profile = await publicProfile(c.env), origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin,
+    social = parseJson<Record<string, string>>(profile?.social_json, {}),
+    experiences = parseJson<Array<{ title: string; organization: string; period: string; summary: string }>>(profile?.experience_json, []),
+    projects = parseJson<Array<{ name: string; role: string; url: string; summary: string }>>(profile?.project_json, []),
+    education = parseJson<Array<{ school: string; degree: string; period: string; summary: string }>>(profile?.education_json, []);
   return c.html(
     layout(
-      "关于 · Bunshin",
+      `关于 · ${profile?.display_name || "个人分身"}-AI分身`,
       html`<section class="post">
         <h1>${profile?.display_name ?? "关于我"}</h1>
         ${profile?.headline
           ? html`<p class="lead">${profile.headline}</p>`
           : ""}
-        ${profile?.bio ? html`<p>${profile.bio}</p>` : ""}
+        ${profile?.bio ? html`<p class="profile-summary">${profile.bio}</p>` : ""}
+        ${(profile?.location || profile?.public_email || profile?.website_url || Object.values(social).some(Boolean)) ? html`<div class="profile-facts">${profile?.location ? html`<span>⌖ ${profile.location}</span>` : ""}${profile?.public_email ? html`<a href=${`mailto:${profile.public_email}`}>邮箱</a>` : ""}${profile?.website_url ? html`<a href=${profile.website_url} rel="noreferrer">个人网站</a>` : ""}${Object.entries(social).filter(([, value]) => value).map(([label, value]) => html`<a href=${value} rel="noreferrer">${label}</a>`)}</div>` : ""}
         ${profile?.markdown_bio
-          ? renderSafeMarkdown(profile.markdown_bio)
+          ? html`<div class="rich-content">${renderSafeMarkdown(profile.markdown_bio)}</div>`
           : html`<p>个人资料尚未完善。</p>`}
         ${profile?.skills_json
           ? html`<h2>技能</h2>
               <div class="tag-list">
-                ${(JSON.parse(profile.skills_json) as string[]).map(
+                ${parseJson<string[]>(profile.skills_json, []).map(
                   (skill) => html`<span>${skill}</span>`,
                 )}
               </div>`
           : ""}
+        ${experiences.length ? html`<section class="profile-section"><h2>经历</h2><div class="timeline">${experiences.map((item) => html`<article><div><strong>${item.title}</strong><span>${item.organization}</span></div><time>${item.period}</time><p>${item.summary}</p></article>`)}</div></section>` : ""}
+        ${projects.length ? html`<section class="profile-section"><h2>项目</h2><div class="project-grid">${projects.map((item) => html`<article><h3>${item.url ? html`<a href=${item.url} rel="noreferrer">${item.name}</a>` : item.name}</h3>${item.role ? html`<span>${item.role}</span>` : ""}<p>${item.summary}</p></article>`)}</div></section>` : ""}
+        ${education.length ? html`<section class="profile-section"><h2>教育</h2><div class="timeline">${education.map((item) => html`<article><div><strong>${item.school}</strong><span>${item.degree}</span></div><time>${item.period}</time><p>${item.summary}</p></article>`)}</div></section>` : ""}
       </section>`,
-      "个人介绍",
+      profile?.bio || "个人介绍",
       "about",
+      profile,
+      origin,
+      "/about",
     ),
   );
 });
 
 app.get("/api/profile", async (c) => {
   const profile = await c.env.DB.prepare(
-    "SELECT display_name,headline,bio,location,skills_json,social_json,updated_at FROM profiles WHERE published=1 ORDER BY created_at LIMIT 1",
+    "SELECT display_name,headline,bio,location,skills_json,social_json,website_url,public_email,avatar_position_x,avatar_position_y,updated_at FROM profiles WHERE published=1 ORDER BY created_at LIMIT 1",
   ).first();
   return c.json({ profile: profile ?? null }, 200, {
     "Cache-Control": "public, max-age=60",
@@ -584,10 +656,21 @@ app.get("/api/agent/status", async (c) => {
       remaining: Math.max(0, config.dailyLimit - (usage?.count ?? 0)),
       dailyLimit: config.dailyLimit,
       welcomeMessage: config.welcomeMessage,
+      reasonCode: !config.enabled
+        ? "disabled_by_owner"
+        : !provider
+          ? "provider_missing"
+          : provider.health_status !== "healthy"
+            ? provider.health_status === "error" ? "provider_error" : "provider_unverified"
+            : provider.monthly_budget_micros > 0 && provider.month_spent_micros >= provider.monthly_budget_micros
+              ? "budget_exhausted"
+              : (documents?.count ?? 0) === 0 ? "knowledge_not_ready" : null,
       reason: !config.enabled
         ? "站长暂时关闭了 Agent 问答"
-        : provider?.health_status !== "healthy"
-          ? "模型渠道尚未完成验证"
+        : !provider
+          ? "站长尚未配置模型渠道"
+        : provider.health_status !== "healthy"
+          ? provider.health_status === "error" ? "模型渠道连接异常，站长正在处理" : "模型渠道尚未完成验证"
           : provider.monthly_budget_micros > 0 &&
               provider.month_spent_micros >= provider.monthly_budget_micros
             ? "本月模型预算已用完"
@@ -627,7 +710,7 @@ app.post("/api/chat", async (c) => {
     "SELECT COUNT(*) count FROM documents WHERE status='indexed' AND visibility!='private'",
   ).first<{ count: number }>();
   const identity = await c.env.DB.prepare(
-    "SELECT display_name FROM profiles WHERE published=1 ORDER BY created_at LIMIT 1",
+    "SELECT display_name FROM profiles WHERE rag_enabled=1 ORDER BY created_at LIMIT 1",
   ).first<{ display_name: string }>();
   if (
     !config.enabled ||
@@ -652,6 +735,7 @@ app.post("/api/chat", async (c) => {
     content: string;
     title: string;
     score: number;
+    source_url?: string | null;
   }> = [];
   if (provider?.embedding_mode === "provider" && apiKey) {
     const started = Date.now();
@@ -666,10 +750,10 @@ app.post("/api/chat", async (c) => {
     if (ids.length) {
       const rows = (
         await c.env.DB.prepare(
-          `SELECT chunks.id,chunks.content,documents.title FROM chunks JOIN documents ON documents.id=chunks.document_id WHERE chunks.id IN (${ids.map(() => "?").join(",")}) AND documents.status='indexed' AND documents.visibility!='private'`,
+          `SELECT chunks.id,chunks.content,documents.title,documents.source_url FROM chunks JOIN documents ON documents.id=chunks.document_id WHERE chunks.id IN (${ids.map(() => "?").join(",")}) AND documents.status='indexed' AND documents.visibility!='private'`,
         )
           .bind(...ids)
-          .all<{ id: string; content: string; title: string }>()
+          .all<{ id: string; content: string; title: string; source_url: string | null }>()
       ).results;
       const scores = new Map(
         matches.matches.map((match) => [match.id, match.score]),
@@ -703,12 +787,13 @@ app.post("/api/chat", async (c) => {
   } else {
     const rows = (
       await c.env.DB.prepare(
-        "SELECT chunks.id,chunks.content,documents.title,local_vectors.embedding_json FROM local_vectors JOIN chunks ON chunks.id=local_vectors.chunk_id JOIN documents ON documents.id=chunks.document_id WHERE documents.status='indexed' AND documents.visibility!='private' LIMIT 1000",
+        "SELECT chunks.id,chunks.content,documents.title,documents.source_url,local_vectors.embedding_json FROM local_vectors JOIN chunks ON chunks.id=local_vectors.chunk_id JOIN documents ON documents.id=chunks.document_id WHERE documents.status='indexed' AND documents.visibility!='private' LIMIT 1000",
       ).all<{
         id: string;
         content: string;
         title: string;
         embedding_json: string;
+        source_url: string | null;
       }>()
     ).results;
     const query = createLocalEmbedding(question);
@@ -786,7 +871,7 @@ app.post("/api/chat", async (c) => {
         try {
           controller.enqueue(
             enc.encode(
-              `data: ${JSON.stringify({ type: "sources", items: contexts.map((item) => ({ title: item.title, score: item.score })) })}\n\n`,
+              `data: ${JSON.stringify({ type: "sources", items: contexts.map((item, index) => ({ index: index + 1, title: item.title, score: item.score, href: item.source_url || null })) })}\n\n`,
             ),
           );
           while (true) {
@@ -885,9 +970,10 @@ app.post("/api/chat", async (c) => {
   }
 });
 
-app.get("/robots.txt", (c) =>
-  c.text("User-agent: *\nAllow: /\nDisallow: /api/\nSitemap: /sitemap.xml\n"),
-);
+app.get("/robots.txt", (c) => {
+  const origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin;
+  return c.text(`User-agent: *\nAllow: /\nDisallow: /api/\nSitemap: ${origin}/sitemap.xml\n`);
+});
 app.get("/avatar", async (c) => {
   const profile = await c.env.DB.prepare(
     "SELECT display_name,avatar_url FROM profiles WHERE published=1 ORDER BY created_at LIMIT 1",
@@ -919,18 +1005,43 @@ app.get("/avatar", async (c) => {
     },
   );
 });
-app.get("/sitemap.xml", (c) =>
-  c.body(
-    `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>/</loc></url><url><loc>/articles</loc></url><url><loc>/categories</loc></url><url><loc>/archives</loc></url><url><loc>/about</loc></url>${demoArticles.map((a) => `<url><loc>/articles/${a.slug}</loc></url>`).join("")}</urlset>`,
-    200,
-    { "Content-Type": "application/xml" },
-  ),
-);
-app.get("/llms.txt", (c) =>
-  c.text(
-    "# Bunshin\n\n个人简历、文章与 AI 分身。\n\n- /about: 个人介绍\n- /archives: 文章归档\n",
-  ),
-);
+app.get("/api/search", async (c) => {
+  const query = (c.req.query("q") || "").trim();
+  if (!query) return c.json({ items: [] });
+  const items = (await c.env.DB.prepare(
+    "SELECT title,slug,excerpt,published_at FROM articles WHERE status='published' AND (title LIKE ? OR excerpt LIKE ? OR body LIKE ?) ORDER BY COALESCE(published_at,updated_at) DESC LIMIT 20",
+  ).bind(...Array(3).fill(`%${query}%`)).all()).results;
+  return c.json({ items }, 200, { "Cache-Control": "public, max-age=30" });
+});
+app.get("/sitemap.xml", async (c) => {
+  const origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin,
+    articles = await publicArticles(c.env),
+    categories = (await c.env.DB.prepare("SELECT slug FROM categories WHERE scope IN ('article','shared','both')").all<{ slug: string }>()).results,
+    paths = ["/", "/articles", "/categories", "/archives", "/about", ...articles.map((a) => `/articles/${a.slug}`), ...categories.map((item) => `/categories/${item.slug}`)];
+  return c.body(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${paths.map((path) => `<url><loc>${origin}${path}</loc></url>`).join("")}</urlset>`, 200, { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "public, max-age=300" });
+});
+app.get("/feed.xml", async (c) => {
+  const origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin,
+    [profile, articles] = await Promise.all([publicProfile(c.env), publicArticles(c.env)]),
+    escapeXml = (value: string) => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+  return c.body(`<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>${escapeXml(profile?.display_name || "Bunshin")}-AI分身</title><link>${origin}</link><description>${escapeXml(profile?.bio || "个人文章与知识积累")}</description>${articles.map((article) => `<item><title>${escapeXml(article.title)}</title><link>${origin}/articles/${article.slug}</link><guid>${origin}/articles/${article.slug}</guid><pubDate>${new Date(article.published_at || article.updated_at).toUTCString()}</pubDate><description>${escapeXml(article.excerpt)}</description></item>`).join("")}</channel></rss>`, 200, { "Content-Type": "application/rss+xml; charset=utf-8", "Cache-Control": "public, max-age=300" });
+});
+app.get("/llms.txt", async (c) => {
+  const [profile, articles] = await Promise.all([publicProfile(c.env), publicArticles(c.env)]), name = profile?.display_name || "Bunshin";
+  return c.text(`# ${name}-AI分身\n\n${profile?.bio || "个人简历、文章与 AI 分身。"}\n\n- /about: ${name}的公开个人介绍\n- /archives: 文章归档\n${articles.map((article) => `- /articles/${article.slug}: ${article.title}`).join("\n")}\n`, 200, { "Cache-Control": "public, max-age=300" });
+});
+app.get("/llms-full.txt", async (c) => {
+  const setting = await c.env.DB.prepare(
+    "SELECT value FROM settings WHERE key='llms_full_enabled'",
+  ).first<{ value: string }>();
+  if (setting?.value !== "true") return c.notFound();
+  const [profile, articles] = await Promise.all([publicProfile(c.env), publicArticles(c.env)]),
+    name = profile?.display_name || "个人分身";
+  return c.text(`# ${name}-AI分身\n\n${profile?.bio || ""}\n\n${profile?.markdown_bio || ""}\n\n${articles.map((article) => `# ${article.title}\n\n${article.excerpt}\n\n${article.body.replaceAll("\\n", "\n")}`).join("\n\n---\n\n")}`, 200, {
+    "Cache-Control": "public, max-age=300",
+    "X-Robots-Tag": "index, follow",
+  });
+});
 app.get("/health", (c) => c.json({ ok: true, service: "web" }));
 app.all("*", async (c) => {
   const url = new URL(c.req.url);

@@ -9,6 +9,7 @@ import {
 } from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
 import "./styles.css";
+import { ArticlesManager, KnowledgeManager, ProfileManager } from "./management";
 echarts.use([
   LineChart,
   PieChart,
@@ -1528,7 +1529,22 @@ function Placeholder({ view }: { view: View }) {
   );
 }
 function AdminApp({ onLogout }: { onLogout: () => void }) {
-  const [view, setView] = useState<View>("dashboard");
+  const hashToView = (): View => {
+    const value = location.hash.replace(/^#\/?/, "");
+    if (value === "profile") return "content";
+    return nav.some((item) => item.id === value) ? value as View : "dashboard";
+  };
+  const [view, setView] = useState<View>(hashToView);
+  useEffect(() => {
+    const update = () => setView(hashToView());
+    addEventListener("hashchange", update);
+    if (!location.hash) history.replaceState(null, "", "#/dashboard");
+    return () => removeEventListener("hashchange", update);
+  }, []);
+  const navigate = (next: View) => {
+    if (document.body.dataset.unsaved === "true" && !confirm("当前页面有未保存更改，确定离开吗？")) return;
+    location.hash = `/${next === "content" ? "profile" : next}`;
+  };
   const title = useMemo(() => nav.find((n) => n.id === view)?.label, [view]);
   return (
     <div className="shell">
@@ -1545,7 +1561,7 @@ function AdminApp({ onLogout }: { onLogout: () => void }) {
             <button
               key={item.id}
               className={view === item.id ? "active" : ""}
-              onClick={() => setView(item.id)}
+              onClick={() => navigate(item.id)}
             >
               <span>{item.icon}</span>
               {item.label}
@@ -1574,9 +1590,11 @@ function AdminApp({ onLogout }: { onLogout: () => void }) {
         {view === "dashboard" ? (
           <Dashboard />
         ) : view === "content" ? (
-          <ProfileEditor />
+          <ProfileManager />
+        ) : view === "articles" ? (
+          <ArticlesManager />
         ) : view === "knowledge" ? (
-          <Knowledge />
+          <KnowledgeManager />
         ) : view === "providers" ? (
           <Providers />
         ) : view === "agent" ? (

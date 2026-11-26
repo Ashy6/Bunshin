@@ -44,8 +44,29 @@ export const profiles = sqliteTable("profiles", {
   avatarUrl: text("avatar_url"),
   socialJson: text("social_json").notNull().default("{}"),
   published: integer("published", { mode: "boolean" }).notNull().default(false),
+  ragEnabled: integer("rag_enabled", { mode: "boolean" }).notNull().default(true),
+  websiteUrl: text("website_url"),
+  publicEmail: text("public_email"),
+  experienceJson: text("experience_json").notNull().default("[]"),
+  projectJson: text("project_json").notNull().default("[]"),
+  educationJson: text("education_json").notNull().default("[]"),
+  avatarPositionX: integer("avatar_position_x").notNull().default(50),
+  avatarPositionY: integer("avatar_position_y").notNull().default(50),
+  markdownBio: text("markdown_bio").notNull().default(""),
+  skillsJson: text("skills_json").notNull().default("[]"),
+  resumeDocumentId: text("resume_document_id"),
   ...timestamps,
 });
+export const profileVersions = sqliteTable(
+  "profile_versions",
+  {
+    id: text("id").primaryKey(),
+    profileId: text("profile_id").notNull(),
+    snapshotJson: text("snapshot_json").notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (t) => [index("idx_profile_versions_profile_created").on(t.profileId, t.createdAt)],
+);
 export const categories = sqliteTable(
   "categories",
   {
@@ -78,6 +99,7 @@ export const articles = sqliteTable(
       .default(true),
     publishedAt: text("published_at"),
     seoDescription: text("seo_description"),
+    documentId: text("document_id"),
     ...timestamps,
   },
   (t) => [
@@ -100,6 +122,11 @@ export const documents = sqliteTable(
     parsedText: text("parsed_text"),
     errorMessage: text("error_message"),
     chunkCount: integer("chunk_count").notNull().default(0),
+    purpose: text("purpose").notNull().default("knowledge"),
+    originalName: text("original_name"),
+    fileSize: integer("file_size").notNull().default(0),
+    sourceUrl: text("source_url"),
+    archivedAt: text("archived_at"),
     ...timestamps,
   },
   (t) => [

@@ -11,6 +11,9 @@ document.querySelector("#menu-toggle")?.addEventListener("click", (event) => {
   event.stopPropagation();
   sidebar?.classList.toggle("open");
 });
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") sidebar?.classList.remove("open");
+});
 document.querySelector(".page")?.addEventListener("click", () => {
   if (window.matchMedia("(max-width: 980px)").matches)
     sidebar?.classList.remove("open");
@@ -31,6 +34,38 @@ const sources = document.querySelector("#answer-sources");
 let agentReady = false;
 let remainingCount = 0;
 let sending = false;
+function escapeHtml(value) {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+function inline(value) {
+  return escapeHtml(value)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\[(\d+)\]/g, '<sup class="citation">[$1]</sup>');
+}
+function renderAnswer(value) {
+  const lines = value.replace(/\r/g, "").split("\n"), blocks = [];
+  for (let index = 0; index < lines.length;) {
+    const line = lines[index] || "";
+    if (!line.trim()) { index += 1; continue; }
+    const heading = /^(#{1,3})\s+(.+)$/.exec(line);
+    if (heading) { blocks.push(`<h${heading[1].length}>${inline(heading[2])}</h${heading[1].length}>`); index += 1; continue; }
+    if (/^[-*]\s+/.test(line)) {
+      const items = [];
+      while (index < lines.length && /^[-*]\s+/.test(lines[index])) items.push(`<li>${inline(lines[index++].replace(/^[-*]\s+/, ""))}</li>`);
+      blocks.push(`<ul>${items.join("")}</ul>`); continue;
+    }
+    if (/^\d+[.)]\s+/.test(line)) {
+      const items = [];
+      while (index < lines.length && /^\d+[.)]\s+/.test(lines[index])) items.push(`<li>${inline(lines[index++].replace(/^\d+[.)]\s+/, ""))}</li>`);
+      blocks.push(`<ol>${items.join("")}</ol>`); continue;
+    }
+    const paragraph = [line]; index += 1;
+    while (index < lines.length && lines[index].trim() && !/^(#{1,3})\s|^[-*]\s+|^\d+[.)]\s+/.test(lines[index])) paragraph.push(lines[index++]);
+    blocks.push(`<p>${inline(paragraph.join("\n")).replaceAll("\n", "<br>")}</p>`);
+  }
+  return blocks.join("");
+}
 
 function setAvailability(status) {
   agentReady = Boolean(status.ready);
@@ -98,7 +133,7 @@ form?.addEventListener("submit", async (event) => {
     answer.textContent = "";
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
-    let buffer = "";
+    let buffer = "", answerText = "";
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -111,8 +146,14 @@ form?.addEventListener("submit", async (event) => {
           .find((entry) => entry.startsWith("data: "));
         if (!line) continue;
         const data = JSON.parse(line.slice(6));
-        if (data.type === "delta") answer.textContent += data.text;
-        if (data.type === "error") answer.textContent += `\n${data.text}`;
+        if (data.type === "delta") {
+          answerText += data.text;
+          answer.innerHTML = renderAnswer(answerText);
+        }
+        if (data.type === "error") {
+          answerText += `\n\n${data.text}`;
+          answer.innerHTML = renderAnswer(answerText);
+        }
         if (data.type === "sources" && sources) {
           sources.hidden = false;
           const title = document.createElement("strong");
@@ -121,7 +162,10 @@ form?.addEventListener("submit", async (event) => {
           const list = document.createElement("ul");
           for (const item of data.items) {
             const entry = document.createElement("li");
-            entry.textContent = item.title;
+            const content = item.href ? document.createElement("a") : document.createElement("span");
+            content.textContent = `${item.index ? `[${item.index}] ` : ""}${item.title}`;
+            if (item.href) content.href = item.href;
+            entry.append(content);
             list.append(entry);
           }
           sources.append(list);

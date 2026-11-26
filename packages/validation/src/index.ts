@@ -42,8 +42,34 @@ export const profileSchema = z.object({
   location: z.string().trim().max(100).nullable(),
   markdownBio: z.string().max(200000),
   skills: z.array(z.string().trim().min(1).max(40)).max(100),
-  social: z.record(z.string(), z.string().max(500)),
+  social: z.record(
+    z.string(),
+    z.union([z.string().trim().url(), z.literal("")]),
+  ),
   published: z.boolean(),
+  ragEnabled: z.boolean(),
+  websiteUrl: z.union([z.string().trim().url(), z.literal("")]).nullable(),
+  publicEmail: z.union([z.string().trim().email(), z.literal("")]).nullable(),
+  experiences: z.array(z.object({
+    title: z.string().trim().min(1).max(120),
+    organization: z.string().trim().max(120),
+    period: z.string().trim().max(80),
+    summary: z.string().trim().max(2000),
+  })).max(30),
+  projects: z.array(z.object({
+    name: z.string().trim().min(1).max(120),
+    role: z.string().trim().max(120),
+    url: z.union([z.string().trim().url(), z.literal("")]),
+    summary: z.string().trim().max(2000),
+  })).max(50),
+  education: z.array(z.object({
+    school: z.string().trim().min(1).max(120),
+    degree: z.string().trim().max(120),
+    period: z.string().trim().max(80),
+    summary: z.string().trim().max(1000),
+  })).max(20),
+  avatarPositionX: z.number().int().min(0).max(100),
+  avatarPositionY: z.number().int().min(0).max(100),
 });
 export const agentSettingsSchema = z.object({
   enabled: z.boolean(),
@@ -65,6 +91,7 @@ export const articleSchema = z.object({
   categoryId: z.string().nullable(),
   includeInRag: z.boolean(),
   status: z.enum(["draft", "published", "archived"]),
+  seoDescription: z.string().trim().max(300).nullable().optional(),
 });
 export type ChatRequest = z.infer<typeof chatRequestSchema>;
 export type ProviderInput = z.infer<typeof providerSchema>;

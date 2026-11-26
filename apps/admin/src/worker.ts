@@ -115,6 +115,109 @@ function avatarSvg(displayName: string | null | undefined) {
     .replaceAll("'", "&apos;");
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#31516f"/><stop offset="1" stop-color="#7899b5"/></linearGradient></defs><rect width="100" height="100" rx="50" fill="url(#g)"/><text x="50" y="64" text-anchor="middle" font-family="Inter,system-ui,sans-serif" font-size="44" font-weight="700" fill="white">${safe}</text></svg>`;
 }
+async function removeDocumentIndex(env: Env, documentId: string) {
+  const vectorRows = (
+    await env.DB.prepare(
+      "SELECT COALESCE(vector_id,id) id FROM chunks WHERE document_id=?",
+    )
+      .bind(documentId)
+      .all<{ id: string }>()
+  ).results;
+  if (vectorRows.length) {
+    try {
+      await env.VECTORIZE.deleteByIds(vectorRows.map((row) => row.id));
+    } catch (error) {
+      console.warn("Vector cleanup skipped", error);
+    }
+  }
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM local_vectors WHERE document_id=?").bind(documentId),
+    env.DB.prepare("DELETE FROM chunks WHERE document_id=?").bind(documentId),
+  ]);
+}
+async function audit(
+  env: Env,
+  request: Request,
+  action: string,
+  targetType: string,
+  targetId?: string,
+  detail: Record<string, unknown> = {},
+) {
+  const admin = await currentAdmin(request, env);
+  await env.DB.prepare(
+    "INSERT INTO audit_events (id,admin_id,action,target_type,target_id,detail_json,created_at) VALUES (?,?,?,?,?,?,?)",
+  )
+    .bind(
+      crypto.randomUUID(),
+      admin?.id ?? null,
+      action,
+      targetType,
+      targetId ?? null,
+      JSON.stringify(detail),
+      new Date().toISOString(),
+    )
+    .run();
+}
+function articleMarkdown(article: {
+  title: string;
+  excerpt: string;
+  body: string;
+}) {
+  return `# ${article.title}\n\n${article.excerpt}\n\n${article.body}`;
+}
+async function syncArticleDocument(
+  env: Env,
+  article: {
+    id: string;
+    title: string;
+    slug: string;
+    excerpt: string;
+    body: string;
+    status: string;
+    includeInRag: boolean;
+    documentId?: string | null;
+  },
+) {
+  const now = new Date().toISOString();
+  if (article.status !== "published" || !article.includeInRag) {
+    if (article.documentId) {
+      await removeDocumentIndex(env, article.documentId);
+      await env.DB.prepare(
+        "UPDATE documents SET visibility='private',status='archived',archived_at=?,updated_at=? WHERE id=?",
+      )
+        .bind(now, now, article.documentId)
+        .run();
+    }
+    return article.documentId ?? null;
+  }
+  const documentId = article.documentId ?? `article-${article.id}`,
+    key = `generated/articles/${article.id}.md`;
+  await env.ASSETS_BUCKET.put(key, articleMarkdown(article), {
+    httpMetadata: { contentType: "text/markdown; charset=utf-8" },
+  });
+  await env.DB.prepare(
+    "INSERT INTO documents (id,title,source_type,visibility,status,r2_key,purpose,original_name,file_size,source_url,created_at,updated_at) VALUES (?,?,?,'public','uploaded',?,'article',?,?,?, ?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,visibility='public',status='uploaded',r2_key=excluded.r2_key,source_url=excluded.source_url,archived_at=NULL,error_message=NULL,updated_at=excluded.updated_at",
+  )
+    .bind(
+      documentId,
+      article.title,
+      "markdown",
+      key,
+      `${article.slug}.md`,
+      articleMarkdown(article).length,
+      `/articles/${article.slug}`,
+      now,
+      now,
+    )
+    .run();
+  await env.INGESTION_QUEUE.send({
+    type: "ingest",
+    documentId,
+    r2Key: key,
+    mimeType: "text/markdown",
+  } satisfies Job);
+  return documentId;
+}
 app.onError((error, c) => {
   console.error("Unhandled admin API error", error);
   return c.json(
@@ -303,9 +406,23 @@ app.put("/api/admin/agent", async (c) => {
 });
 app.get("/api/admin/profile", async (c) => {
   const row = await c.env.DB.prepare(
-    "SELECT id,display_name,headline,bio,location,avatar_url,social_json,published,markdown_bio,skills_json,resume_document_id FROM profiles ORDER BY created_at LIMIT 1",
+    "SELECT id,display_name,headline,bio,location,avatar_url,social_json,published,rag_enabled,website_url,public_email,markdown_bio,skills_json,resume_document_id,experience_json,project_json,education_json,avatar_position_x,avatar_position_y,updated_at FROM profiles ORDER BY created_at LIMIT 1",
   ).first();
   return c.json({ profile: row ?? null });
+});
+app.get("/api/admin/profile/versions", async (c) => {
+  const profile = await c.env.DB.prepare(
+    "SELECT id FROM profiles ORDER BY created_at LIMIT 1",
+  ).first<{ id: string }>();
+  if (!profile) return c.json({ items: [] });
+  const items = (
+    await c.env.DB.prepare(
+      "SELECT id,snapshot_json,created_at FROM profile_versions WHERE profile_id=? ORDER BY created_at DESC LIMIT 30",
+    )
+      .bind(profile.id)
+      .all()
+  ).results;
+  return c.json({ items });
 });
 app.put("/api/admin/profile", async (c) => {
   const parsed = profileSchema.safeParse(await c.req.json().catch(() => null));
@@ -313,12 +430,17 @@ app.put("/api/admin/profile", async (c) => {
   const p = parsed.data,
     now = new Date().toISOString(),
     existing = await c.env.DB.prepare(
-      "SELECT id FROM profiles ORDER BY created_at LIMIT 1",
-    ).first<{ id: string }>(),
+      "SELECT * FROM profiles ORDER BY created_at LIMIT 1",
+    ).first<Record<string, unknown> & { id: string }>(),
     id = existing?.id ?? crypto.randomUUID();
-  if (existing)
+  if (existing) {
     await c.env.DB.prepare(
-      "UPDATE profiles SET display_name=?,headline=?,bio=?,location=?,social_json=?,published=?,markdown_bio=?,skills_json=?,updated_at=? WHERE id=?",
+      "INSERT INTO profile_versions (id,profile_id,snapshot_json,created_at) VALUES (?,?,?,?)",
+    )
+      .bind(crypto.randomUUID(), id, JSON.stringify(existing), now)
+      .run();
+    await c.env.DB.prepare(
+      "UPDATE profiles SET display_name=?,headline=?,bio=?,location=?,social_json=?,published=?,rag_enabled=?,website_url=?,public_email=?,markdown_bio=?,skills_json=?,experience_json=?,project_json=?,education_json=?,avatar_position_x=?,avatar_position_y=?,updated_at=? WHERE id=?",
     )
       .bind(
         p.displayName,
@@ -327,15 +449,23 @@ app.put("/api/admin/profile", async (c) => {
         p.location,
         JSON.stringify(p.social),
         p.published ? 1 : 0,
+        p.ragEnabled ? 1 : 0,
+        p.websiteUrl || null,
+        p.publicEmail || null,
         p.markdownBio,
         JSON.stringify(p.skills),
+        JSON.stringify(p.experiences),
+        JSON.stringify(p.projects),
+        JSON.stringify(p.education),
+        p.avatarPositionX,
+        p.avatarPositionY,
         now,
         id,
       )
       .run();
-  else
+  } else
     await c.env.DB.prepare(
-      "INSERT INTO profiles (id,display_name,headline,bio,location,social_json,published,markdown_bio,skills_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+      "INSERT INTO profiles (id,display_name,headline,bio,location,social_json,published,rag_enabled,website_url,public_email,markdown_bio,skills_json,experience_json,project_json,education_json,avatar_position_x,avatar_position_y,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
       .bind(
         id,
@@ -345,27 +475,49 @@ app.put("/api/admin/profile", async (c) => {
         p.location,
         JSON.stringify(p.social),
         p.published ? 1 : 0,
+        p.ragEnabled ? 1 : 0,
+        p.websiteUrl || null,
+        p.publicEmail || null,
         p.markdownBio,
         JSON.stringify(p.skills),
+        JSON.stringify(p.experiences),
+        JSON.stringify(p.projects),
+        JSON.stringify(p.education),
+        p.avatarPositionX,
+        p.avatarPositionY,
         now,
         now,
       )
       .run();
   const profileDocumentId = "generated-profile",
     profileKey = "generated/profile.md",
-    profileMarkdown = `# ${p.displayName}\n\n${p.headline}\n\n${p.bio}\n\n${p.markdownBio}\n\n## 技能\n\n${p.skills.join("、")}`;
-  if (p.published) {
+    socialLines = Object.entries(p.social)
+      .filter(([, value]) => value)
+      .map(([label, value]) => `- ${label}: ${value}`)
+      .join("\n"),
+    experienceLines = p.experiences
+      .map((item) => `### ${item.title} · ${item.organization}\n${item.period}\n\n${item.summary}`)
+      .join("\n\n"),
+    projectLines = p.projects
+      .map((item) => `### ${item.name}${item.role ? ` · ${item.role}` : ""}\n${item.summary}${item.url ? `\n${item.url}` : ""}`)
+      .join("\n\n"),
+    educationLines = p.education
+      .map((item) => `### ${item.school}${item.degree ? ` · ${item.degree}` : ""}\n${item.period}\n\n${item.summary}`)
+      .join("\n\n"),
+    profileMarkdown = `# ${p.displayName}\n\n${p.headline}\n\n${p.bio}\n\n${p.location ? `所在地：${p.location}\n\n` : ""}${p.markdownBio}\n\n## 技能\n\n${p.skills.join("、")}\n\n${experienceLines ? `## 经历\n\n${experienceLines}\n\n` : ""}${projectLines ? `## 项目\n\n${projectLines}\n\n` : ""}${educationLines ? `## 教育\n\n${educationLines}\n\n` : ""}${socialLines ? `## 公开链接\n\n${socialLines}` : ""}`;
+  if (p.ragEnabled) {
     await c.env.ASSETS_BUCKET.put(profileKey, profileMarkdown, {
       httpMetadata: { contentType: "text/markdown; charset=utf-8" },
     });
     await c.env.DB.prepare(
-      "INSERT INTO documents (id,title,source_type,visibility,status,r2_key,created_at,updated_at) VALUES (?,?,?,'rag_only','uploaded',?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,visibility='rag_only',status='uploaded',r2_key=excluded.r2_key,error_message=NULL,updated_at=excluded.updated_at",
+      "INSERT INTO documents (id,title,source_type,visibility,status,r2_key,purpose,original_name,file_size,created_at,updated_at) VALUES (?,?,?,'rag_only','uploaded',?,'profile','profile.md',?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,visibility='rag_only',status='uploaded',r2_key=excluded.r2_key,file_size=excluded.file_size,archived_at=NULL,error_message=NULL,updated_at=excluded.updated_at",
     )
       .bind(
         profileDocumentId,
         `${p.displayName}的个人资料`,
         "markdown",
         profileKey,
+        profileMarkdown.length,
         now,
         now,
       )
@@ -377,12 +529,17 @@ app.put("/api/admin/profile", async (c) => {
       mimeType: "text/markdown",
     } satisfies Job);
   } else {
+    await removeDocumentIndex(c.env, profileDocumentId);
     await c.env.DB.prepare(
-      "UPDATE documents SET visibility='private',updated_at=? WHERE id=?",
+      "UPDATE documents SET visibility='private',status='archived',archived_at=?,updated_at=? WHERE id=?",
     )
-      .bind(now, profileDocumentId)
+      .bind(now, now, profileDocumentId)
       .run();
   }
+  await audit(c.env, c.req.raw, "profile.update", "profile", id, {
+    published: p.published,
+    ragEnabled: p.ragEnabled,
+  });
   return c.json({ id });
 });
 app.get("/api/admin/profile/avatar", async (c) => {
@@ -426,10 +583,16 @@ app.post("/api/admin/profile/avatar", async (c) => {
       { error: "请选择 5MB 以内的 JPG、PNG、WebP 或 GIF 图片" },
       400,
     );
-  const profile = await c.env.DB.prepare(
+  let profile = await c.env.DB.prepare(
     "SELECT id,avatar_url FROM profiles ORDER BY created_at LIMIT 1",
   ).first<{ id: string; avatar_url: string | null }>();
-  if (!profile) return c.json({ error: "请先保存基本资料，再上传头像" }, 409);
+  if (!profile) {
+    const now = new Date().toISOString(), id = crypto.randomUUID();
+    await c.env.DB.prepare(
+      "INSERT INTO profiles (id,display_name,headline,bio,social_json,published,rag_enabled,markdown_bio,skills_json,experience_json,project_json,education_json,created_at,updated_at) VALUES (?,'Bunshin','','','{}',0,1,'','[]','[]','[]','[]',?,?)",
+    ).bind(id, now, now).run();
+    profile = { id, avatar_url: null };
+  }
   const extension =
       (
         {
@@ -454,6 +617,19 @@ app.post("/api/admin/profile/avatar", async (c) => {
     );
   return c.json({ key });
 });
+app.delete("/api/admin/profile/avatar", async (c) => {
+  const profile = await c.env.DB.prepare(
+    "SELECT id,avatar_url FROM profiles ORDER BY created_at LIMIT 1",
+  ).first<{ id: string; avatar_url: string | null }>();
+  if (!profile) return c.json({ ok: true });
+  await c.env.DB.prepare(
+    "UPDATE profiles SET avatar_url=NULL,avatar_position_x=50,avatar_position_y=50,updated_at=? WHERE id=?",
+  ).bind(new Date().toISOString(), profile.id).run();
+  if (profile.avatar_url?.startsWith("r2://"))
+    await c.env.ASSETS_BUCKET.delete(profile.avatar_url.slice(5));
+  await audit(c.env, c.req.raw, "profile.avatar.delete", "profile", profile.id);
+  return c.json({ ok: true });
+});
 app.get("/api/admin/provider-presets", (c) =>
   c.json({
     items: Object.entries(providerPresets).map(([id, value]) => ({
@@ -466,7 +642,7 @@ app.get("/api/admin/articles", async (c) =>
   c.json({
     items: (
       await c.env.DB.prepare(
-        "SELECT id,title,slug,status,updated_at FROM articles ORDER BY updated_at DESC LIMIT 100",
+        "SELECT articles.id,articles.title,articles.slug,articles.excerpt,articles.body,articles.category_id,articles.status,articles.include_in_rag,articles.published_at,articles.seo_description,articles.document_id,articles.created_at,articles.updated_at,categories.name category_name FROM articles LEFT JOIN categories ON categories.id=articles.category_id ORDER BY articles.updated_at DESC LIMIT 100",
       ).all()
     ).results,
   }),
@@ -484,21 +660,21 @@ app.get("/api/admin/documents", async (c) =>
   c.json({
     items: (
       await c.env.DB.prepare(
-        "SELECT documents.id,documents.title,documents.source_type,documents.visibility,documents.status,documents.r2_key,documents.chunk_count,documents.error_message,documents.updated_at,categories.name category_name FROM documents LEFT JOIN categories ON categories.id=documents.category_id ORDER BY documents.updated_at DESC LIMIT 100",
+        "SELECT documents.id,documents.title,documents.source_type,documents.category_id,documents.visibility,documents.status,documents.r2_key,documents.chunk_count,documents.error_message,documents.purpose,documents.original_name,documents.file_size,documents.source_url,documents.archived_at,documents.created_at,documents.updated_at,categories.name category_name FROM documents LEFT JOIN categories ON categories.id=documents.category_id ORDER BY documents.updated_at DESC LIMIT 200",
       ).all()
     ).results,
   }),
 );
 app.get("/api/admin/documents/:id/download", async (c) => {
   const document = await c.env.DB.prepare(
-    "SELECT title,r2_key,source_type FROM documents WHERE id=? LIMIT 1",
+    "SELECT title,r2_key,source_type,original_name FROM documents WHERE id=? LIMIT 1",
   )
     .bind(c.req.param("id"))
-    .first<{ title: string; r2_key: string | null; source_type: string }>();
+    .first<{ title: string; r2_key: string | null; source_type: string; original_name: string | null }>();
   if (!document?.r2_key) return c.json({ error: "附件不存在" }, 404);
   const object = await c.env.ASSETS_BUCKET.get(document.r2_key);
   if (!object) return c.json({ error: "R2 中未找到原文件" }, 404);
-  const storedName = document.r2_key.split("/").at(-1) ||
+  const storedName = document.original_name || document.r2_key.split("/").at(-1) ||
     `${document.title}.${document.source_type === "pdf" ? "pdf" : "md"}`;
   const fallbackName = storedName.replace(/[^a-zA-Z0-9._-]/g, "_");
   return new Response(object.body, {
@@ -526,7 +702,7 @@ app.post("/api/admin/articles", async (c) => {
     id = crypto.randomUUID(),
     a = parsed.data;
   await c.env.DB.prepare(
-    "INSERT INTO articles (id,title,slug,excerpt,body,category_id,status,include_in_rag,published_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+    "INSERT INTO articles (id,title,slug,excerpt,body,category_id,status,include_in_rag,published_at,seo_description,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
   )
     .bind(
       id,
@@ -538,11 +714,83 @@ app.post("/api/admin/articles", async (c) => {
       a.status,
       a.includeInRag ? 1 : 0,
       a.status === "published" ? now : null,
+      a.seoDescription || null,
       now,
       now,
     )
     .run();
-  return c.json({ id }, 201);
+  const documentId = await syncArticleDocument(c.env, {
+    id,
+    ...a,
+  });
+  if (documentId)
+    await c.env.DB.prepare("UPDATE articles SET document_id=? WHERE id=?")
+      .bind(documentId, id).run();
+  await audit(c.env, c.req.raw, "article.create", "article", id, { status: a.status });
+  return c.json({ id, documentId }, 201);
+});
+app.put("/api/admin/articles/:id", async (c) => {
+  const parsed = articleSchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
+  const existing = await c.env.DB.prepare(
+    "SELECT id,document_id,published_at FROM articles WHERE id=?",
+  ).bind(c.req.param("id")).first<{ id: string; document_id: string | null; published_at: string | null }>();
+  if (!existing) return c.json({ error: "文章不存在" }, 404);
+  const a = parsed.data, now = new Date().toISOString();
+  await c.env.DB.prepare(
+    "UPDATE articles SET title=?,slug=?,excerpt=?,body=?,category_id=?,status=?,include_in_rag=?,published_at=?,seo_description=?,updated_at=? WHERE id=?",
+  ).bind(
+    a.title, a.slug, a.excerpt, a.body, a.categoryId, a.status,
+    a.includeInRag ? 1 : 0,
+    a.status === "published" ? (existing.published_at ?? now) : existing.published_at,
+    a.seoDescription || null, now, existing.id,
+  ).run();
+  const documentId = await syncArticleDocument(c.env, {
+    id: existing.id,
+    ...a,
+    documentId: existing.document_id,
+  });
+  await c.env.DB.prepare("UPDATE articles SET document_id=? WHERE id=?")
+    .bind(documentId, existing.id).run();
+  await audit(c.env, c.req.raw, "article.update", "article", existing.id, { status: a.status });
+  return c.json({ id: existing.id, documentId });
+});
+app.delete("/api/admin/articles/:id", async (c) => {
+  const article = await c.env.DB.prepare(
+    "SELECT id,document_id FROM articles WHERE id=?",
+  ).bind(c.req.param("id")).first<{ id: string; document_id: string | null }>();
+  if (!article) return c.json({ error: "文章不存在" }, 404);
+  if (article.document_id) {
+    await removeDocumentIndex(c.env, article.document_id);
+    const document = await c.env.DB.prepare("SELECT r2_key FROM documents WHERE id=?")
+      .bind(article.document_id).first<{ r2_key: string | null }>();
+    if (document?.r2_key) await c.env.ASSETS_BUCKET.delete(document.r2_key);
+    await c.env.DB.prepare("DELETE FROM documents WHERE id=?").bind(article.document_id).run();
+  }
+  await c.env.DB.prepare("DELETE FROM articles WHERE id=?").bind(article.id).run();
+  await audit(c.env, c.req.raw, "article.delete", "article", article.id);
+  return c.json({ ok: true });
+});
+app.post("/api/admin/articles/reindex", async (c) => {
+  const articles = (
+    await c.env.DB.prepare(
+      "SELECT id,title,slug,excerpt,body,status,include_in_rag,document_id FROM articles WHERE status='published' AND include_in_rag=1",
+    ).all<{
+      id: string; title: string; slug: string; excerpt: string; body: string;
+      status: string; include_in_rag: number; document_id: string | null;
+    }>()
+  ).results;
+  for (const article of articles) {
+    const documentId = await syncArticleDocument(c.env, {
+      ...article,
+      includeInRag: Boolean(article.include_in_rag),
+      documentId: article.document_id,
+    });
+    await c.env.DB.prepare("UPDATE articles SET document_id=? WHERE id=?")
+      .bind(documentId, article.id).run();
+  }
+  await audit(c.env, c.req.raw, "article.reindex", "article", undefined, { count: articles.length });
+  return c.json({ ok: true, count: articles.length }, 202);
 });
 app.post("/api/admin/categories", async (c) => {
   const parsed = categorySchema.safeParse(await c.req.json());
@@ -555,6 +803,16 @@ app.post("/api/admin/categories", async (c) => {
     .bind(id, parsed.data.name, parsed.data.slug, parsed.data.scope, now, now)
     .run();
   return c.json({ id }, 201);
+});
+app.delete("/api/admin/categories/:id", async (c) => {
+  const id = c.req.param("id");
+  await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE articles SET category_id=NULL WHERE category_id=?").bind(id),
+    c.env.DB.prepare("UPDATE documents SET category_id=NULL WHERE category_id=?").bind(id),
+    c.env.DB.prepare("DELETE FROM categories WHERE id=?").bind(id),
+  ]);
+  await audit(c.env, c.req.raw, "category.delete", "category", id);
+  return c.json({ ok: true });
 });
 app.post("/api/admin/providers", async (c) => {
   const parsed = providerSchema.safeParse(await c.req.json());
@@ -716,34 +974,47 @@ app.post("/api/admin/providers/:id/test", async (c) => {
 app.post("/api/admin/documents", async (c) => {
   const form = await c.req.formData(),
     file = form.get("file"),
+    textInput = String(form.get("text") || "").trim(),
     title = String(form.get("title") || "").trim(),
     categoryId = String(form.get("categoryId") || "") || null,
     visibility = String(form.get("visibility") || "rag_only");
   const purpose = String(form.get("purpose") || "");
-  if (!(file instanceof File) || !title)
-    return c.json({ error: "缺少文件或标题" }, 400);
-  if (file.size > 20 * 1024 * 1024)
+  const resumeProfile = purpose === "resume"
+    ? await c.env.DB.prepare(
+        "SELECT id,resume_document_id FROM profiles ORDER BY created_at LIMIT 1",
+      ).first<{ id: string; resume_document_id: string | null }>()
+    : null;
+  if (purpose === "resume" && !resumeProfile)
+    return c.json({ error: "请先保存个人资料" }, 409);
+  if (!(file instanceof File) && !textInput || !title)
+    return c.json({ error: "请提供文件或文字内容，并填写标题" }, 400);
+  if (file instanceof File && file.size > 20 * 1024 * 1024)
     return c.json({ error: "文件不能超过 20MB" }, 413);
   const allowed = new Set(["application/pdf", "text/plain", "text/markdown"]);
-  if (!allowed.has(file.type))
+  if (file instanceof File && !allowed.has(file.type))
     return c.json({ error: "不支持的文件类型" }, 415);
   const id = crypto.randomUUID(),
-    r2Key = `documents/${id}/${file.name.replace(/[^a-zA-Z0-9._-]/g, "_")}`,
+    originalName = file instanceof File ? file.name : `${title}.md`,
+    r2Key = `documents/${id}/${encodeURIComponent(originalName).replaceAll("%", "_")}`,
     now = new Date().toISOString();
-  await c.env.ASSETS_BUCKET.put(r2Key, file.stream(), {
-    httpMetadata: { contentType: file.type },
+  const mimeType = file instanceof File ? file.type : "text/markdown";
+  await c.env.ASSETS_BUCKET.put(r2Key, file instanceof File ? file.stream() : textInput, {
+    httpMetadata: { contentType: mimeType },
   });
   await c.env.DB.prepare(
-    "INSERT INTO documents (id,title,source_type,category_id,visibility,status,r2_key,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+    "INSERT INTO documents (id,title,source_type,category_id,visibility,status,r2_key,purpose,original_name,file_size,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
   )
     .bind(
       id,
       title,
-      file.type.includes("pdf") ? "pdf" : "text",
+      mimeType.includes("pdf") ? "pdf" : mimeType.includes("markdown") ? "markdown" : "text",
       categoryId,
       visibility,
       "uploaded",
       r2Key,
+      purpose === "resume" ? "resume" : "knowledge",
+      originalName,
+      file instanceof File ? file.size : new TextEncoder().encode(textInput).length,
       now,
       now,
     )
@@ -752,15 +1023,86 @@ app.post("/api/admin/documents", async (c) => {
     type: "ingest",
     documentId: id,
     r2Key,
-    mimeType: file.type,
+    mimeType,
   } satisfies Job);
-  if (purpose === "resume")
+  if (purpose === "resume") {
+    if (resumeProfile?.resume_document_id && resumeProfile.resume_document_id !== id) {
+      await removeDocumentIndex(c.env, resumeProfile.resume_document_id);
+      await c.env.DB.prepare(
+        "UPDATE documents SET visibility='private',status='archived',archived_at=?,updated_at=? WHERE id=?",
+      ).bind(now, now, resumeProfile.resume_document_id).run();
+    }
     await c.env.DB.prepare(
-      "UPDATE profiles SET resume_document_id=?,updated_at=?",
+      "UPDATE profiles SET resume_document_id=?,updated_at=? WHERE id=?",
     )
-      .bind(id, now)
+      .bind(id, now, resumeProfile!.id)
       .run();
+  }
+  await audit(c.env, c.req.raw, "document.create", "document", id, { purpose, visibility });
   return c.json({ id, status: "uploaded" }, 202);
+});
+app.patch("/api/admin/documents/:id", async (c) => {
+  const body = await c.req.json<{ title?: string; categoryId?: string | null; visibility?: string }>().catch(() => ({} as { title?: string; categoryId?: string | null; visibility?: string }));
+  const visibility = body.visibility;
+  if (visibility && !["public", "rag_only", "private"].includes(visibility))
+    return c.json({ error: "可见性不正确" }, 400);
+  const current = await c.env.DB.prepare(
+    "SELECT id,title,category_id,visibility,r2_key,source_type FROM documents WHERE id=?",
+  ).bind(c.req.param("id")).first<{ id: string; title: string; category_id: string | null; visibility: string; r2_key: string | null; source_type: string }>();
+  if (!current) return c.json({ error: "文档不存在" }, 404);
+  const nextVisibility = visibility ?? current.visibility;
+  await c.env.DB.prepare(
+    "UPDATE documents SET title=?,category_id=?,visibility=?,updated_at=? WHERE id=?",
+  ).bind(
+    body.title?.trim() || current.title,
+    body.categoryId === undefined ? current.category_id : body.categoryId,
+    nextVisibility,
+    new Date().toISOString(),
+    current.id,
+  ).run();
+  if (nextVisibility === "private") await removeDocumentIndex(c.env, current.id);
+  else if (current.visibility === "private" && current.r2_key) {
+    await c.env.DB.prepare(
+      "UPDATE documents SET status='uploaded',archived_at=NULL,error_message=NULL,updated_at=? WHERE id=?",
+    ).bind(new Date().toISOString(), current.id).run();
+    await c.env.INGESTION_QUEUE.send({
+      type: "ingest", documentId: current.id, r2Key: current.r2_key,
+      mimeType: current.source_type === "pdf" ? "application/pdf" : "text/markdown",
+    } satisfies Job);
+  }
+  await audit(c.env, c.req.raw, "document.update", "document", current.id, { visibility: nextVisibility });
+  return c.json({ ok: true });
+});
+app.post("/api/admin/documents/:id/retry", async (c) => {
+  const document = await c.env.DB.prepare(
+    "SELECT id,r2_key,source_type FROM documents WHERE id=?",
+  ).bind(c.req.param("id")).first<{ id: string; r2_key: string | null; source_type: string }>();
+  if (!document?.r2_key) return c.json({ error: "原文件不存在" }, 404);
+  await c.env.DB.prepare(
+    "UPDATE documents SET status='uploaded',error_message=NULL,archived_at=NULL,updated_at=? WHERE id=?",
+  ).bind(new Date().toISOString(), document.id).run();
+  await c.env.INGESTION_QUEUE.send({
+    type: "ingest", documentId: document.id, r2Key: document.r2_key,
+    mimeType: document.source_type === "pdf" ? "application/pdf" : "text/markdown",
+  } satisfies Job);
+  await audit(c.env, c.req.raw, "document.retry", "document", document.id);
+  return c.json({ ok: true }, 202);
+});
+app.delete("/api/admin/documents/:id", async (c) => {
+  const document = await c.env.DB.prepare(
+    "SELECT id,r2_key,purpose FROM documents WHERE id=?",
+  ).bind(c.req.param("id")).first<{ id: string; r2_key: string | null; purpose: string }>();
+  if (!document) return c.json({ error: "文档不存在" }, 404);
+  if (["profile", "article"].includes(document.purpose))
+    return c.json({ error: "该文档由资料或文章生成，请在对应模块管理" }, 409);
+  await removeDocumentIndex(c.env, document.id);
+  if (document.r2_key) await c.env.ASSETS_BUCKET.delete(document.r2_key);
+  await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE profiles SET resume_document_id=NULL WHERE resume_document_id=?").bind(document.id),
+    c.env.DB.prepare("DELETE FROM documents WHERE id=?").bind(document.id),
+  ]);
+  await audit(c.env, c.req.raw, "document.delete", "document", document.id);
+  return c.json({ ok: true });
 });
 app.all("*", (c) => c.env.ASSETS.fetch(c.req.raw));
 
@@ -805,12 +1147,18 @@ async function consume(batch: MessageBatch<Job>, env: Env) {
         }
       } else text = await object.text();
       const chunks = chunkText(text);
-      await env.DB.prepare("DELETE FROM local_vectors WHERE document_id=?")
-        .bind(job.documentId)
-        .run();
-      await env.DB.prepare("DELETE FROM chunks WHERE document_id=?")
-        .bind(job.documentId)
-        .run();
+      const documentMeta = await env.DB.prepare(
+        "SELECT visibility FROM documents WHERE id=?",
+      ).bind(job.documentId).first<{ visibility: string }>();
+      if (!documentMeta || documentMeta.visibility === "private") {
+        await removeDocumentIndex(env, job.documentId);
+        await env.DB.prepare(
+          "UPDATE documents SET status='archived',updated_at=? WHERE id=?",
+        ).bind(new Date().toISOString(), job.documentId).run();
+        message.ack();
+        continue;
+      }
+      await removeDocumentIndex(env, job.documentId);
       await env.DB.batch(
         chunks.map((chunk) =>
           env.DB.prepare(
@@ -821,7 +1169,7 @@ async function consume(batch: MessageBatch<Job>, env: Env) {
             chunk.index,
             chunk.text,
             JSON.stringify(chunk.headingPath),
-            "rag_only",
+            documentMeta.visibility,
             String(chunk.text.length),
             new Date().toISOString(),
           ),
