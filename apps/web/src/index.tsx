@@ -347,13 +347,14 @@ function layout(
         <meta property="og:type" content=${article ? "article" : "website"} />
         <meta property="og:url" content=${canonical} />
         <meta name="author" content=${ownerName} />
-        <link rel="stylesheet" href="/styles.css?v=20261126.2" />
+        <link rel="stylesheet" href="/styles.css?v=20261126.3" />
         <style>
           /* Critical shell styles keep navigation usable if the external stylesheet is delayed. */
           * { box-sizing: border-box; }
           body { margin: 0; }
-          .desktop-header { display: none; }
-          .page { min-height: 100vh; }
+          .desktop-header { display: flex; }
+          .sidebar, .topbar { display: none; }
+          .page { min-height: 100vh; margin-left: 0; }
           .avatar {
             overflow: hidden;
           }
@@ -387,10 +388,9 @@ function layout(
             color: var(--text);
           }
           .answer-sources ul { margin: 6px 0 0; padding-left: 18px; }
-          @media (min-width: 1200px) {
-            .sidebar, .topbar { display: none !important; }
-            .desktop-header { display: flex; }
-            .page { margin-left: 0 !important; }
+          @media (max-width: 767px) {
+            .desktop-header { display: none; }
+            .sidebar, .topbar { display: flex; }
           }
         </style>
         <script type="application/ld+json">
@@ -433,7 +433,7 @@ function layout(
             回答请以引用来源为准。
           </footer>
         </div>
-        <script src="/agent.js?v=20261126.2" defer></script>
+        <script src="/agent.js?v=20261126.3" defer></script>
       </body>
     </html>`;
 }

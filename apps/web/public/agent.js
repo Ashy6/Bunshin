@@ -16,12 +16,12 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") sidebar?.classList.remove("open");
 });
 document.querySelector(".page")?.addEventListener("click", () => {
-  if (window.matchMedia("(max-width: 980px)").matches)
+  if (window.matchMedia("(max-width: 767px)").matches)
     sidebar?.classList.remove("open");
 });
 sidebar?.querySelectorAll("nav a").forEach((link) =>
   link.addEventListener("click", () => {
-    if (window.matchMedia("(max-width: 980px)").matches)
+    if (window.matchMedia("(max-width: 767px)").matches)
       sidebar.classList.remove("open");
   }),
 );
