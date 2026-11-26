@@ -9,7 +9,8 @@ import {
 } from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
 import "./styles.css";
-import { ArticlesManager, KnowledgeManager, ProfileManager } from "./management";
+import { ProfileManager } from "./management";
+import { ArticlesManagerV2, CategoriesManager, KnowledgeManagerV2 } from "./content-management";
 echarts.use([
   LineChart,
   PieChart,
@@ -22,6 +23,7 @@ type View =
   | "dashboard"
   | "content"
   | "articles"
+  | "categories"
   | "knowledge"
   | "agent"
   | "providers"
@@ -32,6 +34,7 @@ const nav: Array<{ id: View; label: string; icon: string }> = [
   { id: "content", label: "个人资料", icon: "◎" },
   { id: "articles", label: "文章管理", icon: "▤" },
   { id: "knowledge", label: "知识库", icon: "◇" },
+  { id: "categories", label: "内容分类", icon: "⌗" },
   { id: "agent", label: "Agent 设置", icon: "◉" },
   { id: "providers", label: "模型渠道", icon: "⌘" },
   { id: "usage", label: "用量明细", icon: "⌁" },
@@ -1526,6 +1529,7 @@ function Placeholder({ view }: { view: View }) {
   const labels = {
     content: "个人资料",
     articles: "文章管理",
+    categories: "内容分类",
     usage: "用量明细",
     settings: "系统设置",
     dashboard: "",
@@ -1554,6 +1558,7 @@ function AdminApp({ onLogout }: { onLogout: () => void }) {
   const hashToView = (): View => {
     const value = location.hash.replace(/^#\/?/, "");
     if (value === "profile") return "content";
+    if (value === "articles/new" || /^articles\/[^/]+\/edit$/.test(value)) return "articles";
     return nav.some((item) => item.id === value) ? value as View : "dashboard";
   };
   const [view, setView] = useState<View>(hashToView);
@@ -1649,9 +1654,11 @@ function AdminApp({ onLogout }: { onLogout: () => void }) {
         ) : view === "content" ? (
           <ProfileManager />
         ) : view === "articles" ? (
-          <ArticlesManager />
+          <ArticlesManagerV2 />
         ) : view === "knowledge" ? (
-          <KnowledgeManager />
+          <KnowledgeManagerV2 />
+        ) : view === "categories" ? (
+          <CategoriesManager />
         ) : view === "providers" ? (
           <Providers />
         ) : view === "agent" ? (

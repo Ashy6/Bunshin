@@ -11,6 +11,9 @@ export const categorySchema = z.object({
     .regex(/^[a-z0-9-]+$/)
     .max(60),
   scope: z.enum(["article", "knowledge", "shared"]),
+  description: z.string().trim().max(300).default(""),
+  sortOrder: z.number().int().min(0).max(9999).default(0),
+  showInPortal: z.boolean().default(true),
 });
 export const providerSchema = z.object({
   name: z.string().trim().min(1).max(60),
@@ -90,8 +93,11 @@ export const articleSchema = z.object({
   body: z.string().min(1).max(500000),
   categoryId: z.string().nullable(),
   includeInRag: z.boolean(),
-  status: z.enum(["draft", "published", "archived"]),
+  status: z.enum(["draft", "scheduled", "published", "archived"]),
   seoDescription: z.string().trim().max(300).nullable().optional(),
+  seoTitle: z.string().trim().max(180).nullable().optional(),
+  tags: z.array(z.string().trim().min(1).max(40)).max(20).default([]),
+  scheduledAt: z.string().datetime().nullable().optional(),
 });
 export type ChatRequest = z.infer<typeof chatRequestSchema>;
 export type ProviderInput = z.infer<typeof providerSchema>;

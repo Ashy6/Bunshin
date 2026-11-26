@@ -78,6 +78,9 @@ export const categories = sqliteTable(
     }).notNull(),
     description: text("description").notNull().default(""),
     sortOrder: integer("sort_order").notNull().default(0),
+    showInPortal: integer("show_in_portal", { mode: "boolean" })
+      .notNull()
+      .default(true),
     ...timestamps,
   },
   (t) => [uniqueIndex("idx_categories_slug").on(t.slug)],
@@ -91,7 +94,7 @@ export const articles = sqliteTable(
     excerpt: text("excerpt").notNull().default(""),
     body: text("body").notNull(),
     categoryId: text("category_id"),
-    status: text("status", { enum: ["draft", "published", "archived"] })
+    status: text("status", { enum: ["draft", "scheduled", "published", "archived"] })
       .notNull()
       .default("draft"),
     includeInRag: integer("include_in_rag", { mode: "boolean" })
@@ -99,6 +102,15 @@ export const articles = sqliteTable(
       .default(true),
     publishedAt: text("published_at"),
     seoDescription: text("seo_description"),
+    seoTitle: text("seo_title"),
+    tagsJson: text("tags_json").notNull().default("[]"),
+    coverR2Key: text("cover_r2_key"),
+    sourceR2Key: text("source_r2_key"),
+    sourceName: text("source_name"),
+    sourceType: text("source_type"),
+    scheduledAt: text("scheduled_at"),
+    importStatus: text("import_status").notNull().default("ready"),
+    importError: text("import_error"),
     documentId: text("document_id"),
     ...timestamps,
   },
@@ -127,11 +139,45 @@ export const documents = sqliteTable(
     fileSize: integer("file_size").notNull().default(0),
     sourceUrl: text("source_url"),
     archivedAt: text("archived_at"),
+    tagsJson: text("tags_json").notNull().default("[]"),
+    ingestionProgress: integer("ingestion_progress").notNull().default(0),
+    ocrStatus: text("ocr_status").notNull().default("none"),
+    ocrR2Key: text("ocr_r2_key"),
+    currentVersion: integer("current_version").notNull().default(1),
     ...timestamps,
   },
   (t) => [
     index("idx_documents_status").on(t.status),
     index("idx_documents_category_id").on(t.categoryId),
+  ],
+);
+export const articleVersions = sqliteTable(
+  "article_versions",
+  {
+    id: text("id").primaryKey(),
+    articleId: text("article_id").notNull(),
+    snapshotJson: text("snapshot_json").notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (t) => [index("idx_article_versions_article_created").on(t.articleId, t.createdAt)],
+);
+export const documentVersions = sqliteTable(
+  "document_versions",
+  {
+    id: text("id").primaryKey(),
+    documentId: text("document_id").notNull(),
+    versionNumber: integer("version_number").notNull(),
+    r2Key: text("r2_key").notNull(),
+    originalName: text("original_name").notNull(),
+    sourceType: text("source_type").notNull(),
+    fileSize: integer("file_size").notNull().default(0),
+    createdAt: text("created_at").notNull(),
+  },
+  (t) => [
+    uniqueIndex("idx_document_versions_document_version").on(
+      t.documentId,
+      t.versionNumber,
+    ),
   ],
 );
 export const chunks = sqliteTable(

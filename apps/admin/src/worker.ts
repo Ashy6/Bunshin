@@ -5,7 +5,7 @@ import {
   type EncryptedSecret,
 } from "@ai-bunshin/crypto";
 import { createEmbedding, testChatConnection } from "@ai-bunshin/ai";
-import { chunkText, createLocalEmbedding } from "@ai-bunshin/rag";
+import { chunkText, cosineSimilarity, createLocalEmbedding } from "@ai-bunshin/rag";
 import { extractText, getDocumentProxy } from "unpdf";
 import {
   articleSchema,
@@ -217,6 +217,111 @@ async function syncArticleDocument(
     mimeType: "text/markdown",
   } satisfies Job);
   return documentId;
+}
+function slugFrom(value: string) {
+  const slug = value
+    .normalize("NFKD")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 150);
+  return slug || `article-${Date.now()}`;
+}
+async function uniqueArticleSlug(env: Env, preferred: string, excludeId?: string) {
+  const base = slugFrom(preferred);
+  for (let suffix = 0; suffix < 100; suffix += 1) {
+    const value = suffix ? `${base}-${suffix + 1}` : base;
+    const existing = await env.DB.prepare(
+      "SELECT id FROM articles WHERE slug=? AND (? IS NULL OR id!=?) LIMIT 1",
+    ).bind(value, excludeId ?? null, excludeId ?? null).first();
+    if (!existing) return value;
+  }
+  return `${base}-${crypto.randomUUID().slice(0, 8)}`;
+}
+function stripHtml(value: string) {
+  return value
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<\/?(h[1-6]|p|div|section|article|li|blockquote|pre|br)[^>]*>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+function parseMarkdownImport(raw: string, fallbackTitle: string) {
+  let body = raw.replace(/^\uFEFF/, "").trim(), metadata: Record<string, string> = {};
+  const frontmatter = /^---\s*\n([\s\S]*?)\n---\s*\n?/.exec(body);
+  if (frontmatter) {
+    for (const line of frontmatter[1]!.split("\n")) {
+      const match = /^([a-zA-Z0-9_-]+):\s*["']?(.*?)["']?\s*$/.exec(line);
+      if (match) metadata[match[1]!.toLowerCase()] = match[2]!.trim();
+    }
+    body = body.slice(frontmatter[0].length).trim();
+  }
+  const heading = /^#\s+(.+)$/m.exec(body);
+  const title = metadata.title || heading?.[1]?.trim() || fallbackTitle;
+  if (heading && heading.index === 0) body = body.slice(heading[0].length).trim();
+  const plain = body.replace(/[#>*_`\[\]()!-]/g, " ").replace(/\s+/g, " ").trim();
+  return {
+    title,
+    body: body || raw.trim(),
+    excerpt: metadata.description || plain.slice(0, 180),
+    preferredSlug: metadata.slug || title,
+    tags: (metadata.tags || "").split(",").map((item) => item.trim()).filter(Boolean),
+  };
+}
+async function extractImportedFile(file: File) {
+  const fallbackTitle = file.name.replace(/\.[^.]+$/, "");
+  if (file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const pdf = await getDocumentProxy(bytes, { maxImageSize: 16_777_216 });
+    if (pdf.numPages > 100) throw new Error("PDF 页数不能超过 100 页");
+    const extracted = await extractText(pdf, { mergePages: true });
+    const text = String(extracted.text).trim();
+    if (text.length < 40)
+      return { title: fallbackTitle, body: "", excerpt: "", preferredSlug: fallbackTitle, tags: [] as string[], needsOcr: true };
+    return { ...parseMarkdownImport(text, fallbackTitle), needsOcr: false };
+  }
+  return { ...parseMarkdownImport(await file.text(), fallbackTitle), needsOcr: false };
+}
+function validateImportUrl(raw: string) {
+  const url = new URL(raw);
+  if (url.protocol !== "https:") throw new Error("只允许导入 HTTPS 地址");
+  const host = url.hostname.toLowerCase();
+  if (
+    host === "localhost" || host.endsWith(".local") || host === "0.0.0.0" ||
+    /^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host) || host === "::1"
+  ) throw new Error("不允许导入本地或私有网络地址");
+  return url;
+}
+async function saveArticleVersion(env: Env, articleId: string) {
+  const article = await env.DB.prepare("SELECT * FROM articles WHERE id=?")
+    .bind(articleId).first<Record<string, unknown>>();
+  if (!article) return;
+  await env.DB.prepare(
+    "INSERT INTO article_versions (id,article_id,snapshot_json,created_at) VALUES (?,?,?,?)",
+  ).bind(crypto.randomUUID(), articleId, JSON.stringify(article), new Date().toISOString()).run();
+}
+function bytesToBase64(bytes: Uint8Array) {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000)
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  return btoa(binary);
+}
+function outputTextFromResponse(payload: any) {
+  if (typeof payload?.output_text === "string") return payload.output_text;
+  return (payload?.output ?? [])
+    .flatMap((item: any) => item?.content ?? [])
+    .filter((item: any) => item?.type === "output_text")
+    .map((item: any) => item?.text ?? "")
+    .join("\n")
+    .trim();
 }
 app.onError((error, c) => {
   console.error("Unhandled admin API error", error);
@@ -642,7 +747,7 @@ app.get("/api/admin/articles", async (c) =>
   c.json({
     items: (
       await c.env.DB.prepare(
-        "SELECT articles.id,articles.title,articles.slug,articles.excerpt,articles.body,articles.category_id,articles.status,articles.include_in_rag,articles.published_at,articles.seo_description,articles.document_id,articles.created_at,articles.updated_at,categories.name category_name FROM articles LEFT JOIN categories ON categories.id=articles.category_id ORDER BY articles.updated_at DESC LIMIT 100",
+        "SELECT articles.*,categories.name category_name,(SELECT COUNT(*) FROM article_versions WHERE article_id=articles.id) version_count FROM articles LEFT JOIN categories ON categories.id=articles.category_id ORDER BY articles.updated_at DESC LIMIT 200",
       ).all()
     ).results,
   }),
@@ -651,7 +756,7 @@ app.get("/api/admin/categories", async (c) =>
   c.json({
     items: (
       await c.env.DB.prepare(
-        "SELECT id,name,slug,scope,description,sort_order FROM categories ORDER BY sort_order,name",
+        "SELECT categories.id,categories.name,categories.slug,CASE WHEN categories.scope='both' THEN 'shared' ELSE categories.scope END scope,categories.description,categories.sort_order,categories.show_in_portal,(SELECT COUNT(*) FROM articles WHERE category_id=categories.id) article_count,(SELECT COUNT(*) FROM documents WHERE category_id=categories.id AND purpose='knowledge') document_count FROM categories ORDER BY sort_order,name",
       ).all()
     ).results,
   }),
@@ -660,7 +765,7 @@ app.get("/api/admin/documents", async (c) =>
   c.json({
     items: (
       await c.env.DB.prepare(
-        "SELECT documents.id,documents.title,documents.source_type,documents.category_id,documents.visibility,documents.status,documents.r2_key,documents.chunk_count,documents.error_message,documents.purpose,documents.original_name,documents.file_size,documents.source_url,documents.archived_at,documents.created_at,documents.updated_at,categories.name category_name FROM documents LEFT JOIN categories ON categories.id=documents.category_id ORDER BY documents.updated_at DESC LIMIT 200",
+        "SELECT documents.id,documents.title,documents.source_type,documents.category_id,documents.visibility,documents.status,documents.r2_key,documents.chunk_count,documents.error_message,documents.purpose,documents.original_name,documents.file_size,documents.source_url,documents.archived_at,documents.tags_json,documents.ingestion_progress,documents.ocr_status,documents.current_version,documents.created_at,documents.updated_at,categories.name category_name FROM documents LEFT JOIN categories ON categories.id=documents.category_id ORDER BY documents.updated_at DESC LIMIT 300",
       ).all()
     ).results,
   }),
@@ -695,14 +800,78 @@ app.get("/api/admin/providers", async (c) =>
     ).results,
   }),
 );
+app.post("/api/admin/articles/import", async (c) => {
+  const form = await c.req.formData(), files = form.getAll("files");
+  if (!files.length || files.some((file) => !(file instanceof File)))
+    return c.json({ error: "请选择要导入的 PDF、Markdown 或 TXT" }, 400);
+  if (files.length > 10) return c.json({ error: "一次最多导入 10 个文件" }, 400);
+  const categoryId = String(form.get("categoryId") || "") || null,
+    results: Array<{ id: string; title: string; status: string }> = [];
+  for (const entry of files) {
+    const file = entry as File;
+    if (file.size > 20 * 1024 * 1024) return c.json({ error: `${file.name} 超过 20MB` }, 413);
+    const allowed = file.type === "application/pdf" || file.type === "text/markdown" ||
+      file.type === "text/plain" || /\.(pdf|md|markdown|txt)$/i.test(file.name);
+    if (!allowed) return c.json({ error: `${file.name} 的格式不受支持` }, 415);
+    const id = crypto.randomUUID(), now = new Date().toISOString(),
+      sourceKey = `article-sources/${id}/${encodeURIComponent(file.name).replaceAll("%", "_")}`;
+    await c.env.ASSETS_BUCKET.put(sourceKey, file.stream(), { httpMetadata: { contentType: file.type || "application/octet-stream" } });
+    try {
+      const imported = await extractImportedFile(file), slug = await uniqueArticleSlug(c.env, imported.preferredSlug);
+      await c.env.DB.prepare(
+        "INSERT INTO articles (id,title,slug,excerpt,body,category_id,status,include_in_rag,published_at,seo_description,seo_title,tags_json,source_r2_key,source_name,source_type,import_status,import_error,created_at,updated_at) VALUES (?,?,?,?,?,?,'draft',1,NULL,NULL,NULL,?,?,?,?,?,?,?,?)",
+      ).bind(
+        id, imported.title, slug, imported.excerpt, imported.body || `# ${imported.title}\n\n> 该 PDF 需要 OCR，请在文章编辑器中执行 OCR 后再发布。`,
+        categoryId, JSON.stringify(imported.tags), sourceKey, file.name,
+        file.type === "application/pdf" ? "pdf" : "markdown",
+        imported.needsOcr ? "needs_ocr" : "ready",
+        imported.needsOcr ? "PDF 未检测到可复制文字" : null, now, now,
+      ).run();
+      results.push({ id, title: imported.title, status: imported.needsOcr ? "needs_ocr" : "ready" });
+    } catch (error) {
+      const title = file.name.replace(/\.[^.]+$/, ""), slug = await uniqueArticleSlug(c.env, title);
+      await c.env.DB.prepare(
+        "INSERT INTO articles (id,title,slug,excerpt,body,category_id,status,include_in_rag,tags_json,source_r2_key,source_name,source_type,import_status,import_error,created_at,updated_at) VALUES (?,?,?,?,?,?,'draft',1,'[]',?,?,?,'failed',?,?,?)",
+      ).bind(id, title, slug, "", `# ${title}`, categoryId, sourceKey, file.name, file.type || "file", error instanceof Error ? error.message : "解析失败", now, now).run();
+      results.push({ id, title, status: "failed" });
+    }
+  }
+  await audit(c.env, c.req.raw, "article.import", "article", undefined, { count: results.length });
+  return c.json({ items: results }, 202);
+});
+app.post("/api/admin/articles/import-url", async (c) => {
+  const body = await c.req.json<{ url?: string; categoryId?: string | null }>().catch(() => ({} as { url?: string; categoryId?: string | null }));
+  let url: URL;
+  try { url = validateImportUrl(String(body.url || "")); } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "URL 不正确" }, 400);
+  }
+  const response = await fetch(url, { headers: { "User-Agent": "BunshinContentImporter/1.0" }, redirect: "follow" });
+  if (!response.ok) return c.json({ error: `来源返回 ${response.status}` }, 400);
+  const length = Number(response.headers.get("content-length") || 0);
+  if (length > 5 * 1024 * 1024) return c.json({ error: "网页内容不能超过 5MB" }, 413);
+  const contentType = response.headers.get("content-type") || "", raw = await response.text();
+  if (raw.length > 5_000_000) return c.json({ error: "网页内容不能超过 5MB" }, 413);
+  const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(raw),
+    imported = parseMarkdownImport(contentType.includes("html") ? stripHtml(raw) : raw, titleMatch?.[1]?.trim() || url.hostname),
+    id = crypto.randomUUID(), now = new Date().toISOString(), slug = await uniqueArticleSlug(c.env, imported.preferredSlug),
+    sourceKey = `article-sources/${id}/imported.md`;
+  await c.env.ASSETS_BUCKET.put(sourceKey, imported.body, { httpMetadata: { contentType: "text/markdown; charset=utf-8" } });
+  await c.env.DB.prepare(
+    "INSERT INTO articles (id,title,slug,excerpt,body,category_id,status,include_in_rag,tags_json,source_r2_key,source_name,source_type,import_status,created_at,updated_at) VALUES (?,?,?,?,?,?,'draft',1,?,?,?,'url','ready',?,?)",
+  ).bind(id, imported.title, slug, imported.excerpt, imported.body, body.categoryId || null, JSON.stringify(imported.tags), sourceKey, url.toString(), now, now).run();
+  await audit(c.env, c.req.raw, "article.import_url", "article", id, { url: url.origin });
+  return c.json({ id }, 201);
+});
 app.post("/api/admin/articles", async (c) => {
   const parsed = articleSchema.safeParse(await c.req.json());
   if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
   const now = new Date().toISOString(),
     id = crypto.randomUUID(),
     a = parsed.data;
+  if (a.status === "scheduled" && (!a.scheduledAt || new Date(a.scheduledAt).getTime() <= Date.now()))
+    return c.json({ error: "定时发布时间必须晚于当前时间" }, 400);
   await c.env.DB.prepare(
-    "INSERT INTO articles (id,title,slug,excerpt,body,category_id,status,include_in_rag,published_at,seo_description,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+    "INSERT INTO articles (id,title,slug,excerpt,body,category_id,status,include_in_rag,published_at,seo_description,seo_title,tags_json,scheduled_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
   )
     .bind(
       id,
@@ -715,6 +884,9 @@ app.post("/api/admin/articles", async (c) => {
       a.includeInRag ? 1 : 0,
       a.status === "published" ? now : null,
       a.seoDescription || null,
+      a.seoTitle || null,
+      JSON.stringify(a.tags),
+      a.status === "scheduled" ? a.scheduledAt : null,
       now,
       now,
     )
@@ -737,13 +909,17 @@ app.put("/api/admin/articles/:id", async (c) => {
   ).bind(c.req.param("id")).first<{ id: string; document_id: string | null; published_at: string | null }>();
   if (!existing) return c.json({ error: "文章不存在" }, 404);
   const a = parsed.data, now = new Date().toISOString();
+  if (a.status === "scheduled" && (!a.scheduledAt || new Date(a.scheduledAt).getTime() <= Date.now()))
+    return c.json({ error: "定时发布时间必须晚于当前时间" }, 400);
+  await saveArticleVersion(c.env, existing.id);
   await c.env.DB.prepare(
-    "UPDATE articles SET title=?,slug=?,excerpt=?,body=?,category_id=?,status=?,include_in_rag=?,published_at=?,seo_description=?,updated_at=? WHERE id=?",
+    "UPDATE articles SET title=?,slug=?,excerpt=?,body=?,category_id=?,status=?,include_in_rag=?,published_at=?,seo_description=?,seo_title=?,tags_json=?,scheduled_at=?,updated_at=? WHERE id=?",
   ).bind(
     a.title, a.slug, a.excerpt, a.body, a.categoryId, a.status,
     a.includeInRag ? 1 : 0,
     a.status === "published" ? (existing.published_at ?? now) : existing.published_at,
-    a.seoDescription || null, now, existing.id,
+    a.seoDescription || null, a.seoTitle || null, JSON.stringify(a.tags),
+    a.status === "scheduled" ? a.scheduledAt : null, now, existing.id,
   ).run();
   const documentId = await syncArticleDocument(c.env, {
     id: existing.id,
@@ -757,8 +933,8 @@ app.put("/api/admin/articles/:id", async (c) => {
 });
 app.delete("/api/admin/articles/:id", async (c) => {
   const article = await c.env.DB.prepare(
-    "SELECT id,document_id FROM articles WHERE id=?",
-  ).bind(c.req.param("id")).first<{ id: string; document_id: string | null }>();
+    "SELECT id,document_id,cover_r2_key,source_r2_key FROM articles WHERE id=?",
+  ).bind(c.req.param("id")).first<{ id: string; document_id: string | null; cover_r2_key: string | null; source_r2_key: string | null }>();
   if (!article) return c.json({ error: "文章不存在" }, 404);
   if (article.document_id) {
     await removeDocumentIndex(c.env, article.document_id);
@@ -767,9 +943,90 @@ app.delete("/api/admin/articles/:id", async (c) => {
     if (document?.r2_key) await c.env.ASSETS_BUCKET.delete(document.r2_key);
     await c.env.DB.prepare("DELETE FROM documents WHERE id=?").bind(article.document_id).run();
   }
-  await c.env.DB.prepare("DELETE FROM articles WHERE id=?").bind(article.id).run();
+  await Promise.all([article.cover_r2_key, article.source_r2_key].filter(Boolean).map((key) => c.env.ASSETS_BUCKET.delete(key!)));
+  await c.env.DB.batch([
+    c.env.DB.prepare("DELETE FROM article_versions WHERE article_id=?").bind(article.id),
+    c.env.DB.prepare("DELETE FROM articles WHERE id=?").bind(article.id),
+  ]);
   await audit(c.env, c.req.raw, "article.delete", "article", article.id);
   return c.json({ ok: true });
+});
+app.get("/api/admin/articles/:id/versions", async (c) =>
+  c.json({ items: (await c.env.DB.prepare(
+    "SELECT id,snapshot_json,created_at FROM article_versions WHERE article_id=? ORDER BY created_at DESC LIMIT 50",
+  ).bind(c.req.param("id")).all()).results }),
+);
+app.post("/api/admin/articles/:id/versions/:versionId/restore", async (c) => {
+  const row = await c.env.DB.prepare(
+    "SELECT snapshot_json FROM article_versions WHERE id=? AND article_id=?",
+  ).bind(c.req.param("versionId"), c.req.param("id")).first<{ snapshot_json: string }>();
+  if (!row) return c.json({ error: "历史版本不存在" }, 404);
+  const snapshot = JSON.parse(row.snapshot_json) as Record<string, any>, now = new Date().toISOString();
+  await saveArticleVersion(c.env, c.req.param("id"));
+  await c.env.DB.prepare(
+    "UPDATE articles SET title=?,slug=?,excerpt=?,body=?,category_id=?,status='draft',include_in_rag=?,seo_description=?,seo_title=?,tags_json=?,scheduled_at=NULL,updated_at=? WHERE id=?",
+  ).bind(snapshot.title, snapshot.slug, snapshot.excerpt || "", snapshot.body, snapshot.category_id || null,
+    Number(snapshot.include_in_rag ?? 1), snapshot.seo_description || null, snapshot.seo_title || null,
+    snapshot.tags_json || "[]", now, c.req.param("id")).run();
+  await audit(c.env, c.req.raw, "article.restore", "article", c.req.param("id"), { versionId: c.req.param("versionId") });
+  return c.json({ ok: true });
+});
+app.put("/api/admin/articles/:id/cover", async (c) => {
+  const form = await c.req.formData(), file = form.get("file");
+  if (!(file instanceof File)) return c.json({ error: "请选择封面图片" }, 400);
+  if (!file.type.startsWith("image/") || file.size > 5 * 1024 * 1024)
+    return c.json({ error: "封面必须是 5MB 以内的图片" }, 400);
+  const article = await c.env.DB.prepare("SELECT cover_r2_key FROM articles WHERE id=?")
+    .bind(c.req.param("id")).first<{ cover_r2_key: string | null }>();
+  if (!article) return c.json({ error: "文章不存在" }, 404);
+  const key = `article-covers/${c.req.param("id")}/${crypto.randomUUID()}-${encodeURIComponent(file.name).replaceAll("%", "_")}`;
+  await c.env.ASSETS_BUCKET.put(key, file.stream(), { httpMetadata: { contentType: file.type } });
+  await c.env.DB.prepare("UPDATE articles SET cover_r2_key=?,updated_at=? WHERE id=?")
+    .bind(key, new Date().toISOString(), c.req.param("id")).run();
+  if (article.cover_r2_key) await c.env.ASSETS_BUCKET.delete(article.cover_r2_key);
+  return c.json({ ok: true });
+});
+app.delete("/api/admin/articles/:id/cover", async (c) => {
+  const article = await c.env.DB.prepare("SELECT cover_r2_key FROM articles WHERE id=?")
+    .bind(c.req.param("id")).first<{ cover_r2_key: string | null }>();
+  if (article?.cover_r2_key) await c.env.ASSETS_BUCKET.delete(article.cover_r2_key);
+  await c.env.DB.prepare("UPDATE articles SET cover_r2_key=NULL,updated_at=? WHERE id=?")
+    .bind(new Date().toISOString(), c.req.param("id")).run();
+  return c.json({ ok: true });
+});
+app.get("/api/admin/articles/:id/source", async (c) => {
+  const article = await c.env.DB.prepare("SELECT source_r2_key,source_name,source_type FROM articles WHERE id=?")
+    .bind(c.req.param("id")).first<{ source_r2_key: string | null; source_name: string | null; source_type: string | null }>();
+  if (!article?.source_r2_key) return c.json({ error: "没有导入源文件" }, 404);
+  const object = await c.env.ASSETS_BUCKET.get(article.source_r2_key);
+  if (!object) return c.json({ error: "源文件不存在" }, 404);
+  const name = article.source_name || `article.${article.source_type === "pdf" ? "pdf" : "md"}`;
+  return new Response(object.body, { headers: {
+    "Content-Type": object.httpMetadata?.contentType || "application/octet-stream",
+    "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(name)}`,
+    "Cache-Control": "private, no-store",
+  } });
+});
+app.post("/api/admin/articles/batch-action", async (c) => {
+  const body = await c.req.json<{ ids?: string[]; action?: string; categoryId?: string | null }>().catch(() => ({} as { ids?: string[]; action?: string; categoryId?: string | null }));
+  const ids = [...new Set(body.ids || [])].slice(0, 100);
+  if (!ids.length) return c.json({ error: "请选择文章" }, 400);
+  if (body.action === "category") {
+    await c.env.DB.batch(ids.map((id) => c.env.DB.prepare("UPDATE articles SET category_id=?,updated_at=? WHERE id=?")
+      .bind(body.categoryId || null, new Date().toISOString(), id)));
+  } else if (["draft", "archived", "published"].includes(body.action || "")) {
+    const now = new Date().toISOString();
+    await c.env.DB.batch(ids.map((id) => c.env.DB.prepare(
+      "UPDATE articles SET status=?,published_at=CASE WHEN ?='published' THEN COALESCE(published_at,?) ELSE published_at END,scheduled_at=NULL,updated_at=? WHERE id=?",
+    ).bind(body.action, body.action, now, now, id)));
+    for (const id of ids) {
+      const article = await c.env.DB.prepare("SELECT id,title,slug,excerpt,body,status,include_in_rag,document_id FROM articles WHERE id=?")
+        .bind(id).first<any>();
+      if (article) await syncArticleDocument(c.env, { ...article, includeInRag: Boolean(article.include_in_rag), documentId: article.document_id });
+    }
+  } else return c.json({ error: "批量操作不受支持" }, 400);
+  await audit(c.env, c.req.raw, "article.batch", "article", undefined, { action: body.action, count: ids.length });
+  return c.json({ ok: true, count: ids.length });
 });
 app.post("/api/admin/articles/reindex", async (c) => {
   const articles = (
@@ -798,20 +1055,38 @@ app.post("/api/admin/categories", async (c) => {
   const now = new Date().toISOString(),
     id = crypto.randomUUID();
   await c.env.DB.prepare(
-    "INSERT INTO categories (id,name,slug,scope,created_at,updated_at) VALUES (?,?,?,?,?,?)",
+    "INSERT INTO categories (id,name,slug,scope,description,sort_order,show_in_portal,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
   )
-    .bind(id, parsed.data.name, parsed.data.slug, parsed.data.scope, now, now)
+    .bind(id, parsed.data.name, parsed.data.slug, parsed.data.scope, parsed.data.description,
+      parsed.data.sortOrder, parsed.data.showInPortal ? 1 : 0, now, now)
     .run();
   return c.json({ id }, 201);
 });
+app.put("/api/admin/categories/:id", async (c) => {
+  const parsed = categorySchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
+  const result = await c.env.DB.prepare(
+    "UPDATE categories SET name=?,slug=?,scope=?,description=?,sort_order=?,show_in_portal=?,updated_at=? WHERE id=?",
+  ).bind(parsed.data.name, parsed.data.slug, parsed.data.scope, parsed.data.description,
+    parsed.data.sortOrder, parsed.data.showInPortal ? 1 : 0, new Date().toISOString(), c.req.param("id")).run();
+  if (!result.meta.changes) return c.json({ error: "分类不存在" }, 404);
+  await audit(c.env, c.req.raw, "category.update", "category", c.req.param("id"));
+  return c.json({ ok: true });
+});
 app.delete("/api/admin/categories/:id", async (c) => {
-  const id = c.req.param("id");
+  const id = c.req.param("id"), body = await c.req.json<{ replacementCategoryId?: string | null; uncategorize?: boolean }>().catch(() => ({} as { replacementCategoryId?: string | null; uncategorize?: boolean }));
+  const counts = await c.env.DB.prepare(
+    "SELECT (SELECT COUNT(*) FROM articles WHERE category_id=?) article_count,(SELECT COUNT(*) FROM documents WHERE category_id=?) document_count",
+  ).bind(id, id).first<{ article_count: number; document_count: number }>();
+  if ((Number(counts?.article_count) || Number(counts?.document_count)) && !body.replacementCategoryId && !body.uncategorize)
+    return c.json({ error: "分类仍有关联内容，请选择迁移目标或确认移动到未分类", counts }, 409);
+  if (body.replacementCategoryId === id) return c.json({ error: "不能合并到自身" }, 400);
   await c.env.DB.batch([
-    c.env.DB.prepare("UPDATE articles SET category_id=NULL WHERE category_id=?").bind(id),
-    c.env.DB.prepare("UPDATE documents SET category_id=NULL WHERE category_id=?").bind(id),
+    c.env.DB.prepare("UPDATE articles SET category_id=? WHERE category_id=?").bind(body.replacementCategoryId || null, id),
+    c.env.DB.prepare("UPDATE documents SET category_id=? WHERE category_id=?").bind(body.replacementCategoryId || null, id),
     c.env.DB.prepare("DELETE FROM categories WHERE id=?").bind(id),
   ]);
-  await audit(c.env, c.req.raw, "category.delete", "category", id);
+  await audit(c.env, c.req.raw, "category.delete", "category", id, { replacementCategoryId: body.replacementCategoryId || null });
   return c.json({ ok: true });
 });
 app.post("/api/admin/providers", async (c) => {
@@ -1002,7 +1277,7 @@ app.post("/api/admin/documents", async (c) => {
     httpMetadata: { contentType: mimeType },
   });
   await c.env.DB.prepare(
-    "INSERT INTO documents (id,title,source_type,category_id,visibility,status,r2_key,purpose,original_name,file_size,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+    "INSERT INTO documents (id,title,source_type,category_id,visibility,status,r2_key,purpose,original_name,file_size,ingestion_progress,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,10,?,?)",
   )
     .bind(
       id,
@@ -1019,6 +1294,11 @@ app.post("/api/admin/documents", async (c) => {
       now,
     )
     .run();
+  await c.env.DB.prepare(
+    "INSERT INTO document_versions (id,document_id,version_number,r2_key,original_name,source_type,file_size,created_at) VALUES (?,?,?,?,?,?,?,?)",
+  ).bind(crypto.randomUUID(), id, 1, r2Key, originalName,
+    mimeType.includes("pdf") ? "pdf" : mimeType.includes("markdown") ? "markdown" : "text",
+    file instanceof File ? file.size : new TextEncoder().encode(textInput).length, now).run();
   await c.env.INGESTION_QUEUE.send({
     type: "ingest",
     documentId: id,
@@ -1040,6 +1320,159 @@ app.post("/api/admin/documents", async (c) => {
   }
   await audit(c.env, c.req.raw, "document.create", "document", id, { purpose, visibility });
   return c.json({ id, status: "uploaded" }, 202);
+});
+app.get("/api/admin/documents/:id/detail", async (c) => {
+  const item = await c.env.DB.prepare(
+    "SELECT documents.*,categories.name category_name FROM documents LEFT JOIN categories ON categories.id=documents.category_id WHERE documents.id=?",
+  ).bind(c.req.param("id")).first();
+  if (!item) return c.json({ error: "文档不存在" }, 404);
+  const [chunks, versions] = await Promise.all([
+    c.env.DB.prepare("SELECT id,chunk_index,content,heading_path,page_number FROM chunks WHERE document_id=? ORDER BY chunk_index LIMIT 200")
+      .bind(c.req.param("id")).all(),
+    c.env.DB.prepare("SELECT id,version_number,original_name,source_type,file_size,created_at FROM document_versions WHERE document_id=? ORDER BY version_number DESC")
+      .bind(c.req.param("id")).all(),
+  ]);
+  return c.json({ item, chunks: chunks.results, versions: versions.results });
+});
+app.get("/api/admin/documents/:id/versions/:versionId/download", async (c) => {
+  const version = await c.env.DB.prepare(
+    "SELECT document_versions.r2_key,document_versions.original_name,document_versions.source_type FROM document_versions JOIN documents ON documents.id=document_versions.document_id WHERE document_versions.id=? AND document_versions.document_id=?",
+  ).bind(c.req.param("versionId"), c.req.param("id")).first<{ r2_key: string; original_name: string; source_type: string }>();
+  if (!version) return c.json({ error: "版本不存在" }, 404);
+  const object = await c.env.ASSETS_BUCKET.get(version.r2_key);
+  if (!object) return c.json({ error: "版本文件不存在" }, 404);
+  const fallbackType = version.source_type === "pdf" ? "application/pdf" : version.source_type === "markdown" ? "text/markdown; charset=utf-8" : "text/plain; charset=utf-8";
+  return new Response(object.body, { headers: {
+    "Content-Type": object.httpMetadata?.contentType || fallbackType,
+    "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(version.original_name)}`,
+    "Cache-Control": "private, no-store",
+  } });
+});
+app.post("/api/admin/documents/:id/versions/:versionId/restore", async (c) => {
+  const row = await c.env.DB.prepare(
+    "SELECT documents.id,documents.purpose,documents.current_version,document_versions.r2_key,document_versions.original_name,document_versions.source_type,document_versions.file_size FROM document_versions JOIN documents ON documents.id=document_versions.document_id WHERE document_versions.id=? AND document_versions.document_id=?",
+  ).bind(c.req.param("versionId"), c.req.param("id")).first<{ id: string; purpose: string; current_version: number; r2_key: string; original_name: string; source_type: string; file_size: number }>();
+  if (!row) return c.json({ error: "版本不存在" }, 404);
+  if (row.purpose !== "knowledge") return c.json({ error: "只能恢复普通知识资料" }, 409);
+  const version = Number(row.current_version || 1) + 1, now = new Date().toISOString();
+  await c.env.DB.batch([
+    c.env.DB.prepare("INSERT INTO document_versions (id,document_id,version_number,r2_key,original_name,source_type,file_size,created_at) VALUES (?,?,?,?,?,?,?,?)")
+      .bind(crypto.randomUUID(), row.id, version, row.r2_key, row.original_name, row.source_type, row.file_size, now),
+    c.env.DB.prepare("UPDATE documents SET r2_key=?,original_name=?,source_type=?,file_size=?,current_version=?,status='uploaded',ingestion_progress=10,error_message=NULL,ocr_status='none',ocr_r2_key=NULL,updated_at=? WHERE id=?")
+      .bind(row.r2_key, row.original_name, row.source_type, row.file_size, version, now, row.id),
+  ]);
+  await removeDocumentIndex(c.env, row.id);
+  const mimeType = row.source_type === "pdf" ? "application/pdf" : row.source_type === "markdown" ? "text/markdown" : "text/plain";
+  await c.env.INGESTION_QUEUE.send({ type: "ingest", documentId: row.id, r2Key: row.r2_key, mimeType } satisfies Job);
+  await audit(c.env, c.req.raw, "document.version.restore", "document", row.id, { version });
+  return c.json({ ok: true, version }, 202);
+});
+app.post("/api/admin/documents/:id/replace", async (c) => {
+  const form = await c.req.formData(), file = form.get("file");
+  if (!(file instanceof File)) return c.json({ error: "请选择替换文件" }, 400);
+  if (file.size > 20 * 1024 * 1024) return c.json({ error: "文件不能超过 20MB" }, 413);
+  const allowed = new Set(["application/pdf", "text/plain", "text/markdown"]);
+  if (!allowed.has(file.type)) return c.json({ error: "不支持的文件类型" }, 415);
+  const document = await c.env.DB.prepare(
+    "SELECT id,current_version,purpose FROM documents WHERE id=?",
+  ).bind(c.req.param("id")).first<{ id: string; current_version: number; purpose: string }>();
+  if (!document || document.purpose !== "knowledge") return c.json({ error: "只能在知识库替换普通资料" }, 409);
+  const version = Number(document.current_version || 1) + 1, now = new Date().toISOString(),
+    type = file.type === "application/pdf" ? "pdf" : file.type === "text/markdown" ? "markdown" : "text",
+    key = `documents/${document.id}/v${version}-${encodeURIComponent(file.name).replaceAll("%", "_")}`;
+  await c.env.ASSETS_BUCKET.put(key, file.stream(), { httpMetadata: { contentType: file.type } });
+  await c.env.DB.batch([
+    c.env.DB.prepare("INSERT INTO document_versions (id,document_id,version_number,r2_key,original_name,source_type,file_size,created_at) VALUES (?,?,?,?,?,?,?,?)")
+      .bind(crypto.randomUUID(), document.id, version, key, file.name, type, file.size, now),
+    c.env.DB.prepare("UPDATE documents SET r2_key=?,original_name=?,source_type=?,file_size=?,current_version=?,status='uploaded',ingestion_progress=10,error_message=NULL,ocr_status='none',ocr_r2_key=NULL,updated_at=? WHERE id=?")
+      .bind(key, file.name, type, file.size, version, now, document.id),
+  ]);
+  await removeDocumentIndex(c.env, document.id);
+  await c.env.INGESTION_QUEUE.send({ type: "ingest", documentId: document.id, r2Key: key, mimeType: file.type } satisfies Job);
+  await audit(c.env, c.req.raw, "document.replace", "document", document.id, { version });
+  return c.json({ ok: true, version }, 202);
+});
+app.post("/api/admin/documents/:id/ocr-result", async (c) => {
+  const form = await c.req.formData(), file = form.get("file"), textInput = String(form.get("text") || "").trim(),
+    text = file instanceof File ? (file.size > 5 * 1024 * 1024 ? "" : await file.text()) : textInput;
+  if (text.length < 40) return c.json({ error: "请上传或粘贴至少 40 个字符的 OCR 结果" }, 400);
+  const document = await c.env.DB.prepare("SELECT id,title FROM documents WHERE id=?")
+    .bind(c.req.param("id")).first<{ id: string; title: string }>();
+  if (!document) return c.json({ error: "文档不存在" }, 404);
+  const key = `documents/${document.id}/ocr-${Date.now()}.md`, now = new Date().toISOString();
+  await c.env.ASSETS_BUCKET.put(key, text, { httpMetadata: { contentType: "text/markdown; charset=utf-8" } });
+  await c.env.DB.prepare(
+    "UPDATE documents SET ocr_status='provided',ocr_r2_key=?,status='uploaded',ingestion_progress=10,error_message=NULL,updated_at=? WHERE id=?",
+  ).bind(key, now, document.id).run();
+  await c.env.INGESTION_QUEUE.send({ type: "ingest", documentId: document.id, r2Key: key, mimeType: "text/markdown" } satisfies Job);
+  await audit(c.env, c.req.raw, "document.ocr_result", "document", document.id);
+  return c.json({ ok: true }, 202);
+});
+app.post("/api/admin/documents/import-url", async (c) => {
+  const body = await c.req.json<{ url?: string; title?: string; categoryId?: string | null; visibility?: string }>().catch(() => ({} as { url?: string; title?: string; categoryId?: string | null; visibility?: string }));
+  let url: URL;
+  try { url = validateImportUrl(String(body.url || "")); } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "URL 不正确" }, 400);
+  }
+  const response = await fetch(url, { headers: { "User-Agent": "BunshinKnowledgeImporter/1.0" }, redirect: "follow" });
+  if (!response.ok) return c.json({ error: `来源返回 ${response.status}` }, 400);
+  const raw = await response.text();
+  if (raw.length > 5_000_000) return c.json({ error: "网页内容不能超过 5MB" }, 413);
+  const contentType = response.headers.get("content-type") || "", titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(raw),
+    text = contentType.includes("html") ? stripHtml(raw) : raw,
+    title = String(body.title || titleMatch?.[1] || url.hostname).trim(), id = crypto.randomUUID(), now = new Date().toISOString(),
+    key = `documents/${id}/imported.md`, size = new TextEncoder().encode(text).length,
+    visibility = ["public", "rag_only", "private"].includes(body.visibility || "") ? body.visibility! : "rag_only";
+  if (text.length < 40) return c.json({ error: "网页没有可导入的正文" }, 400);
+  await c.env.ASSETS_BUCKET.put(key, text, { httpMetadata: { contentType: "text/markdown; charset=utf-8" } });
+  await c.env.DB.batch([
+    c.env.DB.prepare("INSERT INTO documents (id,title,source_type,category_id,visibility,status,r2_key,purpose,original_name,file_size,source_url,ingestion_progress,created_at,updated_at) VALUES (?,?,?,?,?,'uploaded',?,'knowledge','imported.md',?,?,10,?,?)")
+      .bind(id, title, "markdown", body.categoryId || null, visibility, key, size, url.toString(), now, now),
+    c.env.DB.prepare("INSERT INTO document_versions (id,document_id,version_number,r2_key,original_name,source_type,file_size,created_at) VALUES (?,?,?,?,?,?,?,?)")
+      .bind(crypto.randomUUID(), id, 1, key, "imported.md", "markdown", size, now),
+  ]);
+  await c.env.INGESTION_QUEUE.send({ type: "ingest", documentId: id, r2Key: key, mimeType: "text/markdown" } satisfies Job);
+  await audit(c.env, c.req.raw, "document.import_url", "document", id, { origin: url.origin });
+  return c.json({ id }, 202);
+});
+app.post("/api/admin/documents/:id/search-test", async (c) => {
+  const body = await c.req.json<{ query?: string }>().catch(() => ({} as { query?: string })), query = String(body.query || "").trim();
+  if (!query) return c.json({ error: "请输入测试问题" }, 400);
+  const rows = (await c.env.DB.prepare(
+    "SELECT chunks.id,chunks.chunk_index,chunks.content,chunks.heading_path,local_vectors.embedding_json FROM chunks JOIN local_vectors ON local_vectors.chunk_id=chunks.id WHERE chunks.document_id=?",
+  ).bind(c.req.param("id")).all<any>()).results;
+  const vector = createLocalEmbedding(query), items = rows.map((row) => ({
+    id: row.id, chunkIndex: row.chunk_index, content: row.content, headingPath: JSON.parse(row.heading_path || "[]"),
+    score: cosineSimilarity(vector, JSON.parse(row.embedding_json)),
+  })).sort((a, b) => b.score - a.score).slice(0, 5);
+  return c.json({ items });
+});
+app.post("/api/admin/documents/batch-action", async (c) => {
+  const body = await c.req.json<{ ids?: string[]; action?: string; categoryId?: string | null; visibility?: string }>().catch(() => ({} as { ids?: string[]; action?: string; categoryId?: string | null; visibility?: string })),
+    ids = [...new Set(body.ids || [])].slice(0, 100), now = new Date().toISOString();
+  if (!ids.length) return c.json({ error: "请选择资料" }, 400);
+  if (body.action === "category")
+    await c.env.DB.batch(ids.map((id) => c.env.DB.prepare("UPDATE documents SET category_id=?,updated_at=? WHERE id=? AND purpose='knowledge'").bind(body.categoryId || null, now, id)));
+  else if (body.action === "visibility" && ["public", "rag_only", "private"].includes(body.visibility || "")) {
+    await c.env.DB.batch(ids.map((id) => c.env.DB.prepare("UPDATE documents SET visibility=?,updated_at=? WHERE id=? AND purpose='knowledge'").bind(body.visibility, now, id)));
+    for (const id of ids) {
+      if (body.visibility === "private") await removeDocumentIndex(c.env, id);
+      else {
+        const item = await c.env.DB.prepare("SELECT r2_key,source_type FROM documents WHERE id=? AND purpose='knowledge'").bind(id).first<{ r2_key: string; source_type: string }>();
+        if (item?.r2_key) await c.env.INGESTION_QUEUE.send({ type: "ingest", documentId: id, r2Key: item.r2_key, mimeType: item.source_type === "pdf" ? "application/pdf" : "text/markdown" } satisfies Job);
+      }
+    }
+  }
+  else if (body.action === "retry") {
+    for (const id of ids) {
+      const item = await c.env.DB.prepare("SELECT r2_key,source_type FROM documents WHERE id=? AND purpose='knowledge'").bind(id).first<{ r2_key: string; source_type: string }>();
+      if (!item?.r2_key) continue;
+      await c.env.DB.prepare("UPDATE documents SET status='uploaded',ingestion_progress=10,error_message=NULL,updated_at=? WHERE id=?").bind(now, id).run();
+      await c.env.INGESTION_QUEUE.send({ type: "ingest", documentId: id, r2Key: item.r2_key, mimeType: item.source_type === "pdf" ? "application/pdf" : "text/markdown" } satisfies Job);
+    }
+  } else return c.json({ error: "批量操作不受支持" }, 400);
+  await audit(c.env, c.req.raw, "document.batch", "document", undefined, { action: body.action, count: ids.length });
+  return c.json({ ok: true, count: ids.length });
 });
 app.patch("/api/admin/documents/:id", async (c) => {
   const body = await c.req.json<{ title?: string; categoryId?: string | null; visibility?: string }>().catch(() => ({} as { title?: string; categoryId?: string | null; visibility?: string }));
@@ -1079,7 +1512,7 @@ app.post("/api/admin/documents/:id/retry", async (c) => {
   ).bind(c.req.param("id")).first<{ id: string; r2_key: string | null; source_type: string }>();
   if (!document?.r2_key) return c.json({ error: "原文件不存在" }, 404);
   await c.env.DB.prepare(
-    "UPDATE documents SET status='uploaded',error_message=NULL,archived_at=NULL,updated_at=? WHERE id=?",
+    "UPDATE documents SET status='uploaded',ingestion_progress=10,error_message=NULL,archived_at=NULL,updated_at=? WHERE id=?",
   ).bind(new Date().toISOString(), document.id).run();
   await c.env.INGESTION_QUEUE.send({
     type: "ingest", documentId: document.id, r2Key: document.r2_key,
@@ -1090,15 +1523,18 @@ app.post("/api/admin/documents/:id/retry", async (c) => {
 });
 app.delete("/api/admin/documents/:id", async (c) => {
   const document = await c.env.DB.prepare(
-    "SELECT id,r2_key,purpose FROM documents WHERE id=?",
-  ).bind(c.req.param("id")).first<{ id: string; r2_key: string | null; purpose: string }>();
+    "SELECT id,r2_key,ocr_r2_key,purpose FROM documents WHERE id=?",
+  ).bind(c.req.param("id")).first<{ id: string; r2_key: string | null; ocr_r2_key: string | null; purpose: string }>();
   if (!document) return c.json({ error: "文档不存在" }, 404);
   if (["profile", "article"].includes(document.purpose))
     return c.json({ error: "该文档由资料或文章生成，请在对应模块管理" }, 409);
   await removeDocumentIndex(c.env, document.id);
-  if (document.r2_key) await c.env.ASSETS_BUCKET.delete(document.r2_key);
+  const versionKeys = (await c.env.DB.prepare("SELECT r2_key FROM document_versions WHERE document_id=?")
+    .bind(document.id).all<{ r2_key: string }>()).results.map((item) => item.r2_key);
+  await Promise.all([...new Set([document.r2_key, document.ocr_r2_key, ...versionKeys].filter(Boolean))].map((key) => c.env.ASSETS_BUCKET.delete(key!)));
   await c.env.DB.batch([
     c.env.DB.prepare("UPDATE profiles SET resume_document_id=NULL WHERE resume_document_id=?").bind(document.id),
+    c.env.DB.prepare("DELETE FROM document_versions WHERE document_id=?").bind(document.id),
     c.env.DB.prepare("DELETE FROM documents WHERE id=?").bind(document.id),
   ]);
   await audit(c.env, c.req.raw, "document.delete", "document", document.id);
@@ -1121,7 +1557,7 @@ async function consume(batch: MessageBatch<Job>, env: Env) {
     const job = message.body;
     try {
       await env.DB.prepare(
-        "UPDATE documents SET status='parsing', updated_at=? WHERE id=?",
+        "UPDATE documents SET status='parsing',ingestion_progress=35, updated_at=? WHERE id=?",
       )
         .bind(new Date().toISOString(), job.documentId)
         .run();
@@ -1138,7 +1574,7 @@ async function consume(batch: MessageBatch<Job>, env: Env) {
         text = String(extracted.text).trim();
         if (text.length < 40) {
           await env.DB.prepare(
-            "UPDATE documents SET status='needs_ocr', error_message='未检测到足够的可复制文字，可能是扫描版 PDF', updated_at=? WHERE id=?",
+            "UPDATE documents SET status='needs_ocr',ingestion_progress=100,ocr_status='required', error_message='未检测到足够的可复制文字，可能是扫描版 PDF', updated_at=? WHERE id=?",
           )
             .bind(new Date().toISOString(), job.documentId)
             .run();
@@ -1153,7 +1589,7 @@ async function consume(batch: MessageBatch<Job>, env: Env) {
       if (!documentMeta || documentMeta.visibility === "private") {
         await removeDocumentIndex(env, job.documentId);
         await env.DB.prepare(
-          "UPDATE documents SET status='archived',updated_at=? WHERE id=?",
+          "UPDATE documents SET status='archived',ingestion_progress=100,updated_at=? WHERE id=?",
         ).bind(new Date().toISOString(), job.documentId).run();
         message.ack();
         continue;
@@ -1199,7 +1635,7 @@ async function consume(batch: MessageBatch<Job>, env: Env) {
       }>();
       if (provider?.embedding_mode === "provider" && chunks.length) {
         await env.DB.prepare(
-          "UPDATE documents SET status='embedding',updated_at=? WHERE id=?",
+          "UPDATE documents SET status='embedding',ingestion_progress=75,updated_at=? WHERE id=?",
         )
           .bind(new Date().toISOString(), job.documentId)
           .run();
@@ -1253,14 +1689,14 @@ async function consume(batch: MessageBatch<Job>, env: Env) {
           .run();
       }
       await env.DB.prepare(
-        "UPDATE documents SET status='indexed', parsed_text=?, chunk_count=?, error_message=NULL, updated_at=? WHERE id=?",
+        "UPDATE documents SET status='indexed',ingestion_progress=100, parsed_text=?, chunk_count=?, error_message=NULL, updated_at=? WHERE id=?",
       )
         .bind(text, chunks.length, new Date().toISOString(), job.documentId)
         .run();
       message.ack();
     } catch (error) {
       await env.DB.prepare(
-        "UPDATE documents SET status='failed', error_message=?, updated_at=? WHERE id=?",
+        "UPDATE documents SET status='failed',ingestion_progress=100, error_message=?, updated_at=? WHERE id=?",
       )
         .bind(
           error instanceof Error ? error.message : "Unknown error",
@@ -1272,4 +1708,23 @@ async function consume(batch: MessageBatch<Job>, env: Env) {
     }
   }
 }
-export default { fetch: app.fetch, queue: consume };
+async function publishScheduledArticles(env: Env) {
+  const now = new Date().toISOString(), articles = (await env.DB.prepare(
+    "SELECT id,title,slug,excerpt,body,include_in_rag,document_id FROM articles WHERE status='scheduled' AND scheduled_at IS NOT NULL AND scheduled_at<=? ORDER BY scheduled_at LIMIT 50",
+  ).bind(now).all<any>()).results;
+  for (const article of articles) {
+    await env.DB.prepare("UPDATE articles SET status='published',published_at=COALESCE(published_at,scheduled_at,?),scheduled_at=NULL,updated_at=? WHERE id=?")
+      .bind(now, now, article.id).run();
+    const documentId = await syncArticleDocument(env, {
+      ...article, status: "published", includeInRag: Boolean(article.include_in_rag), documentId: article.document_id,
+    });
+    await env.DB.prepare("UPDATE articles SET document_id=? WHERE id=?").bind(documentId, article.id).run();
+  }
+}
+export default {
+  fetch: app.fetch,
+  queue: consume,
+  scheduled: (_controller: ScheduledController, env: Env, ctx: ExecutionContext) => {
+    ctx.waitUntil(publishScheduledArticles(env));
+  },
+};

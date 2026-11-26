@@ -244,6 +244,7 @@ type PublicArticle = {
   id: string; title: string; slug: string; excerpt: string; body: string;
   category_id: string | null; category_name: string | null; category_slug: string | null;
   published_at: string | null; updated_at: string; seo_description: string | null;
+  seo_title: string | null; tags_json: string; cover_r2_key: string | null;
 };
 const parseJson = <T,>(value: string | null | undefined, fallback: T): T => {
   try { return value ? JSON.parse(value) as T : fallback; } catch { return fallback; }
@@ -254,7 +255,7 @@ async function publicProfile(env: Bindings) {
   ).first<PublicProfile>();
 }
 async function publicArticles(env: Bindings, categorySlug?: string | null) {
-  const sql = `SELECT articles.id,articles.title,articles.slug,articles.excerpt,articles.body,articles.category_id,articles.published_at,articles.updated_at,articles.seo_description,categories.name category_name,categories.slug category_slug FROM articles LEFT JOIN categories ON categories.id=articles.category_id WHERE articles.status='published'${categorySlug ? " AND categories.slug=?" : ""} ORDER BY COALESCE(articles.published_at,articles.updated_at) DESC`;
+  const sql = `SELECT articles.id,articles.title,articles.slug,articles.excerpt,articles.body,articles.category_id,articles.published_at,articles.updated_at,articles.seo_description,articles.seo_title,articles.tags_json,articles.cover_r2_key,categories.name category_name,categories.slug category_slug FROM articles LEFT JOIN categories ON categories.id=articles.category_id WHERE articles.status='published'${categorySlug ? " AND categories.slug=?" : ""} ORDER BY COALESCE(articles.published_at,articles.updated_at) DESC`;
   return (categorySlug ? await env.DB.prepare(sql).bind(categorySlug).all<PublicArticle>() : await env.DB.prepare(sql).all<PublicArticle>()).results;
 }
 function formatDate(value: string | null | undefined) {
@@ -347,7 +348,7 @@ function layout(
         <meta property="og:type" content=${article ? "article" : "website"} />
         <meta property="og:url" content=${canonical} />
         <meta name="author" content=${ownerName} />
-        <link rel="stylesheet" href="/styles.css?v=20261126.3" />
+        <link rel="stylesheet" href="/styles.css?v=20261127.1" />
         <style>
           /* Critical shell styles keep navigation usable if the external stylesheet is delayed. */
           * { box-sizing: border-box; }
@@ -494,12 +495,14 @@ app.get("/articles", async (c) => {
             ? articles.map(
                 (article) => html`<article>
                   <a href="/articles/${article.slug}">
+                    ${article.cover_r2_key ? html`<img class="article-cover" src=${`/articles/${article.slug}/cover`} alt="" loading="lazy" />` : ""}
                     <h3>${article.title}</h3>
                     <p>${article.excerpt}</p>
                     <div class="meta">
                       <time>${formatDate(article.published_at || article.updated_at)}</time>
                       ${article.category_name ? html`<span>${article.category_name}</span>` : ""}
                     </div>
+                    ${parseJson<string[]>(article.tags_json, []).length ? html`<div class="article-tags">${parseJson<string[]>(article.tags_json, []).map((tag) => html`<span>${tag}</span>`)}</div>` : ""}
                   </a>
                 </article>`,
               )
@@ -515,22 +518,37 @@ app.get("/articles", async (c) => {
   );
 });
 
+app.get("/articles/:slug/cover", async (c) => {
+  const article = await c.env.DB.prepare("SELECT cover_r2_key FROM articles WHERE slug=? AND status='published' LIMIT 1")
+    .bind(c.req.param("slug")).first<{ cover_r2_key: string | null }>();
+  if (!article?.cover_r2_key) return c.notFound();
+  const object = await c.env.ASSETS_BUCKET.get(article.cover_r2_key);
+  if (!object) return c.notFound();
+  return new Response(object.body, { headers: {
+    "Content-Type": object.httpMetadata?.contentType || "image/jpeg",
+    "Cache-Control": "public, max-age=3600",
+    "X-Content-Type-Options": "nosniff",
+  } });
+});
+
 app.get("/articles/:slug", async (c) => {
   const [article, profile] = await Promise.all([
-    c.env.DB.prepare("SELECT articles.id,articles.title,articles.slug,articles.excerpt,articles.body,articles.category_id,articles.published_at,articles.updated_at,articles.seo_description,categories.name category_name,categories.slug category_slug FROM articles LEFT JOIN categories ON categories.id=articles.category_id WHERE articles.slug=? AND articles.status='published' LIMIT 1").bind(c.req.param("slug")).first<PublicArticle>(),
+    c.env.DB.prepare("SELECT articles.id,articles.title,articles.slug,articles.excerpt,articles.body,articles.category_id,articles.published_at,articles.updated_at,articles.seo_description,articles.seo_title,articles.tags_json,articles.cover_r2_key,categories.name category_name,categories.slug category_slug FROM articles LEFT JOIN categories ON categories.id=articles.category_id WHERE articles.slug=? AND articles.status='published' LIMIT 1").bind(c.req.param("slug")).first<PublicArticle>(),
     publicProfile(c.env),
   ]);
   if (!article) return c.notFound();
   const origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin;
   return c.html(
     layout(
-      `${article.title} · ${profile?.display_name || "个人分身"}-AI分身`,
+      `${article.seo_title || article.title} · ${profile?.display_name || "个人分身"}-AI分身`,
       html`<article class="post">
         <a class="back" href="/articles">← 返回文章</a>
+        ${article.cover_r2_key ? html`<img class="post-cover" src=${`/articles/${article.slug}/cover`} alt=${article.title} />` : ""}
         <h1>${article.title}</h1>
         <div class="post-meta">
           <time>${formatDate(article.published_at || article.updated_at)}</time>${article.category_name ? html`<span>${article.category_name}</span>` : ""}
         </div>
+        ${parseJson<string[]>(article.tags_json, []).length ? html`<div class="article-tags">${parseJson<string[]>(article.tags_json, []).map((tag) => html`<span>${tag}</span>`)}</div>` : ""}
         <p class="lead">${article.excerpt}</p>
         <div class="rich-content">${renderSafeMarkdown(articleBodyWithoutDuplicateTitle(article.body, article.title))}</div>
       </article>`,
@@ -546,7 +564,7 @@ app.get("/articles/:slug", async (c) => {
 
 app.get("/categories", async (c) => {
   const [categories, profile] = await Promise.all([
-    c.env.DB.prepare("SELECT categories.id,categories.name,categories.slug,categories.description,COUNT(articles.id) article_count FROM categories LEFT JOIN articles ON articles.category_id=categories.id AND articles.status='published' WHERE categories.scope IN ('article','shared','both') GROUP BY categories.id ORDER BY categories.sort_order,categories.name").all<{ id: string; name: string; slug: string; description: string; article_count: number }>(),
+    c.env.DB.prepare("SELECT categories.id,categories.name,categories.slug,categories.description,COUNT(articles.id) article_count FROM categories JOIN articles ON articles.category_id=categories.id AND articles.status='published' WHERE categories.scope IN ('article','shared','both') AND categories.show_in_portal=1 GROUP BY categories.id HAVING COUNT(articles.id)>0 ORDER BY categories.sort_order,categories.name").all<{ id: string; name: string; slug: string; description: string; article_count: number }>(),
     publicProfile(c.env),
   ]), origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin;
   return c.html(
@@ -572,7 +590,7 @@ app.get("/categories", async (c) => {
   );
 });
 app.get("/categories/:slug", async (c) => {
-  const category = await c.env.DB.prepare("SELECT name,slug,description FROM categories WHERE slug=? LIMIT 1").bind(c.req.param("slug")).first<{ name: string; slug: string; description: string }>();
+  const category = await c.env.DB.prepare("SELECT name,slug,description FROM categories WHERE slug=? AND scope IN ('article','shared','both') AND show_in_portal=1 LIMIT 1").bind(c.req.param("slug")).first<{ name: string; slug: string; description: string }>();
   if (!category) return c.notFound();
   const [articles, profile] = await Promise.all([publicArticles(c.env, category.slug), publicProfile(c.env)]), origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin;
   return c.html(layout(`${category.name} · ${profile?.display_name || "Bunshin"}-AI分身`, html`<section class="listing article-index"><a class="back" href="/categories">← 返回分类</a><h1>${category.name}</h1>${category.description ? html`<p class="lead">${category.description}</p>` : ""}<div class="article-list">${articles.length ? articles.map((article) => html`<article><a href=${`/articles/${article.slug}`}><h3>${article.title}</h3><p>${article.excerpt}</p><div class="meta"><time>${formatDate(article.published_at || article.updated_at)}</time></div></a></article>`) : html`<p class="empty-state">这个分类还没有已发布文章。</p>`}</div></section>`, category.description || `${category.name}分类文章`, "categories", profile, origin, `/categories/${category.slug}`));
@@ -1044,7 +1062,7 @@ app.get("/api/search", async (c) => {
 app.get("/sitemap.xml", async (c) => {
   const origin = c.env.PUBLIC_ORIGIN || new URL(c.req.url).origin,
     articles = await publicArticles(c.env),
-    categories = (await c.env.DB.prepare("SELECT slug FROM categories WHERE scope IN ('article','shared','both')").all<{ slug: string }>()).results,
+    categories = (await c.env.DB.prepare("SELECT categories.slug FROM categories WHERE categories.scope IN ('article','shared','both') AND categories.show_in_portal=1 AND EXISTS (SELECT 1 FROM articles WHERE articles.category_id=categories.id AND articles.status='published')").all<{ slug: string }>()).results,
     paths = ["/", "/articles", "/categories", "/archives", "/about", ...articles.map((a) => `/articles/${a.slug}`), ...categories.map((item) => `/categories/${item.slug}`)];
   return c.body(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${paths.map((path) => `<url><loc>${origin}${path}</loc></url>`).join("")}</urlset>`, 200, { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "public, max-age=300" });
 });

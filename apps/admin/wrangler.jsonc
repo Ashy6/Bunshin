@@ -10,5 +10,6 @@
   "r2_buckets":[{"binding":"ASSETS_BUCKET","bucket_name":"ai-bunshin-assets"}],
   "vectorize":[{"binding":"VECTORIZE","index_name":"ai-bunshin-knowledge-v1"}],
   "queues":{"producers":[{"binding":"INGESTION_QUEUE","queue":"ai-bunshin-ingestion"}],"consumers":[{"queue":"ai-bunshin-ingestion","max_batch_size":5,"max_batch_timeout":5,"dead_letter_queue":"ai-bunshin-ingestion-dlq"}]},
+  "triggers":{"crons":["*/5 * * * *"]},
   "observability":{"enabled":true,"logs":{"enabled":true,"head_sampling_rate":1}}
 }
