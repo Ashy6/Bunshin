@@ -406,7 +406,7 @@ function layout(
         <meta property="og:type" content=${article ? "article" : "website"} />
         <meta property="og:url" content=${canonical} />
         <meta name="author" content=${ownerName} />
-        <link rel="stylesheet" href="/styles.css?v=20261127.1" />
+        <link rel="stylesheet" href="/styles.css?v=20261127.2" />
         <style>
           /* Critical shell styles keep navigation usable if the external stylesheet is delayed. */
           * { box-sizing: border-box; }
@@ -497,7 +497,7 @@ function layout(
             回答请以引用来源为准。
           </footer>
         </div>
-        <script src="/agent.js?v=20261126.3" defer></script>
+        <script src="/agent.js?v=20261127.2" defer></script>
       </body>
     </html>`;
 }
