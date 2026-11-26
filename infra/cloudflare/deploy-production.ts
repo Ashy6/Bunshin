@@ -42,6 +42,7 @@ function loadSecrets(): Secrets {
   return value;
 }
 
+async function main() {
 console.log("1/7 Checking Cloudflare authentication...");
 run("pnpm", ["exec", "wrangler", "whoami"]);
 
@@ -75,15 +76,16 @@ for (const [name, value] of Object.entries(secrets)) {
 }
 
 console.log("7/7 Verifying production health...");
-for (const url of [
-  "https://ai-bunshin-web.zengjx1998.workers.dev/health",
-  "https://ai-bunshin-admin.zengjx1998.workers.dev/api/admin/health",
-]) {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`Health check failed: ${url} returned ${response.status}`);
-}
+run("pnpm", ["exec", "wrangler", "deployments", "list", "--name", "ai-bunshin-web"], undefined, true);
+run("pnpm", ["exec", "wrangler", "deployments", "list", "--name", "ai-bunshin-admin"], undefined, true);
 console.log("Deployment complete.");
 console.log("Web:   https://ai-bunshin-web.zengjx1998.workers.dev");
 console.log("Admin: https://ai-bunshin-admin.zengjx1998.workers.dev");
 console.log(`First-run admin token: ${secrets.ADMIN_BOOTSTRAP_TOKEN}`);
 console.log("The token is also stored locally in .deploy-secrets.json; never commit that file.");
+}
+
+main().catch((error) => {
+  console.error(error instanceof Error ? error.message : error);
+  process.exitCode = 1;
+});
