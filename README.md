@@ -205,6 +205,8 @@ wrangler secret put ADMIN_BOOTSTRAP_TOKEN
 
 “测试并启用”会先调用推荐聊天模型验证 Key，测试失败不保存；测试成功后加密保存并设为默认渠道。已有渠道可使用“重新测试连接”恢复健康状态。个人资料发布后会生成一份内部 Markdown 文档并自动进入 Queue；上传简历或知识资料后同样自动解析、切片和索引。后台“Agent 设置”统一展示渠道健康、知识库就绪数量、今日问答和向量方案。
 
+如果 OpenAI 返回 `Missing scopes: model.request`，说明 Key 本身已被识别，但没有模型推理权限。请到对应 Project 的 API Keys 页面把 Key 设置为 `All`，或在 `Restricted` 权限中开启模型请求，并确认账号在该 Project 中是 Member 或 Owner。模型渠道表单使用右侧抽屉，Key 在输入和保存后都只显示固定五颗星及首尾字符。
+
 个人资料的结构化字段和 Markdown 原文保存在 D1，简历、头像等原始文件保存在私有 R2。后台“个人资料”页可直接修改显示名称、职业标题、头像和 Markdown 介绍，并上传 PDF/Markdown 简历；保存后主站侧边栏、头像和“关于我”页面读取同一份数据。头像通过 Worker 受控输出，不公开 R2 Bucket。文本型 PDF/TXT/Markdown 经 Queue 异步解析；本地隐私模式使用 D1 向量回退，显式授权外部 Embedding 后使用版本化 Vectorize 索引。切换模型应新建索引版本并重建，不能把不同维度混入同一索引。
 
 后台用量页和 ECharts 从 `usage_events` 读取真实 Chat/Embedding 请求、Token、延迟与状态。费用只有在渠道价格可确定时才是估算值；它不等同于厂商账户真实余额。

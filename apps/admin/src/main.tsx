@@ -47,7 +47,7 @@ function maskApiKey(value: string) {
   if (value.length <= 4) return "•".repeat(value.length);
   const head = value.slice(0, Math.min(4, value.length - 2));
   const tail = value.slice(-2);
-  return `${head}${"*".repeat(Math.max(4, value.length - head.length - tail.length))}${tail}`;
+  return `${head}*****${tail}`;
 }
 function Chart({ type }: { type: "line" | "pie" }) {
   const ref = React.useRef<HTMLDivElement>(null);
@@ -618,7 +618,7 @@ function ProvidersLegacy() {
               <span className="provider-logo">{item.name[0]}</span>
               <div>
                 <h2>{item.name}</h2>
-                <p>{item.key_preview}</p>
+                <p>{maskApiKey(item.key_preview)}</p>
               </div>
               <span className="status ok">
                 {item.enabled ? "正常" : "停用"}
@@ -999,7 +999,8 @@ function Providers() {
     [key, setKey] = useState(""),
     [presetId, setPresetId] = useState("openai"),
     [error, setError] = useState(""),
-    [testingId, setTestingId] = useState<string | null>(null);
+    [testingId, setTestingId] = useState<string | null>(null),
+    [saving, setSaving] = useState(false);
   const load = () =>
     Promise.all([
       fetch("/api/admin/providers").then((r) => r.json()),
@@ -1028,6 +1029,7 @@ function Providers() {
   const submit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setError("");
+    setSaving(true);
     const data = new FormData(e.currentTarget),
       response = await fetch("/api/admin/providers/simple", {
         method: "POST",
@@ -1046,9 +1048,11 @@ function Providers() {
         error?: string;
       };
       setError(result.error ?? "测试失败，请检查配置");
+      setSaving(false);
       return;
     }
     setKey("");
+    setSaving(false);
     setOpen(false);
     await load();
   };
@@ -1073,7 +1077,7 @@ function Providers() {
               <span className="provider-logo">{item.name[0]}</span>
               <div>
                 <h2>{item.name}</h2>
-                <p>{item.key_preview}</p>
+                <p>{maskApiKey(item.key_preview)}</p>
               </div>
               <span
                 className={`status ${item.health_status === "healthy" ? "ok" : ""}`}
@@ -1107,80 +1111,101 @@ function Providers() {
       </section>
       {error && !open && <div className="auth-error">{error}</div>}
       {open && (
-        <div className="modal-backdrop" onMouseDown={() => setOpen(false)}>
+        <div
+          className="channel-drawer-backdrop"
+          onMouseDown={() => !saving && setOpen(false)}
+        >
           <form
-            className="modal"
+            className="channel-drawer"
             onSubmit={submit}
             onMouseDown={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-label="配置模型渠道"
           >
-            <div className="modal-head">
-              <h2>配置模型渠道</h2>
-              <button type="button" onClick={() => setOpen(false)}>
+            <div className="channel-drawer-head">
+              <div>
+                <p>模型渠道</p>
+                <h2>测试并启用一个渠道</h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => setOpen(false)}
+                disabled={saving}
+              >
                 ×
               </button>
             </div>
-            <label>
-              模型厂商
-              <select
-                value={presetId}
-                onChange={(e) => setPresetId(e.target.value)}
-              >
-                {presets.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              API Key
-              <div className="secret-field">
-                <input
-                  type="password"
-                  required
-                  value={key}
-                  onChange={(e) => setKey(e.target.value)}
-                  autoComplete="new-password"
-                />
-                <span>{key.length} 字符</span>
-              </div>
-              <small className="masked-preview">预览：{maskApiKey(key)}</small>
-            </label>
-            {presetId === "custom" && (
-              <>
-                <label>
-                  Base URL
-                  <input name="baseUrl" type="url" required />
-                </label>
-                <label>
-                  Chat 模型
-                  <input name="chatModel" required />
-                </label>
-              </>
-            )}
-            <label>
-              月度预算（USD）
-              <input
-                name="budget"
-                type="number"
-                min="0"
-                step="1"
-                defaultValue="10"
-              />
-            </label>
-            {selected?.embeddingMode === "provider" && (
-              <label className="checkbox consent">
-                <input name="externalEmbedding" type="checkbox" />
-                允许将知识片段发送给 {selected.name}{" "}
-                生成向量；不勾选则使用本地隐私模式
+            <div className="channel-drawer-body">
+              <label>
+                模型厂商
+                <select
+                  value={presetId}
+                  onChange={(e) => setPresetId(e.target.value)}
+                >
+                  {presets.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+                </select>
               </label>
-            )}
-            {error && <div className="auth-error">{error}</div>}
-            <div className="modal-actions">
+              <label>
+                API Key
+                <div className="drawer-secret-field">
+                  <input
+                    type="password"
+                    required
+                    value={key}
+                    onChange={(e) => setKey(e.target.value)}
+                    autoComplete="new-password"
+                    aria-label="API Key"
+                  />
+                  <span className="drawer-secret-mask">
+                    {key ? maskApiKey(key) : "粘贴 API Key"}
+                  </span>
+                  <span className="drawer-secret-count">{key.length} 字符</span>
+                </div>
+                <small>完整 Key 只在本次提交中使用，保存后不可读取。</small>
+              </label>
+              {presetId === "custom" && (
+                <>
+                  <label>
+                    Base URL
+                    <input name="baseUrl" type="url" required />
+                  </label>
+                  <label>
+                    Chat 模型
+                    <input name="chatModel" required />
+                  </label>
+                </>
+              )}
+              <label>
+                月度预算（USD）
+                <input
+                  name="budget"
+                  type="number"
+                  min="0"
+                  step="1"
+                  defaultValue="10"
+                />
+              </label>
+              {selected?.embeddingMode === "provider" && (
+                <label className="checkbox consent">
+                  <input name="externalEmbedding" type="checkbox" />
+                  允许将知识片段发送给 {selected.name}{" "}
+                  生成向量；不勾选则使用本地隐私模式
+                </label>
+              )}
+              {error && <div className="auth-error">{error}</div>}
+            </div>
+            <div className="channel-drawer-actions">
               <button type="button" onClick={() => setOpen(false)}>
                 取消
               </button>
-              <button className="primary">测试并启用</button>
+              <button className="primary" disabled={saving}>
+                {saving ? "正在测试连接…" : "测试并启用"}
+              </button>
             </div>
           </form>
         </div>

@@ -93,6 +93,18 @@ const defaultAgentConfig = {
     "你好，我是站长的个人分身。你可以问我有关经历、项目和文章的问题。",
   systemInstruction: "请简洁、准确地依据知识库回答。",
 };
+function providerErrorMessage(error: unknown) {
+  const message = error instanceof Error ? error.message : "模型连接测试失败";
+  if (message.includes("model.request") || message.includes("Missing scopes"))
+    return "API Key 可以被识别，但缺少模型调用权限（model.request）。请在对应 OpenAI Project 的 API Keys 页面将该 Key 改为 All，或在 Restricted 权限中开启模型请求；同时确认当前账号属于该 Project（Member 或 Owner）。";
+  if (message.includes("returned 401") || message.includes("返回 401"))
+    return "API Key 无效或权限不足。请确认 Key 属于当前项目、尚未过期，并具有模型调用权限。";
+  if (message.includes("returned 429") || message.includes("返回 429"))
+    return "模型渠道返回 429：可能是余额不足、预算限制或请求频率过高，请检查厂商账单与限额。";
+  if (message.includes("returned 404") || message.includes("返回 404"))
+    return "模型不可用或当前项目没有该模型权限，请检查项目的 Model usage 设置。";
+  return message;
+}
 app.onError((error, c) => {
   console.error("Unhandled admin API error", error);
   return c.json(
@@ -522,7 +534,7 @@ app.post("/api/admin/providers", async (c) => {
       p.kind,
       p.baseUrl,
       JSON.stringify(encrypted),
-      `${p.apiKey.slice(0, Math.min(4, Math.max(0, p.apiKey.length - 2)))}${"*".repeat(Math.max(4, p.apiKey.length - 6))}${p.apiKey.slice(-2)}`,
+      `${p.apiKey.slice(0, Math.min(4, Math.max(0, p.apiKey.length - 2)))}*****${p.apiKey.slice(-2)}`,
       p.chatModel,
       p.embeddingModel,
       p.monthlyBudgetMicros,
@@ -548,7 +560,7 @@ app.post("/api/admin/providers/simple", async (c) => {
     encrypted = await encryptSecret(input.apiKey, c.env.MASTER_ENCRYPTION_KEY),
     now = new Date().toISOString(),
     id = crypto.randomUUID(),
-    preview = `${input.apiKey.slice(0, 4)}${"*".repeat(Math.max(4, input.apiKey.length - 6))}${input.apiKey.slice(-2)}`,
+    preview = `${input.apiKey.slice(0, 4)}*****${input.apiKey.slice(-2)}`,
     embeddingMode =
       input.allowExternalEmbedding && preset.embeddingMode === "provider"
         ? "provider"
@@ -562,10 +574,7 @@ app.post("/api/admin/providers/simple", async (c) => {
   } catch (error) {
     return c.json(
       {
-        error:
-          error instanceof Error
-            ? error.message
-            : "模型连接测试失败，请检查 API Key",
+        error: providerErrorMessage(error),
       },
       400,
     );
@@ -657,7 +666,7 @@ app.post("/api/admin/providers/:id/test", async (c) => {
       .run();
     return c.json({ healthStatus: "healthy" });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "连接测试失败";
+    const message = providerErrorMessage(error);
     await c.env.DB.prepare(
       "UPDATE providers SET health_status='error',last_checked_at=?,last_error=?,updated_at=? WHERE id=?",
     )
