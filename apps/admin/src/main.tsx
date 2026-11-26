@@ -1314,6 +1314,19 @@ function AdminApp({ onLogout }: { onLogout: () => void }) {
   };
   const [view, setView] = useState<View>(hashToView);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [shellProfile, setShellProfile] = useState<{ display_name: string; headline: string; avatar_position_x: number; avatar_position_y: number; updated_at: string } | null>(null);
+  const loadShellProfile = async () => {
+    try {
+      const response = await fetch("/api/admin/profile"), body = await response.json() as { profile?: { display_name: string; headline: string; avatar_position_x: number; avatar_position_y: number; updated_at: string } };
+      if (response.ok && body.profile) setShellProfile(body.profile);
+    } catch { /* Keep the safe fallback identity while the profile endpoint recovers. */ }
+  };
+  useEffect(() => {
+    void loadShellProfile();
+    const update = () => void loadShellProfile();
+    addEventListener("bunshin:profile-updated", update);
+    return () => removeEventListener("bunshin:profile-updated", update);
+  }, []);
   useEffect(() => {
     const update = () => {
       setView(hashToView());
@@ -1356,7 +1369,7 @@ function AdminApp({ onLogout }: { onLogout: () => void }) {
           <span aria-hidden="true">☰</span>
         </button>
         <div><strong>{title}</strong><small>Bunshin 管理后台</small></div>
-        <span className="mobile-admin-avatar">A</span>
+        <img className="mobile-admin-avatar" src={`/api/admin/profile/avatar?v=${encodeURIComponent(shellProfile?.updated_at || "default")}`} style={{ objectPosition: `${shellProfile?.avatar_position_x ?? 50}% ${shellProfile?.avatar_position_y ?? 50}%` }} alt="站长头像" />
       </header>
       <button className="mobile-nav-backdrop" type="button" aria-label="关闭管理菜单" onClick={() => setMobileNavOpen(false)} />
       <aside id="admin-navigation" aria-label="管理后台导航">
@@ -1383,12 +1396,12 @@ function AdminApp({ onLogout }: { onLogout: () => void }) {
           ))}
         </nav>
         <div className="account">
-          <span>A</span>
-          <div>
-            <strong>站长</strong>
-            <small>安全会话</small>
-          </div>
+          <button className="account-profile" type="button" onClick={() => navigate("content")} title="编辑个人资料">
+            <img src={`/api/admin/profile/avatar?v=${encodeURIComponent(shellProfile?.updated_at || "default")}`} style={{ objectPosition: `${shellProfile?.avatar_position_x ?? 50}% ${shellProfile?.avatar_position_y ?? 50}%` }} alt="站长头像" />
+            <span><strong>{shellProfile?.display_name || "站长"}</strong><small>{shellProfile?.headline || "个人资料待完善"}</small></span>
+          </button>
           <button
+            className="account-logout"
             onClick={async () => {
               await fetch("/api/admin/auth/logout", { method: "POST" });
               onLogout();

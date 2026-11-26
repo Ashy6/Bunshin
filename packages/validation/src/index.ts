@@ -90,6 +90,13 @@ export const systemSettingsSchema = z.object({
   llmsFullEnabled: z.boolean(),
   cacheTtlSeconds: z.number().int().min(30).max(86400),
 });
+export const observabilitySettingsSchema = z.object({
+  errorRateThreshold: z.number().min(1).max(100),
+  minimumRequests: z.number().int().min(1).max(10000),
+  stuckMinutes: z.number().int().min(1).max(1440),
+  budgetWarningPercent: z.number().min(1).max(100),
+  slowRequestMs: z.number().int().min(100).max(300000),
+});
 export const articleSchema = z.object({
   title: z.string().trim().min(1).max(160),
   slug: z

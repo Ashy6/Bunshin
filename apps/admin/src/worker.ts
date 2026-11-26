@@ -14,6 +14,7 @@ import {
   providerSchema,
   profileSchema,
   simpleProviderSchema,
+  observabilitySettingsSchema,
   systemSettingsSchema,
 } from "@ai-bunshin/validation";
 import {
@@ -101,6 +102,13 @@ const defaultSystemConfig = {
   llmsFullEnabled: false,
   cacheTtlSeconds: 300,
 };
+const defaultObservabilityConfig = {
+  errorRateThreshold: 20,
+  minimumRequests: 5,
+  stuckMinutes: 15,
+  budgetWarningPercent: 80,
+  slowRequestMs: 12000,
+};
 function boundedInteger(
   value: string | undefined,
   fallback: number,
@@ -117,6 +125,15 @@ function parseSystemConfig(value?: string | null) {
       : defaultSystemConfig;
   } catch {
     return defaultSystemConfig;
+  }
+}
+function parseObservabilityConfig(value?: string | null) {
+  try {
+    return value
+      ? { ...defaultObservabilityConfig, ...JSON.parse(value) }
+      : defaultObservabilityConfig;
+  } catch {
+    return defaultObservabilityConfig;
   }
 }
 async function recordAdminTelemetry(env:Env,event:{eventType:string;severity?:"info"|"warning"|"error"|"critical";route?:string;scenario?:string;durationMs?:number;statusCode?:number;traceId?:string;detail?:Record<string,unknown>}){const traceId=event.traceId??crypto.randomUUID();try{await env.DB.prepare("INSERT INTO observability_events (id,service,event_type,severity,route,scenario,duration_ms,status_code,trace_id,detail_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(),"admin",event.eventType,event.severity??"info",event.route??null,event.scenario??null,event.durationMs??0,event.statusCode??0,traceId,JSON.stringify(event.detail??{}),new Date().toISOString()).run()}catch(error){console.error("telemetry_write_failed",error)}return traceId}
@@ -543,7 +560,7 @@ app.get("/api/admin/usage", async (c) => {
     params.push(status);
   }
   const clause = where.join(" AND "),
-    [items, total, summary, providers, scenarios] = await Promise.all([
+    [items, total, summary, providers, scenarios, providerBreakdown, scenarioBreakdown] = await Promise.all([
       c.env.DB.prepare(
         `SELECT usage_events.id,usage_events.scenario,usage_events.model,usage_events.input_tokens,usage_events.output_tokens,usage_events.cached_tokens,usage_events.cost_micros,usage_events.currency,usage_events.latency_ms,usage_events.status,usage_events.estimated,usage_events.trace_id,usage_events.created_at,providers.name provider_name FROM usage_events LEFT JOIN providers ON providers.id=usage_events.provider_id WHERE ${clause} ORDER BY usage_events.created_at DESC LIMIT ? OFFSET ?`,
       ).bind(...params, pageSize, (page - 1) * pageSize).all(),
@@ -551,7 +568,7 @@ app.get("/api/admin/usage", async (c) => {
         `SELECT COUNT(*) count FROM usage_events WHERE ${clause}`,
       ).bind(...params).first<{ count: number }>(),
       c.env.DB.prepare(
-        `SELECT COUNT(*) requests,COALESCE(SUM(input_tokens+output_tokens+cached_tokens),0) tokens,COALESCE(SUM(cost_micros),0) cost_micros,COALESCE(AVG(latency_ms),0) avg_latency_ms,COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END)*100.0/NULLIF(COUNT(*),0),0) success_rate FROM usage_events WHERE ${clause}`,
+        `SELECT COUNT(*) requests,COALESCE(SUM(input_tokens),0) input_tokens,COALESCE(SUM(output_tokens),0) output_tokens,COALESCE(SUM(cached_tokens),0) cached_tokens,COALESCE(SUM(input_tokens+output_tokens+cached_tokens),0) tokens,COALESCE(SUM(cost_micros),0) cost_micros,COALESCE(AVG(latency_ms),0) avg_latency_ms,COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0) success_count,COALESCE(SUM(CASE WHEN status!='success' THEN 1 ELSE 0 END),0) error_count,COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END)*100.0/NULLIF(COUNT(*),0),0) success_rate FROM usage_events WHERE ${clause}`,
       ).bind(...params).first(),
       c.env.DB.prepare(
         "SELECT id,name,chat_model,embedding_model FROM providers ORDER BY is_default DESC,name",
@@ -559,6 +576,12 @@ app.get("/api/admin/usage", async (c) => {
       c.env.DB.prepare(
         "SELECT DISTINCT scenario FROM usage_events ORDER BY scenario",
       ).all(),
+      c.env.DB.prepare(
+        `SELECT COALESCE(providers.name,usage_events.model,'未关联渠道') name,COUNT(*) requests,COALESCE(SUM(input_tokens+output_tokens+cached_tokens),0) tokens,COALESCE(SUM(cost_micros),0) cost_micros,COALESCE(SUM(CASE WHEN usage_events.status='success' THEN 1 ELSE 0 END)*100.0/NULLIF(COUNT(*),0),0) success_rate FROM usage_events LEFT JOIN providers ON providers.id=usage_events.provider_id WHERE ${clause} GROUP BY COALESCE(providers.name,usage_events.model,'未关联渠道') ORDER BY cost_micros DESC,requests DESC LIMIT 12`,
+      ).bind(...params).all(),
+      c.env.DB.prepare(
+        `SELECT usage_events.scenario,COUNT(*) requests,COALESCE(SUM(input_tokens+output_tokens+cached_tokens),0) tokens,COALESCE(SUM(cost_micros),0) cost_micros FROM usage_events WHERE ${clause} GROUP BY usage_events.scenario ORDER BY requests DESC LIMIT 12`,
+      ).bind(...params).all(),
     ]);
   return c.json({
     items: items.results,
@@ -575,23 +598,43 @@ app.get("/api/admin/usage", async (c) => {
     },
     providers: providers.results,
     scenarios: scenarios.results,
+    providerBreakdown: providerBreakdown.results,
+    scenarioBreakdown: scenarioBreakdown.results,
   });
 });
 app.get("/api/admin/settings", async (c) => {
-  const row = await c.env.DB.prepare(
-    "SELECT value,updated_at FROM settings WHERE key='system_config'",
-  ).first<{ value: string; updated_at: string }>();
+  const [systemRow, observabilityRow, profile, provider, documents, articles, audits] = await Promise.all([
+    c.env.DB.prepare("SELECT value,updated_at FROM settings WHERE key='system_config'").first<{ value: string; updated_at: string }>(),
+    c.env.DB.prepare("SELECT value,updated_at FROM settings WHERE key='observability_config'").first<{ value: string; updated_at: string }>(),
+    c.env.DB.prepare("SELECT display_name,published,updated_at FROM profiles ORDER BY updated_at DESC LIMIT 1").first<{display_name:string;published:number;updated_at:string}>(),
+    c.env.DB.prepare("SELECT name,health_status,updated_at FROM providers ORDER BY is_default DESC,updated_at DESC LIMIT 1").first<{name:string;health_status:string;updated_at:string}>(),
+    c.env.DB.prepare("SELECT COUNT(*) total,SUM(CASE WHEN status='indexed' THEN 1 ELSE 0 END) ready,SUM(CASE WHEN status IN ('failed','needs_ocr') THEN 1 ELSE 0 END) failed FROM documents WHERE archived_at IS NULL").first(),
+    c.env.DB.prepare("SELECT COUNT(*) total,SUM(CASE WHEN status='published' THEN 1 ELSE 0 END) published FROM articles").first(),
+    c.env.DB.prepare("SELECT action,target_type,target_id,created_at FROM audit_events ORDER BY created_at DESC LIMIT 8").all(),
+  ]);
+  const config = parseSystemConfig(systemRow?.value);
   return c.json({
-    config: parseSystemConfig(row?.value),
-    updatedAt: row?.updated_at ?? null,
+    config,
+    observability: parseObservabilityConfig(observabilityRow?.value),
+    status: {
+      publicOriginConfigured: Boolean(config.publicOrigin),
+      profileName: profile?.display_name ?? "",
+      profilePublished: Boolean(profile?.published),
+      providerName: provider?.name ?? "",
+      providerHealth: provider?.health_status ?? "missing",
+      documents: documents ?? { total: 0, ready: 0, failed: 0 },
+      articles: articles ?? { total: 0, published: 0 },
+    },
+    recentAudits: audits.results,
+    updatedAt: systemRow?.updated_at ?? null,
   });
 });
 app.put("/api/admin/settings", async (c) => {
-  const parsed = systemSettingsSchema.safeParse(
-    await c.req.json().catch(() => null),
-  );
-  if (!parsed.success)
-    return c.json({ error: parsed.error.flatten() }, 400);
+  const body = await c.req.json<Record<string, unknown>>().catch(() => null),
+    parsed = systemSettingsSchema.safeParse(body),
+    observability = observabilitySettingsSchema.safeParse(body?.observability ?? defaultObservabilityConfig);
+  if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
+  if (!observability.success) return c.json({ error: observability.error.flatten() }, 400);
   const now = new Date().toISOString();
   await c.env.DB.batch([
     c.env.DB.prepare(
@@ -600,13 +643,17 @@ app.put("/api/admin/settings", async (c) => {
     c.env.DB.prepare(
       "INSERT INTO settings (key,value,updated_at) VALUES ('llms_full_enabled',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
     ).bind(String(parsed.data.llmsFullEnabled), now),
+    c.env.DB.prepare(
+      "INSERT INTO settings (key,value,updated_at) VALUES ('observability_config',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+    ).bind(JSON.stringify(observability.data), now),
   ]);
   await audit(c.env, c.req.raw, "settings.update", "system", "system_config", {
     publicOrigin: parsed.data.publicOrigin,
     llmsFullEnabled: parsed.data.llmsFullEnabled,
     cacheTtlSeconds: parsed.data.cacheTtlSeconds,
+    observability: observability.data,
   });
-  return c.json({ config: parsed.data, updatedAt: now });
+  return c.json({ config: parsed.data, observability: observability.data, updatedAt: now });
 });
 app.post("/api/admin/maintenance/repair-document-metadata", async (c) => {
   const result = await repairDocumentMetadata(c.env);

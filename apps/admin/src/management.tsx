@@ -120,16 +120,16 @@ export function ProfileManager() {
         skills: [...new Set(profile.skills.split(/[,，]/).map((item) => item.trim()).filter(Boolean))],
         social: { github: profile.github, linkedin: profile.linkedin, x: profile.x, zhihu: profile.zhihu },
       }) });
-      setInitial(JSON.stringify(profile)); setMessage("已保存，公开页面与 Agent 索引正在同步"); await load();
+      setInitial(JSON.stringify(profile)); setMessage("已保存，公开页面与 Agent 索引正在同步"); await load(); window.dispatchEvent(new CustomEvent("bunshin:profile-updated"));
     } catch (error) { setMessage(error instanceof Error ? error.message : "保存失败"); }
     finally { setSaving(false); }
   };
   const uploadAvatar = async (file?: File) => {
     if (!file) return; setAvatarMessage("正在上传头像…");
-    try { const data = new FormData(); data.set("file", file); await api("/api/admin/profile/avatar", { method: "POST", body: data }); setAvatarVersion(Date.now()); setAvatarMessage("头像已更新"); }
+    try { const data = new FormData(); data.set("file", file); await api("/api/admin/profile/avatar", { method: "POST", body: data }); setAvatarVersion(Date.now()); setAvatarMessage("头像已更新"); window.dispatchEvent(new CustomEvent("bunshin:profile-updated")); }
     catch (error) { setAvatarMessage(error instanceof Error ? error.message : "头像上传失败"); }
   };
-  const deleteAvatar = async () => { if (!confirm("恢复为名称首字头像？")) return; await api("/api/admin/profile/avatar", { method: "DELETE" }); setAvatarVersion(Date.now()); setAvatarMessage("已恢复默认头像"); };
+  const deleteAvatar = async () => { if (!confirm("恢复为名称首字头像？")) return; await api("/api/admin/profile/avatar", { method: "DELETE" }); setAvatarVersion(Date.now()); setAvatarMessage("已恢复默认头像"); window.dispatchEvent(new CustomEvent("bunshin:profile-updated")); };
   const uploadResume = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault(); setResumeBusy(true); setUploadProgress(0); const form = event.currentTarget;
     const result = await new Promise<{ ok: boolean; error?: string }>((resolve) => {
