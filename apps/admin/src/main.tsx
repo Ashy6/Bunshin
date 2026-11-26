@@ -1535,27 +1535,63 @@ function AdminApp({ onLogout }: { onLogout: () => void }) {
     return nav.some((item) => item.id === value) ? value as View : "dashboard";
   };
   const [view, setView] = useState<View>(hashToView);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   useEffect(() => {
-    const update = () => setView(hashToView());
+    const update = () => {
+      setView(hashToView());
+      setMobileNavOpen(false);
+    };
     addEventListener("hashchange", update);
     if (!location.hash) history.replaceState(null, "", "#/dashboard");
     return () => removeEventListener("hashchange", update);
   }, []);
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMobileNavOpen(false);
+    };
+    const closeOnDesktop = () => {
+      if (innerWidth > 820) setMobileNavOpen(false);
+    };
+    addEventListener("keydown", closeOnEscape);
+    addEventListener("resize", closeOnDesktop);
+    return () => {
+      removeEventListener("keydown", closeOnEscape);
+      removeEventListener("resize", closeOnDesktop);
+    };
+  }, []);
   const navigate = (next: View) => {
     if (document.body.dataset.unsaved === "true" && !confirm("当前页面有未保存更改，确定离开吗？")) return;
+    setMobileNavOpen(false);
     location.hash = `/${next === "content" ? "profile" : next}`;
   };
   const title = useMemo(() => nav.find((n) => n.id === view)?.label, [view]);
   return (
-    <div className="shell">
-      <aside>
-        <a className="brand" href="#">
-          <span>B</span>
-          <div>
-            <strong>Bunshin</strong>
-            <small>管理后台</small>
-          </div>
-        </a>
+    <div className={`shell ${mobileNavOpen ? "nav-open" : ""}`}>
+      <header className="mobile-admin-bar">
+        <button
+          type="button"
+          aria-label="打开管理菜单"
+          aria-controls="admin-navigation"
+          aria-expanded={mobileNavOpen}
+          onClick={() => setMobileNavOpen((open) => !open)}
+        >
+          <span aria-hidden="true">☰</span>
+        </button>
+        <div><strong>{title}</strong><small>Bunshin 管理后台</small></div>
+        <span className="mobile-admin-avatar">A</span>
+      </header>
+      <button className="mobile-nav-backdrop" type="button" aria-label="关闭管理菜单" onClick={() => setMobileNavOpen(false)} />
+      <aside id="admin-navigation" aria-label="管理后台导航">
+        <div className="admin-nav-head">
+          <a className="brand" href="#/dashboard" onClick={(event) => { event.preventDefault(); navigate("dashboard"); }}>
+            <span>B</span>
+            <div>
+              <strong>Bunshin</strong>
+              <small>管理后台</small>
+            </div>
+          </a>
+          <button className="admin-nav-close" type="button" aria-label="关闭管理菜单" onClick={() => setMobileNavOpen(false)}>×</button>
+        </div>
         <nav>
           {nav.map((item) => (
             <button
@@ -1586,7 +1622,6 @@ function AdminApp({ onLogout }: { onLogout: () => void }) {
         </div>
       </aside>
       <main>
-        <div className="mobile-title">{title}</div>
         {view === "dashboard" ? (
           <Dashboard />
         ) : view === "content" ? (

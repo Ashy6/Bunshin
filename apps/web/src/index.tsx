@@ -279,6 +279,19 @@ function navIcon(name: PublicNav) {
   return html`<svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${path}</svg>`;
 }
 
+function publicNav(active: PublicNav, className = "") {
+  const items: Array<{ id: PublicNav; href: string; label: string }> = [
+    { id: "ask", href: "/", label: "问问分身" },
+    { id: "articles", href: "/articles", label: "文章" },
+    { id: "categories", href: "/categories", label: "分类" },
+    { id: "archives", href: "/archives", label: "归档" },
+    { id: "about", href: "/about", label: "关于" },
+  ];
+  return html`<nav class=${className} aria-label="主导航">
+    ${items.map((item) => html`<a data-nav=${item.id} class=${active === item.id ? "active" : "nav-link"} href=${item.href}>${navIcon(item.id)}<span>${item.label}</span></a>`)}
+  </nav>`;
+}
+
 function layout(
   title: string,
   content: ReturnType<typeof html>,
@@ -334,8 +347,13 @@ function layout(
         <meta property="og:type" content=${article ? "article" : "website"} />
         <meta property="og:url" content=${canonical} />
         <meta name="author" content=${ownerName} />
-        <link rel="stylesheet" href="/styles.css" />
+        <link rel="stylesheet" href="/styles.css?v=20261126.2" />
         <style>
+          /* Critical shell styles keep navigation usable if the external stylesheet is delayed. */
+          * { box-sizing: border-box; }
+          body { margin: 0; }
+          .desktop-header { display: none; }
+          .page { min-height: 100vh; }
           .avatar {
             overflow: hidden;
           }
@@ -369,27 +387,37 @@ function layout(
             color: var(--text);
           }
           .answer-sources ul { margin: 6px 0 0; padding-left: 18px; }
+          @media (min-width: 1200px) {
+            .sidebar, .topbar { display: none !important; }
+            .desktop-header { display: flex; }
+            .page { margin-left: 0 !important; }
+          }
         </style>
         <script type="application/ld+json">
           ${raw(JSON.stringify(structuredData).replaceAll("<", "\\u003c"))}
         </script>
       </head>
       <body>
+        <header class="desktop-header">
+          <a class="desktop-brand" href="/">
+            <img src="/avatar" alt="" style=${`object-position:${profile?.avatar_position_x ?? 50}% ${profile?.avatar_position_y ?? 50}%`} />
+            <span><strong>${ownerName}</strong><small>AI 分身</small></span>
+          </a>
+          ${publicNav(active, "desktop-nav")}
+          <div class="desktop-actions">
+            ${social.github ? html`<a href=${social.github} rel="noreferrer" target="_blank">GitHub</a>` : ""}
+            <button data-theme-toggle aria-label="切换主题">◐</button>
+          </div>
+        </header>
         <aside class="sidebar">
           <div class="profile">
             <div class="avatar"><img src="/avatar" alt=${`${ownerName}的头像`} style=${`object-position:${profile?.avatar_position_x ?? 50}% ${profile?.avatar_position_y ?? 50}%`} /></div>
             <a class="site-title" id="profile-name" href="/">${ownerName}</a>
             <p id="profile-headline">${profile?.headline || "个人资料暂未公开"}</p>
           </div>
-          <nav aria-label="主导航">
-            <a class=${active === "ask" ? "active" : "nav-link"} href="/">${navIcon("ask")}<span>问问分身</span></a
-            ><a class=${active === "articles" ? "active" : "nav-link"} href="/articles">${navIcon("articles")}<span>文章</span></a
-            ><a class=${active === "categories" ? "active" : "nav-link"} href="/categories">${navIcon("categories")}<span>分类</span></a
-            ><a class=${active === "archives" ? "active" : "nav-link"} href="/archives">${navIcon("archives")}<span>归档</span></a
-            ><a class=${active === "about" ? "active" : "nav-link"} href="/about">${navIcon("about")}<span>关于</span></a>
-          </nav>
+          ${publicNav(active)}
           <div class="sidebar-foot">
-            <button id="theme-toggle" aria-label="切换主题">◐</button
+            <button data-theme-toggle aria-label="切换主题">◐</button
             >${social.github ? html`<a href=${social.github} rel="noreferrer">GitHub</a>` : ""}
           </div>
         </aside>
@@ -405,7 +433,7 @@ function layout(
             回答请以引用来源为准。
           </footer>
         </div>
-        <script src="/agent.js" defer></script>
+        <script src="/agent.js?v=20261126.2" defer></script>
       </body>
     </html>`;
 }
