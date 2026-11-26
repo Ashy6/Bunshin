@@ -81,6 +81,12 @@ importers:
 
   apps/web:
     dependencies:
+      '@ai-bunshin/ai':
+        specifier: workspace:*
+        version: link:../../packages/ai
+      '@ai-bunshin/crypto':
+        specifier: workspace:*
+        version: link:../../packages/crypto
       '@ai-bunshin/rag':
         specifier: workspace:*
         version: link:../../packages/rag

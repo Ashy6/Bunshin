@@ -144,6 +144,10 @@ MVP 仅保证文本型 PDF。扫描 PDF 会标记为“需要 OCR”，不会生
 
 ## 本地开发
 
+本地开发采用两个进程、一个共享数据目录：`apps/admin` 由 Cloudflare Vite 插件同时提供 React 管理界面和 Admin Worker API；`apps/web` 提供访客端和公开 Chat API。两者共享 `apps/admin/.wrangler/state` 中的本地 D1 数据，因此后台上传的内容可以立即被访客端检索，无需额外启动第三个 API 项目。
+
+首次打开后台时会进入站长账号初始化页。密码至少 12 位；初始化完成后使用 HttpOnly 会话 Cookie 登录。模型 API Key 输入框始终使用密码态，只显示首尾掩码和字符长度；服务端只返回 `key_preview`，密文使用 AES-256-GCM 保存，任何读取接口都不会返回原始 Key。
+
 ### 前置条件
 
 - Node.js 22+
@@ -165,6 +169,8 @@ pnpm dev
 
 - 访客端：`http://localhost:8787`
 - 后台：`http://localhost:8788`
+
+本地知识库流程为：上传 TXT/Markdown → R2 本地模拟存储 → Queue 消费 → 切片 → D1 本地向量索引 → 访客端相似度检索。未配置模型渠道时，Chat 会直接展示带来源的检索结果；配置 OpenAI-compatible 渠道后，会将检索上下文交给模型生成回答。Cloudflare 生产环境可继续将索引实现迁移为 Vectorize。当前 PDF 上传会被安全标记为 `needs_ocr`，文本型 PDF 解析适配器将在后续版本接入。
 
 ### 首次初始化
 
