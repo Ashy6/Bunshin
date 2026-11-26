@@ -79,8 +79,8 @@ body {
   align-items: center;
   gap: 9px;
   margin-top: auto;
-  padding: 13px 8px;
-  border-top: 1px solid #2b3942;
+  padding: 13px 8px 0;
+  background: transparent;
 }
 .account strong {
   font-size: 12px;
@@ -92,6 +92,10 @@ body {
   flex: 1;
   gap: 9px;
   padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
   text-align: left;
   cursor: pointer;
 }
@@ -111,13 +115,6 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-.account .account-logout {
-  margin-left: 0;
-  border: 0;
-  background: transparent;
-  color: #9dacb7;
-  cursor: pointer;
 }
 .shell > main {
   margin-left: 228px;

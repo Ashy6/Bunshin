@@ -1305,7 +1305,7 @@ function Placeholder({ view }: { view: View }) {
     </>
   );
 }
-function AdminApp({ onLogout }: { onLogout: () => void }) {
+function AdminApp() {
   const hashToView = (): View => {
     const value = location.hash.replace(/^#\/?/, "");
     if (value === "profile") return "content";
@@ -1398,17 +1398,7 @@ function AdminApp({ onLogout }: { onLogout: () => void }) {
         <div className="account">
           <button className="account-profile" type="button" onClick={() => navigate("content")} title="编辑个人资料">
             <img src={`/api/admin/profile/avatar?v=${encodeURIComponent(shellProfile?.updated_at || "default")}`} style={{ objectPosition: `${shellProfile?.avatar_position_x ?? 50}% ${shellProfile?.avatar_position_y ?? 50}%` }} alt="站长头像" />
-            <span><strong>{shellProfile?.display_name || "站长"}</strong><small>{shellProfile?.headline || "个人资料待完善"}</small></span>
-          </button>
-          <button
-            className="account-logout"
-            onClick={async () => {
-              await fetch("/api/admin/auth/logout", { method: "POST" });
-              onLogout();
-            }}
-            title="退出登录"
-          >
-            退出
+            <span><strong>{shellProfile?.display_name || "站长"}</strong></span>
           </button>
         </div>
       </aside>
@@ -1466,7 +1456,7 @@ function AuthGate() {
       </div>
     );
   if (status === "ready")
-    return <AdminApp onLogout={() => setStatus("login")} />;
+    return <AdminApp />;
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setError("");
