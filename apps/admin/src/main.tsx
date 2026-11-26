@@ -752,7 +752,11 @@ function ProfileEditor() {
       github: "",
       published: true,
     }),
-    [message, setMessage] = useState("");
+    [message, setMessage] = useState(""),
+    [avatarVersion, setAvatarVersion] = useState(0),
+    [avatarBusy, setAvatarBusy] = useState(false),
+    [resumeBusy, setResumeBusy] = useState(false),
+    [uploadMessage, setUploadMessage] = useState("");
   useEffect(() => {
     fetch("/api/admin/profile")
       .then((r) => r.json() as Promise<{ profile: any }>)
@@ -794,6 +798,42 @@ function ProfileEditor() {
   };
   const field = (key: keyof typeof profile, value: string | boolean) =>
     setProfile((old) => ({ ...old, [key]: value }));
+  const uploadAvatar = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setAvatarBusy(true);
+    setUploadMessage("");
+    const data = new FormData();
+    data.set("file", file);
+    const response = await fetch("/api/admin/profile/avatar", {
+      method: "POST",
+      body: data,
+    });
+    const result = (await response.json().catch(() => ({}))) as {
+      error?: string;
+    };
+    setAvatarBusy(false);
+    if (!response.ok) return setUploadMessage(result.error ?? "头像上传失败");
+    setAvatarVersion(Date.now());
+    e.target.value = "";
+    setUploadMessage("头像已更新，公开站点将在几分钟内刷新缓存");
+  };
+  const uploadResume = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setResumeBusy(true);
+    setUploadMessage("");
+    const response = await fetch("/api/admin/documents", {
+      method: "POST",
+      body: new FormData(e.currentTarget),
+    });
+    const result = (await response.json().catch(() => ({}))) as {
+      error?: string;
+    };
+    setResumeBusy(false);
+    if (!response.ok) return setUploadMessage(result.error ?? "简历上传失败");
+    e.currentTarget.reset();
+    setUploadMessage("简历已上传，后台正在解析、切片并建立 RAG 索引");
+  };
   return (
     <>
       <header className="page-head">
@@ -805,6 +845,26 @@ function ProfileEditor() {
       <form className="profile-layout" onSubmit={save}>
         <section className="panel profile-form">
           <h2>基本资料</h2>
+          <div className="avatar-editor">
+            <img
+              src={`/api/admin/profile/avatar?v=${avatarVersion}`}
+              alt="当前头像"
+            />
+            <div className="avatar-upload-control">
+              <label className="upload compact-upload">
+                <input
+                  name="file"
+                  required
+                  type="file"
+                  accept="image/jpeg,image/png,image/webp,image/gif"
+                  onChange={uploadAvatar}
+                  disabled={avatarBusy}
+                />
+                <strong>{avatarBusy ? "上传中…" : "选择并上传头像"}</strong>
+                <span>JPG、PNG、WebP 或 GIF，最大 5MB</span>
+              </label>
+            </div>
+          </div>
           <label>
             显示名称
             <input
@@ -877,9 +937,36 @@ function ProfileEditor() {
       </form>
       <section className="panel resume-entry">
         <h2>个人简历</h2>
-        <p>
-          请在“知识库”上传 PDF、Markdown 或 TXT，并设置为仅供 RAG 或公开引用。
-        </p>
+        <p>在这里直接上传 PDF 或 Markdown，文件会进入现有 RAG 处理流程。</p>
+        <form className="resume-upload" onSubmit={uploadResume}>
+          <input type="hidden" name="purpose" value="resume" />
+          <label>
+            简历标题
+            <input name="title" required placeholder="例如：我的个人简历" />
+          </label>
+          <label className="upload">
+            <input
+              name="file"
+              required
+              type="file"
+              accept=".pdf,.md,application/pdf,text/markdown,text/plain"
+            />
+            <strong>选择 PDF / Markdown</strong>
+            <span>上传后自动解析、切片并建立索引</span>
+          </label>
+          <label>
+            可见性
+            <select name="visibility" defaultValue="rag_only">
+              <option value="rag_only">仅供 AI 分身检索</option>
+              <option value="public">公开并允许引用</option>
+              <option value="private">私有，不参与检索</option>
+            </select>
+          </label>
+          <button className="primary" disabled={resumeBusy}>
+            {resumeBusy ? "上传处理中…" : "上传简历"}
+          </button>
+        </form>
+        {uploadMessage && <div className="upload-message">{uploadMessage}</div>}
       </section>
     </>
   );

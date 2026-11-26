@@ -667,6 +667,59 @@ td small {
 .resume-entry {
   margin-top: 16px;
 }
+.avatar-editor {
+  display: grid;
+  grid-template-columns: 88px 1fr;
+  gap: 14px;
+  align-items: center;
+  padding: 12px;
+  border: 1px solid #e6eaed;
+  border-radius: 12px;
+  background: #fafbfc;
+}
+.avatar-editor > img {
+  width: 88px;
+  height: 88px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: linear-gradient(135deg, #31516f, #7899b5);
+}
+.avatar-upload-control {
+  display: grid;
+  gap: 8px;
+}
+.compact-upload {
+  min-height: auto;
+  padding: 10px !important;
+}
+.resume-upload {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(260px, 1.5fr) 180px auto;
+  gap: 12px;
+  align-items: end;
+}
+.resume-upload > label {
+  display: grid;
+  gap: 6px;
+  color: #66747d;
+  font-size: 12px;
+}
+.resume-upload input,
+.resume-upload select {
+  min-height: 40px;
+  border: 1px solid #dfe4e8;
+  border-radius: 8px;
+  padding: 9px 10px;
+  font: inherit;
+}
+.resume-upload .upload {
+  min-height: 72px;
+}
+.upload-message {
+  margin-top: 12px;
+  color: #397453;
+  font-size: 12px;
+}
 .checkbox {
   display: flex !important;
   grid-template-columns: auto 1fr !important;
@@ -686,6 +739,9 @@ td small {
 }
 @media (max-width: 900px) {
   .profile-layout {
+    grid-template-columns: 1fr;
+  }
+  .resume-upload {
     grid-template-columns: 1fr;
   }
 }

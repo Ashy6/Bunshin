@@ -250,22 +250,66 @@ app.put("/api/admin/profile", async (c) => {
       .run();
   return c.json({ id });
 });
+app.get("/api/admin/profile/avatar", async (c) => {
+  const profile = await c.env.DB.prepare(
+    "SELECT avatar_url FROM profiles ORDER BY created_at LIMIT 1",
+  ).first<{ avatar_url: string | null }>();
+  if (!profile?.avatar_url?.startsWith("r2://"))
+    return c.json({ error: "尚未上传头像" }, 404);
+  const object = await c.env.ASSETS_BUCKET.get(profile.avatar_url.slice(5));
+  if (!object) return c.json({ error: "头像文件不存在" }, 404);
+  return new Response(object.body, {
+    headers: {
+      "Content-Type": object.httpMetadata?.contentType ?? "image/jpeg",
+      "Cache-Control": "private, max-age=300",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+});
 app.post("/api/admin/profile/avatar", async (c) => {
   const form = await c.req.formData(),
     file = form.get("file");
+  const allowedTypes = new Set([
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+  ]);
   if (
     !(file instanceof File) ||
-    !file.type.startsWith("image/") ||
+    !allowedTypes.has(file.type) ||
     file.size > 5 * 1024 * 1024
   )
-    return c.json({ error: "请选择 5MB 以内的图片" }, 400);
-  const key = `profile/avatar-${crypto.randomUUID()}`;
+    return c.json(
+      { error: "请选择 5MB 以内的 JPG、PNG、WebP 或 GIF 图片" },
+      400,
+    );
+  const profile = await c.env.DB.prepare(
+    "SELECT id,avatar_url FROM profiles ORDER BY created_at LIMIT 1",
+  ).first<{ id: string; avatar_url: string | null }>();
+  if (!profile) return c.json({ error: "请先保存基本资料，再上传头像" }, 409);
+  const extension =
+      (
+        {
+          "image/jpeg": "jpg",
+          "image/png": "png",
+          "image/webp": "webp",
+          "image/gif": "gif",
+        } as Record<string, string>
+      )[file.type] ?? "img",
+    key = `profile/avatar-${crypto.randomUUID()}.${extension}`;
   await c.env.ASSETS_BUCKET.put(key, file.stream(), {
     httpMetadata: { contentType: file.type },
   });
-  await c.env.DB.prepare("UPDATE profiles SET avatar_url=?,updated_at=?")
-    .bind(`r2://${key}`, new Date().toISOString())
+  await c.env.DB.prepare(
+    "UPDATE profiles SET avatar_url=?,updated_at=? WHERE id=?",
+  )
+    .bind(`r2://${key}`, new Date().toISOString(), profile.id)
     .run();
+  if (profile.avatar_url?.startsWith("r2://"))
+    c.executionCtx.waitUntil(
+      c.env.ASSETS_BUCKET.delete(profile.avatar_url.slice(5)),
+    );
   return c.json({ key });
 });
 app.get("/api/admin/provider-presets", (c) =>

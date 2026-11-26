@@ -13,6 +13,7 @@ type Bindings = {
   DB: D1Database;
   CACHE: KVNamespace;
   VECTORIZE: VectorizeIndex;
+  ASSETS_BUCKET: R2Bucket;
   ASSETS: Fetcher;
   PUBLIC_ORIGIN?: string;
   MASTER_ENCRYPTION_KEY: string;
@@ -89,6 +90,16 @@ function layout(
         <meta property="og:description" content="${description}" />
         <meta property="og:type" content="website" />
         <link rel="stylesheet" href="/styles.css" />
+        <style>
+          .avatar {
+            overflow: hidden;
+          }
+          .avatar img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+          }
+        </style>
         <script type="application/ld+json">
           ${JSON.stringify({
             "@context": "https://schema.org",
@@ -102,9 +113,9 @@ function layout(
       <body>
         <aside class="sidebar">
           <div class="profile">
-            <div class="avatar" aria-hidden="true">B</div>
-            <a class="site-title" href="/">Bunshin</a>
-            <p>保持好奇，持续构建</p>
+            <div class="avatar"><img src="/avatar" alt="站长头像" /></div>
+            <a class="site-title" id="profile-name" href="/">Bunshin</a>
+            <p id="profile-headline">保持好奇，持续构建</p>
           </div>
           <nav aria-label="主导航">
             <a class="active" href="/">⌂<span>首页</span></a
@@ -131,6 +142,7 @@ function layout(
             回答请以引用来源为准。
           </footer>
         </div>
+        <script src="/profile.js" defer></script>
         <script src="/app.js" defer></script>
       </body>
     </html>`;
@@ -301,6 +313,15 @@ app.get("/about", async (c) => {
       </section>`,
     ),
   );
+});
+
+app.get("/api/profile", async (c) => {
+  const profile = await c.env.DB.prepare(
+    "SELECT display_name,headline,bio,location,skills_json,social_json,updated_at FROM profiles WHERE published=1 ORDER BY created_at LIMIT 1",
+  ).first();
+  return c.json({ profile: profile ?? null }, 200, {
+    "Cache-Control": "public, max-age=60",
+  });
 });
 
 app.post("/api/chat", async (c) => {
@@ -527,6 +548,30 @@ app.post("/api/chat", async (c) => {
 app.get("/robots.txt", (c) =>
   c.text("User-agent: *\nAllow: /\nDisallow: /api/\nSitemap: /sitemap.xml\n"),
 );
+app.get("/avatar", async (c) => {
+  const profile = await c.env.DB.prepare(
+    "SELECT avatar_url FROM profiles WHERE published=1 ORDER BY created_at LIMIT 1",
+  ).first<{ avatar_url: string | null }>();
+  if (profile?.avatar_url?.startsWith("r2://")) {
+    const object = await c.env.ASSETS_BUCKET.get(profile.avatar_url.slice(5));
+    if (object)
+      return new Response(object.body, {
+        headers: {
+          "Content-Type": object.httpMetadata?.contentType ?? "image/jpeg",
+          "Cache-Control": "public, max-age=300",
+          "X-Content-Type-Options": "nosniff",
+        },
+      });
+  }
+  return c.body(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><defs><linearGradient id="g"><stop stop-color="#31516f"/><stop offset="1" stop-color="#7899b5"/></linearGradient></defs><rect width="100" height="100" rx="50" fill="url(#g)"/><text x="50" y="64" text-anchor="middle" font-family="system-ui" font-size="44" font-weight="700" fill="white">B</text></svg>',
+    200,
+    {
+      "Content-Type": "image/svg+xml",
+      "Cache-Control": "public, max-age=60",
+    },
+  );
+});
 app.get("/sitemap.xml", (c) =>
   c.body(
     `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>/</loc></url>${demoArticles.map((a) => `<url><loc>/articles/${a.slug}</loc></url>`).join("")}</urlset>`,
