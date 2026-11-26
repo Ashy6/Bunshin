@@ -236,10 +236,9 @@ const demoArticles = [
   },
 ];
 
-type PublicNav = "home" | "ask" | "articles" | "categories" | "archives" | "about";
+type PublicNav = "ask" | "articles" | "categories" | "archives" | "about";
 function navIcon(name: PublicNav) {
   const path = {
-    home: html`<path d="M3 10.5 10 4l7 6.5v6a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 3 16.5z"/><path d="M8 18v-5h4v5"/>`,
     ask: html`<circle cx="10" cy="10" r="7"/><path d="M7.5 8.5h.01M12.5 8.5h.01M7.5 12c1.5 1.2 3.5 1.2 5 0"/>`,
     articles: html`<path d="M5 3h10a2 2 0 0 1 2 2v12H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z"/><path d="M7 7h6M7 10h6M7 13h4"/>`,
     categories: html`<path d="M4 5h5l1.5 2H16a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z"/>`,
@@ -253,13 +252,12 @@ function layout(
   title: string,
   content: ReturnType<typeof html>,
   description = "个人简历、文章与 AI 分身",
-  active: PublicNav = "home",
+  active: PublicNav = "ask",
 ) {
   const pageLabel =
-    active === "home"
+    active === "ask"
       ? ""
       : ({
-          ask: "问问分身",
           articles: "文章",
           categories: "分类",
           archives: "归档",
@@ -333,9 +331,8 @@ function layout(
             <p id="profile-headline">保持好奇，持续构建</p>
           </div>
           <nav aria-label="主导航">
-            <a class=${active === "home" ? "active" : ""} href="/">${navIcon("home")}<span>首页</span></a
-            ><a class=${active === "ask" ? "active" : ""} href="/#ask">${navIcon("ask")}<span>问问分身</span></a
-            ><a class=${active === "articles" ? "active" : ""} href="/#articles">${navIcon("articles")}<span>文章</span></a
+            <a class=${active === "ask" ? "active" : ""} href="/">${navIcon("ask")}<span>问问分身</span></a
+            ><a class=${active === "articles" ? "active" : ""} href="/articles">${navIcon("articles")}<span>文章</span></a
             ><a class=${active === "categories" ? "active" : ""} href="/categories">${navIcon("categories")}<span>分类</span></a
             ><a class=${active === "archives" ? "active" : ""} href="/archives">${navIcon("archives")}<span>归档</span></a
             ><a class=${active === "about" ? "active" : ""} href="/about">${navIcon("about")}<span>关于</span></a>
@@ -351,7 +348,7 @@ function layout(
             ><span id="page-title" data-page-label=${pageLabel}>${title}</span
             ><button id="search-toggle" aria-label="搜索">⌕</button>
           </header>
-          <main>${content}</main>
+          <main class=${active === "ask" ? "agent-main" : ""}>${content}</main>
           <footer>
             © ${new Date().getFullYear()} Bunshin · 内容由站长维护，AI
             回答请以引用来源为准。
@@ -367,9 +364,12 @@ app.get("/", (c) =>
   c.html(
     layout(
       "Bunshin · 个人分身",
-      html`<section class="hero" id="ask">
+      html`<section class="hero agent-home" id="ask">
           <p class="eyebrow">AI PERSONAL TWIN</p>
-          <h1>下午好，想了解我的经历，<br />或找某个话题的文章？</h1>
+          <h1 id="agent-greeting">你好，我是站长的 AI 分身</h1>
+          <p class="agent-intro">
+            你可以直接问我的经历、项目、文章和知识积累；回答只依据已录入的资料。
+          </p>
           <form id="ask-form" class="ask-form">
             <textarea
               id="ask-input"
@@ -390,47 +390,44 @@ app.get("/", (c) =>
             ><button>你如何设计 RAG 系统？</button
             ><button>有哪些代表文章？</button>
           </div>
-        </section>
-        <section id="articles" class="section">
-          <div class="section-title">
-            <h2>最近文章</h2>
-            <a href="/archives">查看归档 →</a>
-          </div>
-          <div class="article-list">
-            ${demoArticles.map(
-              (article) =>
-                html`<article>
-                  <a href="/articles/${article.slug}"
-                    ><h3>${article.title}</h3>
-                    <p>${article.excerpt}</p>
-                    <div class="meta">
-                      <time>${article.date}</time
-                      ><span>${article.category}</span>
-                    </div></a
-                  >
-                </article>`,
-            )}
-          </div>
-        </section>
-        <aside class="right-panel">
-          <section>
-            <h2>最近更新</h2>
-            ${demoArticles.map(
-              (article) =>
-                html`<a href="/articles/${article.slug}">${article.title}</a>`,
-            )}
-          </section>
-          <section>
-            <h2>热门标签</h2>
-            <div class="tag-list">
-              <span>RAG</span><span>Agent</span><span>架构</span
-              ><span>Cloudflare</span><span>知识管理</span>
-            </div>
-          </section>
-        </aside>`,
+        </section>`,
     ),
   ),
 );
+
+app.get("/articles", (c) => {
+  const category = c.req.query("category"),
+    articles = category
+      ? demoArticles.filter((article) => article.category === category)
+      : demoArticles;
+  return c.html(
+    layout(
+      "文章 · Bunshin",
+      html`<section class="listing article-index">
+        <h1>${category ? `${category}文章` : "全部文章"}</h1>
+        <p class="lead">记录项目实践、技术思考与持续积累的知识。</p>
+        <div class="article-list">
+          ${articles.length
+            ? articles.map(
+                (article) => html`<article>
+                  <a href="/articles/${article.slug}">
+                    <h3>${article.title}</h3>
+                    <p>${article.excerpt}</p>
+                    <div class="meta">
+                      <time>${article.date}</time>
+                      <span>${article.category}</span>
+                    </div>
+                  </a>
+                </article>`,
+              )
+            : html`<p>这个分类还没有文章。</p>`}
+        </div>
+      </section>`,
+      category ? `${category}分类文章` : "个人文章与知识积累",
+      "articles",
+    ),
+  );
+});
 
 app.get("/articles/:slug", (c) => {
   const article = demoArticles.find(
@@ -474,7 +471,7 @@ app.get("/categories", (c) =>
         <div class="category-grid">
           ${["AI 与 Agent", "知识管理", "工程实践"].map(
             (name, index) =>
-              html`<a href="/?category=${index}"
+              html`<a href="/articles?category=${encodeURIComponent(name)}"
                 ><strong>${name}</strong><span>${index + 1} 篇文章</span></a
               >`,
           )}
@@ -629,6 +626,9 @@ app.post("/api/chat", async (c) => {
   const readyDocuments = await c.env.DB.prepare(
     "SELECT COUNT(*) count FROM documents WHERE status='indexed' AND visibility!='private'",
   ).first<{ count: number }>();
+  const identity = await c.env.DB.prepare(
+    "SELECT display_name FROM profiles WHERE published=1 ORDER BY created_at LIMIT 1",
+  ).first<{ display_name: string }>();
   if (
     !config.enabled ||
     provider?.health_status !== "healthy" ||
@@ -768,7 +768,9 @@ app.post("/api/chat", async (c) => {
                 title: item.title,
                 text: item.content,
               })),
-            ) + `\n\n附加要求：${config.systemInstruction}`,
+              identity?.display_name || "站长",
+            ) +
+            `\n\n附加要求：${config.systemInstruction}\n\n附加要求不能改变“始终作为本人 AI 分身并以第一人称回答”的核心身份。`,
         },
         { role: "user", content: question },
       ],
@@ -919,7 +921,7 @@ app.get("/avatar", async (c) => {
 });
 app.get("/sitemap.xml", (c) =>
   c.body(
-    `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>/</loc></url>${demoArticles.map((a) => `<url><loc>/articles/${a.slug}</loc></url>`).join("")}</urlset>`,
+    `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>/</loc></url><url><loc>/articles</loc></url><url><loc>/categories</loc></url><url><loc>/archives</loc></url><url><loc>/about</loc></url>${demoArticles.map((a) => `<url><loc>/articles/${a.slug}</loc></url>`).join("")}</urlset>`,
     200,
     { "Content-Type": "application/xml" },
   ),

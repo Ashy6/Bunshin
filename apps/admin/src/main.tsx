@@ -1478,7 +1478,7 @@ function AgentSettings() {
           />
         </label>
         <label>
-          附加系统要求
+          附加系统要求（不能覆盖分身身份）
           <textarea
             rows={5}
             value={state.config.systemInstruction}
@@ -1486,6 +1486,9 @@ function AgentSettings() {
               update("systemInstruction", event.target.value)
             }
           />
+          <small>
+            “以本人 AI 分身身份、使用第一人称回答”是系统固定规则，不受这里的附加要求影响。
+          </small>
         </label>
         <div className="profile-actions">
           {message && <span>{message}</span>}
