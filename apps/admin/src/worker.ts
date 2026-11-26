@@ -34,6 +34,10 @@ type Job = {
   mimeType: string;
 };
 const app = new Hono<{ Bindings: Env }>();
+app.onError((error, c) => {
+  console.error("Unhandled admin API error", error);
+  return c.json({ error: "服务器处理失败，请稍后重试", code: "INTERNAL_ERROR" }, 500);
+});
 app.use("/api/*", async (c, next) => {
   await next();
   c.header("Cache-Control", "no-store");

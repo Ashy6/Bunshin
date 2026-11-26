@@ -599,7 +599,13 @@ function AuthGate() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    const result = (await response.json()) as { error?: string };
+    const responseText = await response.text();
+    let result: { error?: string } = {};
+    try {
+      result = JSON.parse(responseText) as { error?: string };
+    } catch {
+      result = { error: response.ok ? undefined : `服务器返回异常（HTTP ${response.status}）` };
+    }
     if (!response.ok) {
       setError(result.error || "操作失败");
       return;

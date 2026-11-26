@@ -1,5 +1,7 @@
 const encoder = new TextEncoder();
-const ITERATIONS = 210_000;
+// Keep first-run and login within Cloudflare Workers CPU limits. The encoded
+// hash stores its own iteration count so this can be raised with rehashing later.
+const ITERATIONS = 100_000;
 
 function bytesToBase64(bytes: Uint8Array) {
   let binary = "";
