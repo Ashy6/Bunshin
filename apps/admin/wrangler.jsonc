@@ -9,6 +9,7 @@
   "d1_databases":[{"binding":"DB","database_name":"ai-bunshin","database_id":"605fe3d9-1af8-48c2-b7de-ed836048c51e","migrations_dir":"../../packages/db/migrations"}],
   "r2_buckets":[{"binding":"ASSETS_BUCKET","bucket_name":"ai-bunshin-assets"}],
   "vectorize":[{"binding":"VECTORIZE","index_name":"ai-bunshin-knowledge-v1"}],
+  "send_email":[{"name":"EMAIL","remote":true}],
   "queues":{"producers":[{"binding":"INGESTION_QUEUE","queue":"ai-bunshin-ingestion"}],"consumers":[{"queue":"ai-bunshin-ingestion","max_batch_size":5,"max_batch_timeout":5,"max_retries":3,"dead_letter_queue":"ai-bunshin-ingestion-dlq"}]},
   "triggers":{"crons":["*/5 * * * *"]},
   "observability":{"enabled":true,"logs":{"enabled":true,"head_sampling_rate":1}}

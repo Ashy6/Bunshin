@@ -36,6 +36,16 @@ type Env = {
   MASTER_ENCRYPTION_KEY: string;
   SESSION_SECRET: string;
   ADMIN_BOOTSTRAP_TOKEN: string;
+  PASSWORD_RESET_FROM_EMAIL?: string;
+  EMAIL?: {
+    send(message: {
+      from: string;
+      to: string;
+      subject: string;
+      html: string;
+      text: string;
+    }): Promise<unknown>;
+  };
 };
 type Job = {
   type: "ingest";
@@ -109,6 +119,28 @@ const defaultObservabilityConfig = {
   budgetWarningPercent: 80,
   slowRequestMs: 12000,
 };
+const passwordResetResponse = {
+  ok: true,
+  message: "如果该邮箱对应管理员账号，验证码将在几分钟内发送。",
+};
+function sixDigitCode() {
+  const value = crypto.getRandomValues(new Uint32Array(1))[0] ?? 0;
+  return String(value % 1_000_000).padStart(6, "0");
+}
+function clientAddress(request: Request) {
+  return request.headers.get("CF-Connecting-IP") ?? request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() ?? "unknown";
+}
+async function sendPasswordResetEmail(env: Env, to: string, code: string) {
+  if (!env.EMAIL || !env.PASSWORD_RESET_FROM_EMAIL)
+    throw new Error("邮件服务尚未配置");
+  await env.EMAIL.send({
+    from: env.PASSWORD_RESET_FROM_EMAIL,
+    to,
+    subject: "Bunshin 管理后台密码验证码",
+    text: `你的验证码是 ${code}，10 分钟内有效。若不是你本人操作，请忽略本邮件。`,
+    html: `<div style="font-family:system-ui,sans-serif;max-width:520px;margin:auto;padding:28px"><h1 style="font-size:22px">重置 Bunshin 管理密码</h1><p>你的验证码是：</p><p style="font-size:32px;font-weight:700;letter-spacing:8px">${code}</p><p>验证码 10 分钟内有效，最多可尝试 5 次。若不是你本人操作，请忽略本邮件。</p></div>`,
+  });
+}
 function boundedInteger(
   value: string | undefined,
   fallback: number,
@@ -396,7 +428,81 @@ app.get("/api/admin/auth/status", async (c) => {
   const row = await c.env.DB.prepare(
     "SELECT COUNT(*) count FROM admin_users",
   ).first<{ count: number }>();
-  return c.json({ initialized: (row?.count ?? 0) > 0 });
+  return c.json({
+    initialized: (row?.count ?? 0) > 0,
+    passwordResetAvailable: Boolean(c.env.EMAIL && c.env.PASSWORD_RESET_FROM_EMAIL),
+  });
+});
+app.post("/api/admin/auth/password-reset/request", async (c) => {
+  const body = await c.req.json<{ email?: string }>().catch(() => ({} as { email?: string })),
+    email = body.email?.trim().toLowerCase() ?? "";
+  if (!email || email.length > 320) return c.json(passwordResetResponse);
+  const requestKey = await sha256(`password-reset:${clientAddress(c.req.raw)}:${email}`),
+    now = new Date(),
+    nowIso = now.toISOString(),
+    bucket = await c.env.DB.prepare(
+      "SELECT count,expires_at FROM rate_limit_buckets WHERE visitor_hash=? AND bucket='password_reset_request' LIMIT 1",
+    ).bind(requestKey).first<{ count: number; expires_at: string }>();
+  if (bucket && bucket.expires_at > nowIso && bucket.count >= 3) {
+    c.header("Retry-After", "900");
+    return c.json(passwordResetResponse);
+  }
+  const expiresAt = new Date(now.getTime() + 15 * 60 * 1000).toISOString();
+  await c.env.DB.prepare(
+    "INSERT INTO rate_limit_buckets (visitor_hash,bucket,count,expires_at,updated_at) VALUES (?,'password_reset_request',1,?,?) ON CONFLICT(visitor_hash,bucket) DO UPDATE SET count=CASE WHEN rate_limit_buckets.expires_at<=excluded.updated_at THEN 1 ELSE rate_limit_buckets.count+1 END,expires_at=CASE WHEN rate_limit_buckets.expires_at<=excluded.updated_at THEN excluded.expires_at ELSE rate_limit_buckets.expires_at END,updated_at=excluded.updated_at",
+  ).bind(requestKey, expiresAt, nowIso).run();
+  const admin = await c.env.DB.prepare(
+    "SELECT id,email FROM admin_users WHERE email=? LIMIT 1",
+  ).bind(email).first<{ id: string; email: string }>();
+  if (admin && c.env.EMAIL && c.env.PASSWORD_RESET_FROM_EMAIL) {
+    const code = sixDigitCode(),
+      codeHash = await sha256(`${code}:${c.env.SESSION_SECRET}`),
+      codeExpires = new Date(now.getTime() + 10 * 60 * 1000).toISOString(),
+      id = crypto.randomUUID();
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        "UPDATE password_reset_codes SET consumed_at=? WHERE admin_id=? AND consumed_at IS NULL",
+      ).bind(nowIso, admin.id),
+      c.env.DB.prepare(
+        "INSERT INTO password_reset_codes (id,admin_id,code_hash,attempts,expires_at,created_at) VALUES (?,?,?,?,?,?)",
+      ).bind(id, admin.id, codeHash, 0, codeExpires, nowIso),
+    ]);
+    c.executionCtx.waitUntil(
+      sendPasswordResetEmail(c.env, admin.email, code)
+        .then(() => recordAdminTelemetry(c.env, { eventType: "password_reset_email_sent", route: c.req.path, statusCode: 200 }))
+        .catch((error) => recordAdminTelemetry(c.env, { eventType: "password_reset_email_failed", severity: "error", route: c.req.path, statusCode: 500, detail: { error: error instanceof Error ? error.message : "send failed" } })),
+    );
+  }
+  return c.json(passwordResetResponse);
+});
+app.post("/api/admin/auth/password-reset/confirm", async (c) => {
+  const body = await c.req.json<{ email?: string; code?: string; password?: string }>().catch(() => ({} as { email?: string; code?: string; password?: string })),
+    email = body.email?.trim().toLowerCase() ?? "",
+    code = body.code?.trim() ?? "",
+    password = body.password ?? "";
+  if (!email || !/^\d{6}$/.test(code) || password.length < 12)
+    return c.json({ error: "验证码无效或新密码不符合要求" }, 400);
+  const admin = await c.env.DB.prepare(
+    "SELECT id FROM admin_users WHERE email=? LIMIT 1",
+  ).bind(email).first<{ id: string }>();
+  const reset = admin ? await c.env.DB.prepare(
+    "SELECT id,code_hash,attempts FROM password_reset_codes WHERE admin_id=? AND consumed_at IS NULL AND expires_at>? ORDER BY created_at DESC LIMIT 1",
+  ).bind(admin.id, new Date().toISOString()).first<{ id: string; code_hash: string; attempts: number }>() : null;
+  const actualHash = await sha256(`${code}:${c.env.SESSION_SECRET}`);
+  if (!admin || !reset || reset.attempts >= 5 || actualHash !== reset.code_hash) {
+    if (reset) await c.env.DB.prepare("UPDATE password_reset_codes SET attempts=attempts+1 WHERE id=?").bind(reset.id).run();
+    await recordAdminTelemetry(c.env, { eventType: "password_reset_failed", severity: "warning", route: c.req.path, statusCode: 400 });
+    return c.json({ error: "验证码无效或已经过期" }, 400);
+  }
+  const now = new Date().toISOString(),
+    passwordHash = await hashPassword(password);
+  await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE admin_users SET password_hash=?,updated_at=? WHERE id=?").bind(passwordHash, now, admin.id),
+    c.env.DB.prepare("UPDATE password_reset_codes SET consumed_at=? WHERE id=?").bind(now, reset.id),
+    c.env.DB.prepare("DELETE FROM sessions WHERE admin_id=?").bind(admin.id),
+  ]);
+  await recordAdminTelemetry(c.env, { eventType: "password_reset_succeeded", route: c.req.path, statusCode: 200 });
+  return c.json({ ok: true, message: "密码已修改，请使用新密码登录" });
 });
 app.post("/api/admin/auth/bootstrap", async (c) => {
   const body = await c.req

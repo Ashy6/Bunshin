@@ -74,6 +74,9 @@ for (const [name, value] of Object.entries(secrets)) {
     run("pnpm", ["exec", "wrangler", "secret", "put", name, "--config", config], `${value}\n`);
   }
 }
+if (process.env.PASSWORD_RESET_FROM_EMAIL) {
+  run("pnpm", ["exec", "wrangler", "secret", "put", "PASSWORD_RESET_FROM_EMAIL", "--config", "apps/admin/wrangler.jsonc"], `${process.env.PASSWORD_RESET_FROM_EMAIL}\n`);
+}
 
 console.log("7/7 Verifying production health...");
 run("pnpm", ["exec", "wrangler", "deployments", "list", "--name", "ai-bunshin-web"], undefined, true);

@@ -156,6 +156,7 @@ Agent 只有在“渠道测试成功 + 至少一份非私有资料完成索引 +
 - `MASTER_ENCRYPTION_KEY` 只放 Worker Secret。
 - 管理员密码使用强密码哈希，Session Cookie 使用 `Secure`、`HttpOnly`、`SameSite=Strict`。
 - 后台登录按“来源 IP + 规范化邮箱”的不可逆哈希计数；15 分钟内连续失败 8 次后返回 `429`，成功登录后清除该临时计数。原始 IP 和邮箱不会写入限流表或监控详情。
+- 后台支持 Cloudflare Email Service 邮箱验证码重置：请求接口防邮箱枚举、15 分钟最多请求 3 次，验证码只保存带服务端 Secret 的哈希、10 分钟有效且最多尝试 5 次；成功后注销全部旧 Session。只有 Email binding 和 `PASSWORD_RESET_FROM_EMAIL` 同时配置时才显示入口。
 - 后台写请求执行同源 Origin 校验，并配合 `SameSite=Strict` 会话 Cookie 防止跨站提交。
 - 后台左下角账号区只展示当前资料中的头像、姓名和无背景的“退出登录”入口；退出时会删除当前服务端 Session 并清除 Cookie。
 - 日志不记录 API Key、Cookie、Authorization、完整 prompt 或私密原文。

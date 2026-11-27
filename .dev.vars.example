@@ -1,6 +1,8 @@
 MASTER_ENCRYPTION_KEY=base64-encoded-32-byte-key
 SESSION_SECRET=replace-with-at-least-32-random-bytes
 ADMIN_BOOTSTRAP_TOKEN=replace-with-one-time-bootstrap-token
+# Optional password reset email. The sender domain must be onboarded in Cloudflare Email Service.
+PASSWORD_RESET_FROM_EMAIL=Bunshin <no-reply@example.com>
 PUBLIC_ORIGIN=http://localhost:8787
 ADMIN_ORIGIN=http://localhost:8788
 # Optional: only enable Turnstile when both values are configured.

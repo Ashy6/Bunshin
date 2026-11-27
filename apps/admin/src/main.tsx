@@ -1448,20 +1448,24 @@ function AdminApp() {
   );
 }
 function AuthGate() {
-  const [status, setStatus] = useState<"loading" | "setup" | "login" | "ready">(
+  const [status, setStatus] = useState<"loading" | "setup" | "login" | "reset-request" | "reset-confirm" | "ready">(
     "loading",
   );
-  const [error, setError] = useState("");
+  const [error, setError] = useState(""),
+    [message, setMessage] = useState(""),
+    [resetEmail, setResetEmail] = useState(""),
+    [passwordResetAvailable, setPasswordResetAvailable] = useState(false);
   useEffect(() => {
     Promise.all([
       fetch("/api/admin/auth/status").then(
-        (r) => r.json() as Promise<{ initialized: boolean }>,
+        (r) => r.json() as Promise<{ initialized: boolean; passwordResetAvailable?: boolean }>,
       ),
       fetch("/api/admin/auth/session").then((r) => r.ok),
     ])
-      .then(([setup, session]) =>
-        setStatus(session ? "ready" : setup.initialized ? "login" : "setup"),
-      )
+      .then(([setup, session]) => {
+        setPasswordResetAvailable(Boolean(setup.passwordResetAvailable));
+        setStatus(session ? "ready" : setup.initialized ? "login" : "setup");
+      })
       .catch(() => setStatus("setup"));
   }, []);
   if (status === "loading")
@@ -1477,7 +1481,43 @@ function AuthGate() {
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setError("");
-    const form = new FormData(event.currentTarget),
+    setMessage("");
+    const form = new FormData(event.currentTarget);
+    if (status === "reset-request") {
+      const email = String(form.get("email") || "").trim();
+      const response = await fetch("/api/admin/auth/password-reset/request", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+      const result = await response.json().catch(() => ({})) as { message?: string };
+      setResetEmail(email);
+      setMessage(result.message || "如果账号存在，验证码将发送到该邮箱。");
+      setStatus("reset-confirm");
+      return;
+    }
+    if (status === "reset-confirm") {
+      const password = String(form.get("password") || ""),
+        passwordConfirm = String(form.get("passwordConfirm") || "");
+      if (password !== passwordConfirm) {
+        setError("两次输入的新密码不一致");
+        return;
+      }
+      const response = await fetch("/api/admin/auth/password-reset/confirm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: resetEmail, code: String(form.get("code") || ""), password }),
+      });
+      const result = await response.json().catch(() => ({})) as { error?: string; message?: string };
+      if (!response.ok) {
+        setError(result.error || "验证码校验失败");
+        return;
+      }
+      setMessage(result.message || "密码已修改，请重新登录");
+      setStatus("login");
+      return;
+    }
+    const
       body = {
         email: String(form.get("email")),
         password: String(form.get("password")),
@@ -1522,28 +1562,40 @@ function AuthGate() {
       <form className="auth-card" onSubmit={submit}>
         <div className="auth-logo">B</div>
         <p className="eyebrow">AI BUNSHIN</p>
-        <h1>{status === "setup" ? "创建本地管理员" : "登录管理后台"}</h1>
+        <h1>{status === "setup" ? "创建本地管理员" : status === "reset-request" ? "找回管理密码" : status === "reset-confirm" ? "输入邮箱验证码" : "登录管理后台"}</h1>
         <p>
           {status === "setup"
             ? "首次运行只需创建一个站长账号。"
+            : status === "reset-request"
+              ? "验证码只会发送到已经注册的管理员邮箱。"
+              : status === "reset-confirm"
+                ? `验证码已请求发送至 ${resetEmail}，10 分钟内有效。`
             : "管理你的内容、知识库与模型渠道。"}
         </p>
-        <label>
+        {status !== "reset-confirm" && <label>
           邮箱
           <input name="email" type="email" required autoComplete="email" />
-        </label>
-        <label>
-          密码
+        </label>}
+        {status === "reset-confirm" && <label>
+          6 位验证码
+          <input name="code" inputMode="numeric" pattern="[0-9]{6}" maxLength={6} required autoComplete="one-time-code" />
+        </label>}
+        {!["reset-request"].includes(status) && <label>
+          {status === "reset-confirm" ? "新密码" : "密码"}
           <input
             name="password"
             type="password"
             required
             minLength={12}
             autoComplete={
-              status === "setup" ? "new-password" : "current-password"
+              ["setup", "reset-confirm"].includes(status) ? "new-password" : "current-password"
             }
           />
-        </label>
+        </label>}
+        {status === "reset-confirm" && <label>
+          再次输入新密码
+          <input name="passwordConfirm" type="password" required minLength={12} autoComplete="new-password" />
+        </label>}
         {status === "setup" &&
           location.hostname !== "localhost" &&
           location.hostname !== "127.0.0.1" && (
@@ -1552,10 +1604,13 @@ function AuthGate() {
               <input name="token" type="password" required />
             </label>
           )}
+        {message && <div className="notice">{message}</div>}
         {error && <div className="auth-error">{error}</div>}
         <button className="primary">
-          {status === "setup" ? "创建并进入后台" : "登录"}
+          {status === "setup" ? "创建并进入后台" : status === "reset-request" ? "发送验证码" : status === "reset-confirm" ? "验证并修改密码" : "登录"}
         </button>
+        {status === "login" && passwordResetAvailable && <button className="text-button" type="button" onClick={() => { setError(""); setMessage(""); setStatus("reset-request"); }}>忘记密码？使用邮箱验证码</button>}
+        {["reset-request", "reset-confirm"].includes(status) && <button className="text-button" type="button" onClick={() => { setError(""); setMessage(""); setStatus("login"); }}>返回登录</button>}
       </form>
     </div>
   );
