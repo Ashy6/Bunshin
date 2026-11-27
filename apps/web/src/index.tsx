@@ -758,18 +758,24 @@ app.get("/api/agent/status", async (c) => {
     )
       .bind(visitor.hash, `day:${parts.day}`)
       .first<{ count: number }>(),
+    providerReady = provider?.health_status === "healthy",
+    budgetAvailable = Boolean(
+      !provider ||
+        provider.monthly_budget_micros === 0 ||
+        provider.month_spent_micros < provider.monthly_budget_micros,
+    ),
     ready = Boolean(
-      config.enabled &&
-        provider?.health_status === "healthy" &&
-        (provider.monthly_budget_micros === 0 ||
-          provider.month_spent_micros < provider.monthly_budget_micros) &&
-        (documents?.count ?? 0) > 0,
+      config.enabled && budgetAvailable && (documents?.count ?? 0) > 0,
     );
   if (visitor.setCookie) c.header("Set-Cookie", visitor.setCookie);
   return c.json(
     {
       enabled: config.enabled,
       ready,
+      mode: providerReady ? "agent" : "retrieval_only",
+      notice: ready && !providerReady
+        ? "知识检索可用，AI 生成暂不可用"
+        : null,
       remaining: Math.max(0, config.dailyLimit - (usage?.count ?? 0)),
       dailyLimit: config.dailyLimit,
       welcomeMessage: config.welcomeMessage,
@@ -779,21 +785,12 @@ app.get("/api/agent/status", async (c) => {
       },
       reasonCode: !config.enabled
         ? "disabled_by_owner"
-        : !provider
-          ? "provider_missing"
-          : provider.health_status !== "healthy"
-            ? provider.health_status === "error" ? "provider_error" : "provider_unverified"
-            : provider.monthly_budget_micros > 0 && provider.month_spent_micros >= provider.monthly_budget_micros
-              ? "budget_exhausted"
-              : (documents?.count ?? 0) === 0 ? "knowledge_not_ready" : null,
+        : !budgetAvailable
+          ? "budget_exhausted"
+          : (documents?.count ?? 0) === 0 ? "knowledge_not_ready" : null,
       reason: !config.enabled
         ? "站长暂时关闭了 Agent 问答"
-        : !provider
-          ? "站长尚未配置模型渠道"
-        : provider.health_status !== "healthy"
-          ? provider.health_status === "error" ? "模型渠道连接异常，站长正在处理" : "模型渠道尚未完成验证"
-          : provider.monthly_budget_micros > 0 &&
-              provider.month_spent_micros >= provider.monthly_budget_micros
+        : !budgetAvailable
             ? "本月模型预算已用完"
             : (documents?.count ?? 0) === 0
               ? "知识库尚未准备完成"
@@ -836,10 +833,10 @@ app.post("/api/chat", async (c) => {
   const identity = await c.env.DB.prepare(
     "SELECT display_name FROM profiles WHERE rag_enabled=1 ORDER BY created_at LIMIT 1",
   ).first<{ display_name: string }>();
+  const providerReady = provider?.health_status === "healthy";
   if (
     !config.enabled ||
-    provider?.health_status !== "healthy" ||
-    (provider.monthly_budget_micros > 0 &&
+    (provider && provider.monthly_budget_micros > 0 &&
       provider.month_spent_micros >= provider.monthly_budget_micros) ||
     (readyDocuments?.count ?? 0) === 0
   )
@@ -849,7 +846,7 @@ app.post("/api/chat", async (c) => {
       visitor.setCookie ? { "Set-Cookie": visitor.setCookie } : undefined,
     );
   let apiKey: string | null = null;
-  if (provider)
+  if (providerReady && provider)
     apiKey = await decryptSecret(
       JSON.parse(provider.encrypted_api_key) as EncryptedSecret,
       c.env.MASTER_ENCRYPTION_KEY,
@@ -867,7 +864,7 @@ app.post("/api/chat", async (c) => {
   ).all<Omit<RetrievalRow,"score">>()).results,
     lexical=bm25Search(question,corpus,12).filter((item)=>hasMeaningfulOverlap(question,item.content));
   let vectorRanking:Array<RetrievalRow>=[],retrievalMode="local_hybrid";
-  if (provider?.embedding_mode === "provider" && apiKey) {
+  if (providerReady && provider?.embedding_mode === "provider" && apiKey) {
     retrievalMode="provider_hybrid";
     const started = Date.now();
     const embedded = await createEmbedding(
@@ -914,7 +911,10 @@ app.post("/api/chat", async (c) => {
       }))
       .sort((a, b) => b.score - a.score)
       .slice(0, 12)
-      .filter((row) => row.score >= .12);
+      .filter(
+        (row) =>
+          row.score >= .12 && hasMeaningfulOverlap(question, row.content),
+      );
   }
   const fused=reciprocalRankFusion([lexical,vectorRanking],8),
     contexts=rerankHybrid(question,fused,5) as RetrievalRow[],
@@ -944,12 +944,12 @@ app.post("/api/chat", async (c) => {
       429,
       visitor.setCookie ? { "Set-Cookie": visitor.setCookie } : undefined,
     );
-  if (!provider) {
+  if (!providerReady || !provider) {
     const evidence = contexts
       .map((item, index) => `[${index + 1}] ${item.title}：${item.content}`)
       .join("\n\n");
     return new Response(
-      `data: ${JSON.stringify({ type: "delta", text: `已找到以下相关资料（尚未配置模型渠道，因此展示检索结果）：\n\n${evidence}` })}\n\ndata: ${JSON.stringify({ type: "done" })}\n\n`,
+      `data: ${JSON.stringify({ type: "delta", text: `模型生成服务暂时不可用，已为你返回知识库中的相关资料：\n\n${evidence}` })}\n\ndata: ${JSON.stringify({ type: "done", remaining: quota.remaining })}\n\n`,
       { headers },
     );
   }

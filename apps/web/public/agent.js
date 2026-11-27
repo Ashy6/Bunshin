@@ -154,7 +154,7 @@ function setAvailability(status) {
   remainingCount = Number(status.remaining || 0);
   if (statusText)
     statusText.textContent = status.ready
-      ? "Agent 已就绪"
+      ? status.notice || "Agent 已就绪"
       : status.reason || "Agent 尚未就绪";
   if (quotaText)
     quotaText.textContent = `今日剩余 ${status.remaining}/${status.dailyLimit} 次`;
@@ -348,7 +348,7 @@ function applyDynamicAvailability(status, dynamicForm) {
   const dynamicSubmit = dynamicForm.querySelector("button[type='submit']");
   const dynamicStatus = document.querySelector("#agent-status");
   const dynamicQuota = document.querySelector("#agent-quota");
-  if (dynamicStatus) dynamicStatus.textContent = status.ready ? "Agent 已就绪" : status.reason || "Agent 尚未就绪";
+  if (dynamicStatus) dynamicStatus.textContent = status.ready ? status.notice || "Agent 已就绪" : status.reason || "Agent 尚未就绪";
   if (dynamicQuota) dynamicQuota.textContent = `今日剩余 ${status.remaining}/${status.dailyLimit} 次`;
   if (dynamicSubmit) dynamicSubmit.disabled = !status.ready || status.remaining <= 0 || (turnstileRequired && !turnstileToken);
   if (dynamicInput) {
