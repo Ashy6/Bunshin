@@ -1395,10 +1395,11 @@ function AdminApp() {
             <button
               key={item.id}
               className={view === item.id ? "active" : ""}
+              title={item.label}
               onClick={() => navigate(item.id)}
             >
-              <span>{item.icon}</span>
-              {item.label}
+              <span className="nav-icon">{item.icon}</span>
+              <span className="nav-label">{item.label}</span>
             </button>
           ))}
         </nav>
