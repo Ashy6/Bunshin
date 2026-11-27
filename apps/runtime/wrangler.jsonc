@@ -8,33 +8,8 @@
   "vars": {
     "AI_RUNTIME_ALLOW_ENV_PROVIDER_KEYS": "false"
   },
-  "containers": [
-    {
-      "class_name": "AiRuntimeContainer",
-      "scheduling_policy": "default",
-      "image": "./Dockerfile",
-      "image_build_context": "../..",
-      "instance_type": "lite",
-      "max_instances": 1,
-      "constraints": {
-        "regions": ["ENAM", "WNAM"],
-        "jurisdiction": "us"
-      }
-    }
-  ],
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "AI_RUNTIME",
-        "class_name": "AiRuntimeContainer"
-      }
-    ]
-  },
-  "exports": {
-    "AiRuntimeContainer": {
-      "type": "durable-object",
-      "storage": "sqlite"
-    }
+  "placement": {
+    "region": "aws:us-east-1"
   },
   "observability": {
     "enabled": true,

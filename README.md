@@ -18,7 +18,7 @@
 
 ## 总体架构
 
-项目有两个用户界面和一个内部模型执行服务。公开 API 仍内聚在 Web Worker，后台 API 仍内聚在 Admin Worker；`apps/runtime` 不是第三套产品或公开通用 API，只为两个 Worker 提供签名保护的 Chat、Embedding 和渠道测试能力。对能够从边缘直连的厂商可关闭 Runtime；对会拒绝 Cloudflare 普通 Worker 出口的 OpenAI 部署，固定美国区域 Runtime 是生产必需组件：
+项目有两个用户界面和一个内部模型执行服务。公开 API 仍内聚在 Web Worker，后台 API 仍内聚在 Admin Worker；`apps/runtime` 不是第三套产品或公开通用 API，只为两个 Worker 提供签名保护的 Chat、Embedding 和渠道测试能力。Runtime 通过 Placement Hint 尽量在靠近 AWS 美东一区的 Cloudflare 节点执行；它用于改善模型请求出口，但不是固定美国主机，也不承诺固定出口或厂商区域判定：
 
 ```mermaid
 flowchart LR
@@ -28,7 +28,7 @@ flowchart LR
 
     W --> D[(D1)]
     W --> X[(Vectorize)]
-    W --> I[AI Runtime\n固定区域内部服务]
+    W --> I[Model Worker\nPlacement Hint 内部服务]
     I --> L[模型厂商]
     W --> K[(KV / Cache)]
 
@@ -83,7 +83,7 @@ ai-bunshin/
 ├── apps/
 │   ├── web/                 # 公开 SSR 站点与 Public Worker API
 │   ├── admin/               # 后台、Admin Worker API、Queue Consumer
-│   └── runtime/             # 私有固定区域 AI Runtime（Node.js + Cloudflare Container）
+│   └── runtime/             # 私有 Model Worker（Service Binding + Placement Hint）
 ├── packages/
 │   ├── ai/                  # 模型渠道适配、Usage 归一化
 │   ├── crypto/              # API Key 信封加密
@@ -168,7 +168,8 @@ Agent 只有在“渠道测试成功 + 至少一份非私有资料完成索引 +
 - 日志不记录 API Key、Cookie、Authorization、完整 prompt 或私密原文。
 - 访客 IP 仅与随机访客 ID、服务端 Secret 组合生成匿名 SHA-256 哈希，用于限流和统计。
 - 自定义模型 Base URL 仅允许 HTTPS 或本地开发地址。
-- 公开站域名只负责访客访问、canonical 与 SEO，不改变模型请求的出口区域。实测普通 Worker 即使使用 Targeted Placement 到 `aws:us-east-1`，OpenAI 仍可能返回 `unsupported_country_region_territory`；AI Gateway 也不承诺改变厂商看到的出口。受此限制的部署必须使用固定美国区域 Runtime 或当地可用模型，不能把域名或 Placement 当作网络代理。系统会区分厂商 Key、Runtime/Gateway 鉴权、区域、限流、超时与 5xx，运行链路故障不会再把有效 Key 标成失效。
+- 公开站域名只负责访客访问、canonical 与 SEO，不改变模型请求的出口区域。Model Worker 使用 `placement.region = "aws:us-east-1"`，只表示运行在离该云区域网络延迟最低的 Cloudflare 节点，不等于运行在 AWS 内部，也不保证固定美国出口。系统会通过 `cf-placement`/`X-Bunshin-Runtime-Placement` 观察实际节点，并区分厂商 Key、Runtime 鉴权、区域、限流、超时与 5xx；如果厂商仍拒绝该出口，应改用当地可用模型或真正固定在支持地区的运行环境。
+- 2026-11-28 生产验收：Service Binding、三端 HMAC 与 Runtime 深度健康检查均通过，但使用后台现有 OpenAI Key 的真实 `/api/chat` 请求仍返回 `ROUTE_REGION_UNSUPPORTED`。因此当前 Placement 方案已经完成但没有解决该 OpenAI 出口限制，不能将“内部链路健康”等同于“模型厂商可用”。
 
 ## GEO 与 SEO
 
@@ -184,7 +185,7 @@ Agent 只有在“渠道测试成功 + 至少一份非私有资料完成索引 +
 
 ## 本地开发
 
-本地内容开发仍可只启动 Web/Admin 两个进程。启用固定区域模型执行链路时，再启动可选 `apps/runtime`；它不保存业务数据，也不访问 D1、R2 或 Vectorize。Web/Admin 共享 `apps/admin/.wrangler/state` 中的本地 D1 数据，Runtime 只接收签名后的模型执行请求。
+本地内容开发仍可只启动 Web/Admin 两个进程。启用独立模型执行链路时，再启动可选 `apps/runtime`；它不保存业务数据，也不访问 D1、R2 或 Vectorize。Web/Admin 共享 `apps/admin/.wrangler/state` 中的本地 D1 数据，Runtime 只接收签名后的模型执行请求。
 
 首次打开后台时会进入站长账号初始化页。密码至少 12 位；初始化完成后会生成 10 个只展示一次的离线恢复码，下载或复制保存后使用 HttpOnly 会话 Cookie 进入后台。登录页的“忘记密码”可选择离线恢复码；邮件服务配置完成后也可选择邮箱验证码。模型 API Key 输入框始终使用密码态，只显示首尾掩码和字符长度；服务端只返回 `key_preview`，密文使用 AES-256-GCM 保存，任何读取接口都不会返回原始 Key。
 
@@ -243,7 +244,7 @@ wrangler secret put CF_AIG_TOKEN --config apps/admin/wrangler.jsonc
 # 可选：启用公开 Agent 人机验证时同时设置
 wrangler secret put TURNSTILE_SITE_KEY --config apps/web/wrangler.jsonc
 wrangler secret put TURNSTILE_SECRET_KEY --config apps/web/wrangler.jsonc
-# 固定区域 Runtime 与两个业务 Worker 使用同一内部鉴权 Secret
+# Model Worker 与两个业务 Worker 使用同一内部鉴权 Secret
 wrangler secret put AI_RUNTIME_AUTH_SECRET --config apps/runtime/wrangler.jsonc
 wrangler secret put AI_RUNTIME_AUTH_SECRET --config apps/web/wrangler.jsonc
 wrangler secret put AI_RUNTIME_AUTH_SECRET --config apps/admin/wrangler.jsonc
@@ -252,11 +253,11 @@ pnpm --filter @ai-bunshin/runtime deploy
 
 模型 API Key 始终由站长在后台录入，使用 `MASTER_ENCRYPTION_KEY` 信封加密后保存在 D1；Runtime 模式不会改成平台级公共 Key。Web/Admin 只在当前服务端请求中解密，并通过私有 Service Binding 把 Key 交给 Runtime。请求体由 HMAC 完整覆盖，Runtime 不持久化、不记录也不返回 Key，浏览器始终接触不到完整密钥。
 
-Runtime 至少需要 `AI_RUNTIME_AUTH_SECRET`。同一个 Secret 同时配置到 Runtime、Web Worker 和 Admin Worker；业务调用使用 Cloudflare HTTP Service Binding，不需要公开 Runtime URL。Cloudflare Container 需要 Workers Paid 计划，当前免费计划不能部署该组件。Runtime 必须部署在固定、合规且受模型厂商支持的区域；再部署一个普通全球 Worker 并不能保证改变上游出口。完整方案见 [固定区域 AI Runtime 拆分与迁移方案](./docs/ai-runtime-architecture.md)。
+Runtime 至少需要 `AI_RUNTIME_AUTH_SECRET`。同一个 Secret 同时配置到 Runtime、Web Worker 和 Admin Worker；业务调用使用 Cloudflare HTTP Service Binding 的 `fetch()`，不需要公开 Runtime URL。Placement 只对 `fetch` 处理器生效，因此不能改成 RPC-only 入口。该方案不再依赖 Cloudflare Container 或 Workers Paid，但 Placement 只是运行位置提示，正式启用前必须用无 VPN 终端连续验证实际模型请求。完整方案见 [Placement Model Worker 拆分与迁移方案](./docs/ai-runtime-architecture.md)。
 
-Runtime 默认只接受由 Web/Admin 从 D1 解密并在 HMAC 请求体中携带的站长 Key；`AI_RUNTIME_ALLOW_ENV_PROVIDER_KEYS` 保持 `false`，避免漏传 Key 时静默切到平台账户。发布脚本先部署 Runtime，再同步三端内部 Secret、应用 D1 迁移、部署并深度验证 Admin，最后才切 Web。深度探针由独立 `DEPLOY_HEALTH_TOKEN` 保护，公网浅探针不会唤醒 Container。
+Runtime 默认只接受由 Web/Admin 从 D1 解密并在 HMAC 请求体中携带的站长 Key；`AI_RUNTIME_ALLOW_ENV_PROVIDER_KEYS` 保持 `false`，避免漏传 Key 时静默切到平台账户。发布脚本先部署 Runtime，再同步三端内部 Secret、应用 D1 迁移、部署并深度验证 Admin，最后才切 Web。深度探针由独立 `DEPLOY_HEALTH_TOKEN` 保护，公网浅探针不会执行内部签名探测。
 
-Web/Admin 的后台测试、门户 Chat、Query Embedding 和文档 Embedding 使用同一 Runtime 路由。AI Gateway 仍作为兼容回退：`env.AI.gateway("default").run(...)` 可以完成 Gateway 鉴权，但不能替代固定区域出口。完整密钥不会进入浏览器，也不会被当成 Gateway 身份令牌。
+Web/Admin 的后台测试、门户 Chat、Query Embedding 和文档 Embedding 使用同一 Runtime 路由。AI Gateway 仍作为兼容回退：`env.AI.gateway("default").run(...)` 可以完成 Gateway 鉴权，但不能提供固定区域出口。完整密钥不会进入浏览器，也不会被当成 Gateway 身份令牌。
 
 Turnstile 只有在 Site Key 与 Secret Key 同时配置时启用。前端 Token 必须由 Web Worker 调用 Cloudflare Siteverify 校验，且每次成功或失败后都会重置；它与 D1 中默认 25 次的服务端额度是两层独立保护。`cf_clearance` 是 Cloudflare WAF/Challenge 的可选凭据，不作为业务额度身份。详细方案见 [生产监控、混合 RAG 与 Turnstile](./docs/observability-rag-turnstile.md)。
 
@@ -289,7 +290,7 @@ Agent 的核心身份由服务端固定：它始终是资料所有者本人的 A
 正式部署需要：
 
 - 两个用户端 Workers：`ai-bunshin-web`、`ai-bunshin-admin`
-- 一个内部模型执行 Worker + Container：`ai-bunshin-runtime`（OpenAI 区域受限部署必需，要求 Workers Paid）
+- 一个内部模型执行 Worker：`ai-bunshin-runtime`（HTTP Service Binding + `aws:us-east-1` Placement Hint）
 - 一个 D1：`ai-bunshin`
 - 一个 R2：`ai-bunshin-assets`
 - 一个 Vectorize：`ai-bunshin-knowledge-v1`
@@ -307,7 +308,7 @@ pnpm cf:setup
 当前仓库已提供生产发布门禁。首次启用 R2 并完成资源配置后，执行：
 
 ```bash
-# OpenAI 区域受限部署先完成 Workers Paid 升级，并部署私有 Runtime
+# 先部署带 Placement Hint 的私有 Model Worker
 wrangler secret put AI_RUNTIME_AUTH_SECRET --config apps/runtime/wrangler.jsonc
 pnpm --filter @ai-bunshin/runtime deploy
 
@@ -317,11 +318,11 @@ wrangler secret put AI_RUNTIME_AUTH_SECRET --config apps/admin/wrangler.jsonc
 pnpm deploy:production
 ```
 
-脚本会先完整读取并校验本机稳定密钥，再检查 Cloudflare 登录、R2 和 Workers Paid Container 权限；Container 只读预检失败时会在上传任何 Worker 前终止。预检通过后才运行类型检查/测试/构建并部署 Runtime；只有 Runtime 成功后才同步三端内部 Secret、应用远程 D1 迁移、部署并深度验证 Admin，最后才部署和验证 Web。Runtime 部署失败时不会修改生产 D1、Web 或 Admin，避免把尚不可用的执行链路切给访客。脚本不会擅自升级付费计划。模型 API Key 仍由后台加密保存，不需要复制到部署脚本。
+脚本会先完整读取并校验本机稳定密钥，再检查 Cloudflare 登录和 R2；随后运行类型检查、测试和构建并部署 Runtime。只有 Runtime 成功后才同步三端内部 Secret、应用远程 D1 迁移、部署并深度验证 Admin，最后才部署和验证 Web。Runtime 部署失败时不会修改生产 D1、Web 或 Admin，避免把尚不可用的执行链路切给访客。模型 API Key 仍由后台加密保存，不需要复制到部署脚本。
 
 稳定应用密钥保存在本机被 Git 忽略且强制为 `0600` 的 `.deploy-secrets.json` 中。已有部署若缺失 `MASTER_ENCRYPTION_KEY`、`SESSION_SECRET` 或 `ADMIN_BOOTSTRAP_TOKEN` 会直接终止，绝不会静默生成新值；只有新增的 Runtime 鉴权和部署健康检查字段可以补齐。全新实例必须显式设置 `AI_BUNSHIN_FIRST_DEPLOY=1`，后续部署始终复用已有密钥，避免主密钥变化导致已保存的模型 API Key 无法解密。
 
-开源克隆部署或自定义域名环境可通过 `AI_BUNSHIN_WEB_ORIGIN`、`AI_BUNSHIN_ADMIN_ORIGIN` 指定发布后的健康检查 Origin；未设置时使用本仓库默认 `workers.dev` 地址。Origin 只用于部署验收，不会进入模型请求或替代 Runtime 的固定出口。
+开源克隆部署或自定义域名环境可通过 `AI_BUNSHIN_WEB_ORIGIN`、`AI_BUNSHIN_ADMIN_ORIGIN` 指定发布后的健康检查 Origin；本仓库默认使用 `https://twin-ai.online` 与 `https://admin.twin-ai.online`，避免部分网络无法访问 `workers.dev` 导致假失败。Origin 只用于部署验收，不会进入模型请求或决定 Runtime 的实际出口。
 
 `0008_operations.sql` 会创建系统配置、把已有站点的默认访客额度统一为 25 次，并回填可从 D1 版本记录确定的附件元数据；`0009_observability_rag_security.sql` 创建生产事件、告警、Queue 运行和 RAG 检索指标。部署完成后进入后台“系统设置”，填写正式公开地址并执行一次“修复历史附件元数据”，再到“生产监控”确认运行健康。
 

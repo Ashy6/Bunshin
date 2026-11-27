@@ -90,9 +90,6 @@ importers:
       '@ai-bunshin/ai':
         specifier: workspace:*
         version: link:../../packages/ai
-      '@cloudflare/containers':
-        specifier: ^0.2.0
-        version: 0.2.4
       '@hono/node-server':
         specifier: ^1.19.7
         version: 1.19.19(hono@4.13.22)
@@ -299,9 +296,6 @@ packages:
   '@babel/types@7.29.15':
     resolution: {integrity: sha512-/XKpKDakL//LZ66bq1XsZOswuqeI5MZqPLDu18o3XdkU1fNJ7bdPtzgnc4ZNS+bBGHV0FJG8jjb8SwcC3nNVQQ==}
     engines: {node: '>=6.9.0'}
-
-  '@cloudflare/containers@0.2.4':
-    resolution: {integrity: sha512-G/Wsl0EuLbSgXyr9zv7cetUO90NyinKIMZvXae/C5R5BY3XMl9ZUdplvcofylAwRZjBEUm+aUugWxIiiKQU0ZA==}
 
   '@cloudflare/kv-asset-handler@0.5.1':
     resolution: {integrity: sha512-48OysfSW3MkQY1XjkhkpPkgrEkOvgfoyHzA2eyX5wpzFpijC02uWigv3hkNdJdT3C7ybW/U17yYHXeR68pLeww==}
@@ -2292,8 +2286,6 @@ snapshots:
     dependencies:
       '@babel/helper-string-parser': 7.29.15
       '@babel/helper-validator-identifier': 7.29.7
-
-  '@cloudflare/containers@0.2.4': {}
 
   '@cloudflare/kv-asset-handler@0.5.1': {}
 

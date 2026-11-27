@@ -20,19 +20,19 @@
 
 - `direct`：Worker 直接请求兼容模型厂商。
 - `gateway`：OpenAI 原生地址由服务端改写为 Cloudflare AI Gateway URL。
-- `runtime`：通过 HMAC 请求固定区域 AI Runtime。
+- `runtime`：通过 HTTP Service Binding 和 HMAC 请求 Placement Model Worker。
 
 有效路由按以下顺序确定：
 
-1. Web/Admin 配置私有 `AI_RUNTIME` Service Binding、共享 HMAC Secret 且启用 Runtime 时，统一使用固定区域 Runtime。
+1. Web/Admin 配置私有 `AI_RUNTIME` Service Binding、共享 HMAC Secret 且启用 Runtime 时，统一使用 Placement Model Worker。
 2. 未启用 Runtime 时，渠道为 `gateway` 且存在 Worker AI binding 或 Gateway Base URL，才使用 AI Gateway。
 3. 其余兼容渠道使用直连；原生 OpenAI 在受区域限制的 Cloudflare 出口上不应依赖该回退。
 
 后台“重新测试”、门户 Chat、Query Embedding 与文档 Embedding调用完全相同的路由选择逻辑。系统不再用后台某个边缘节点的直连结果，替代访客生产路径的健康状态。
 
-Runtime 通过 HTTP Service Binding 调用，不暴露 `workers.dev` 公网入口。Web/Admin 从 D1 解密站长保存的 API Key，只在当前内部请求中把它作为 HMAC 完整覆盖的 JSON 字段交给 Runtime；Runtime 不持久化、不记录也不返回该字段。这样后台仍然保持“选择厂商并录入自己的 Key”的产品体验，同时模型请求从 Runtime 的受控区域发出。
+Runtime 通过 HTTP Service Binding 的 `fetch()` 调用，不暴露 `workers.dev` 公网入口。Web/Admin 从 D1 解密站长保存的 API Key，只在当前内部请求中把它作为 HMAC 完整覆盖的 JSON 字段交给 Runtime；Runtime 不持久化、不记录也不返回该字段。这样后台仍然保持“选择厂商并录入自己的 Key”的产品体验，同时让模型请求尽量从靠近 AWS 美东一区的 Cloudflare 节点发出。
 
-AI Gateway 仍保留为兼容路线。`env.AI.gateway("default").run(...)` 可以解决 Gateway 自身鉴权，但不会承诺改变模型厂商看到的出口区域；因此它不能替代固定区域 Runtime。普通 Worker 的 Targeted Placement 同样只是执行位置提示，不等于固定出口 IP，生产验收必须以真实模型请求为准。
+AI Gateway 仍保留为兼容路线。`env.AI.gateway("default").run(...)` 可以解决 Gateway 自身鉴权，但不会承诺改变模型厂商看到的出口区域。Model Worker 的 Placement 同样只是执行位置提示，不等于固定出口 IP，生产验收必须以真实模型请求为准。
 
 ## 3. 错误协议
 
@@ -107,7 +107,7 @@ RAG 检索与模型生成是两个阶段。BM25、本地向量、RRF 和相关�
 
 1. `PROVIDER_AUTH_INVALID`：更新 Key 或授予 `model.request` 权限。
 2. `GATEWAY_AUTH_MISCONFIGURED`：检查 Gateway 鉴权，不要先更换 OpenAI Key。
-3. `ROUTE_REGION_UNSUPPORTED`：切换 Gateway、固定区域 Runtime 或当地合规模型厂商。
+3. `ROUTE_REGION_UNSUPPORTED`：检查实际 Placement；若仍受限，切换当地可用模型厂商或真正固定在支持地区的 Runtime。
 4. 限流、超时或 5xx：观察自动恢复与生产监控；持续异常再检查厂商状态和预算。
 5. `CUSTOM_BASE_URL_DENIED`：把规范化后的完整 HTTPS Base URL（含 `/v1` 等路径）加入 Runtime 的 `AI_RUNTIME_CUSTOM_BASE_URLS` 精确白名单，重新部署 Runtime，并在后台重新验证渠道以恢复 `unavailable` 状态。
 
@@ -127,4 +127,4 @@ RAG 检索与模型生成是两个阶段。BM25、本地向量、RRF 和相关�
 - 后台录入的 Key 使用主密钥信封加密保存在 D1，只返回掩码。
 - 完整上游错误只用于服务端脱敏分类；门户只收到稳定错误码、公开文案、是否可重试与操作类型。
 - 遥测不记录 Authorization、完整 Prompt、知识片段或完整回答。
-- Gateway 与固定区域 Runtime 用于建立可控、合规的执行路径，不用于绕过模型厂商政策。
+- Gateway 与 Placement Model Worker 用于建立可控、合规的执行路径，不用于绕过模型厂商政策。

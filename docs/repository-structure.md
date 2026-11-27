@@ -5,7 +5,7 @@
 - 产品层面只有两个用户端：`web` 和 `admin`；另有一个可选内部模型执行服务 `runtime`。
 - `web` 负责公开页面、公开只读 API 和对话流。
 - `admin` 负责后台 UI、管理 API，以及 Queue 消费者。
-- `runtime` 只负责固定区域 Chat、Embedding 和渠道测试，不持有业务数据。
+- `runtime` 只负责带 Placement Hint 的 Chat、Embedding 和渠道测试，不持有业务数据。
 - 共享代码只能放入职责明确的 `packages`，禁止创建无边界的 `shared` 大杂烩。
 - Cloudflare 资源定义集中管理，开发、预览和生产环境使用独立绑定。
 
@@ -60,11 +60,11 @@ ai-bunshin/
 │       ├── vite.config.ts
 │       └── wrangler.jsonc
 │
-│   └── runtime/                     # 内部 Node.js AI Runtime
-│       ├── src/index.ts             # Container 内 Node/Hono 服务
-│       ├── src/worker.ts            # Cloudflare Container/DO 入口
-│       ├── Dockerfile
-│       ├── wrangler.jsonc           # 美国区域约束与 Container 配置
+│   └── runtime/                     # 内部 Placement Model Worker
+│       ├── src/app.ts               # Hono 内部协议与模型适配
+│       ├── src/index.ts             # 可选 Node 本地开发入口
+│       ├── src/worker.ts            # Cloudflare fetch 入口
+│       ├── wrangler.jsonc           # Service Worker 与 Placement Hint
 │       ├── .env.example
 │       └── package.json
 │
@@ -129,7 +129,7 @@ ai-bunshin/
 - 模型 Key 只存在于运行平台 Secret。
 - 不访问 D1、R2、Vectorize、Session 或访客 Cookie。
 - 预设厂商使用固定 Base URL，自定义厂商必须进入允许列表。
-- 默认以 Cloudflare Container 部署到 ENAM/WNAM 美国区域；Secret 由 Worker 注入。
+- 默认以普通 Cloudflare Worker 部署，并使用 `aws:us-east-1` Placement Hint；这不是固定区域或固定出口保证。
 - 生产内部接口使用 HMAC、时间窗和防重放校验。
 
 ## 4. 包依赖方向

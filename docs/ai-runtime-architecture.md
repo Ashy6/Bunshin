@@ -1,14 +1,14 @@
-# Bunshin 固定区域 AI Runtime 技术方案
+# Bunshin Placement Model Worker 技术方案
 
-> 文档状态：代码与 Cloudflare Container/Service Binding 部署定义已实现；当前账户尚未开通 Workers Paid，生产 Runtime 待计划升级后部署
+> 文档状态：普通 Cloudflare Worker、HTTP Service Binding 与 Placement Hint 已实现；待生产部署后执行实际出口验收
 > 适用版本：ai-bunshin 0.1.x  
-> 更新日期：2026-11-27
+> 更新日期：2026-11-28
 
 ## 1. 背景与目标
 
 Bunshin 的公开页面、内容后台、RAG 数据和限流均运行在 Cloudflare。原始实现由 Web Worker 或 Admin Worker 直接请求模型厂商。该模式部署简单，但全球边缘执行位置不等于一个可预测的固定上游出口；当模型厂商对请求区域、账号、Project 权限或网络路径有限制时，访客能够打开门户并不代表模型生成链路一定可用。
 
-本方案增加一个固定区域的 AI Runtime，把模型执行从业务 Worker 中抽离，同时保持以下公开契约不变：
+本方案增加一个独立的 Model Worker，把模型执行从业务 Worker 中抽离，并通过 Placement Hint 尽量让其靠近 AWS 美东一区执行，同时保持以下公开契约不变：
 
 - 访客仍然只访问 `POST https://twin-ai.online/api/chat`。
 - 浏览器永远不接收模型 API Key。
@@ -36,7 +36,7 @@ flowchart LR
     W --> V[(Vectorize / 本地向量)]
     W --> R[RAG 检索与 Prompt 组装]
 
-    R -->|私有 Service Binding + HMAC| AI[AI Runtime<br/>固定区域 Node.js 服务]
+    R -->|私有 HTTP Service Binding + HMAC| AI[Model Worker<br/>Placement: aws:us-east-1]
     AI -->|仅本次请求使用解密后的 Key| O[OpenAI / 其他模型厂商]
     O -->|流式回答与 Token usage| AI
     AI -->|标准 SSE| W
@@ -240,7 +240,7 @@ AI_RUNTIME_ENABLED != false
 
 灰度顺序：
 
-1. 升级 Workers Paid，部署 Runtime，但暂不部署 Web/Admin 的 Service Binding 配置。
+1. 部署 Runtime，但暂不部署 Web/Admin 的 Service Binding 配置。
 2. 为 Runtime 配置 HMAC Secret，并通过内部验收脚本检查健康状态。
 3. 使用签名脚本测试 Chat、Embedding 和渠道测试。
 4. 给 Admin Worker 配置同一个 Secret 并部署 Service Binding，验证渠道测试和一份测试文档入库。
@@ -276,19 +276,31 @@ Runtime 输出结构化日志，但只允许记录 request ID、provider ID、�
 
 ## 11. 部署
 
-### 11.1 Cloudflare Container 部署形态
+### 11.1 Cloudflare Worker + Placement Hint 部署形态
 
-仓库中的 `apps/runtime/wrangler.jsonc` 把 Node.js Runtime 打包为 Cloudflare Container，并通过 `AiRuntimeContainer` Durable Object 作为唯一入口。Container 使用 `default` 调度策略，约束到 `ENAM`/`WNAM` 且 `jurisdiction=us`，从而使模型请求从受支持的美国区域发出。Runtime Worker 关闭 `workers.dev`，仅允许 Web/Admin 的 Service Binding 调用。
+`apps/runtime/wrangler.jsonc` 将 Runtime 部署为普通 Cloudflare Worker，并配置 `placement.region = "aws:us-east-1"`。Cloudflare 会选择到该云区域网络延迟最低的数据中心运行 `fetch` 处理器；Worker 并不运行在 AWS 内部，Placement 也不保证固定国家、固定出口 IP 或模型厂商一定接受该出口。
 
-Cloudflare Containers 不包含在免费计划中，需要 Workers Paid 计划。2026-11-28 对当前账户的只读预检明确返回“Deploying containers requires the Workers Paid plan”，因此升级前不能把 Web/Admin 切到 Runtime；普通 Worker Targeted Placement 已经真实请求验证，仍会收到 OpenAI 的 `unsupported_country_region_territory`，不能作为等价替代。
+Web/Admin 必须使用 `AI_RUNTIME.fetch(...)` 的 HTTP Service Binding 调用默认 `fetch` 处理器。Cloudflare Placement 不作用于 RPC 方法或 named entrypoint，因此禁止把生产调用改成 RPC-only。Runtime 关闭 `workers.dev`，没有公开路由；Service Binding 是可达性边界，HMAC 是请求完整性与防重放边界。
 
-生产发布脚本在质量门禁和任何 Worker 上传前执行 `wrangler containers list` 只读预检。免费计划、Containers 未开通或 Wrangler 授权不足都会立即终止，并保持 D1、Admin 与 Web 不变。Cloudflare 的 Container 发布本身不是事务：Worker 代码可能先上线、镜像推送随后失败，因此不能把一次 `wrangler deploy` 的 Worker 上传当成 Runtime 已就绪；只有镜像发布、三端 Secret 同步和签名深度健康检查全部通过后，才允许 Web 切流。
+当 Placement 生效时，Cloudflare 会在传入请求中附带 `cf-placement`。Runtime 将其复制为内部响应头 `X-Bunshin-Runtime-Placement`，用于深度健康检查和日志诊断。该值只用于观察，不能被当作合规或固定区域证明。
 
-Cloudflare 已把 `default` 调度标记为 deprecated，但截至 2026-11-27，新的 `durable_object` 调度仍不支持应用级区域约束。当前选择是“固定区域优先”的有意取舍；当新策略支持区域约束时，应迁移到新应用，不能直接原地修改调度策略。
+本方案不依赖 Cloudflare Container，也不要求为了 Runtime 单独启用 Container 付费能力。它是最低改动的实验性出口方案：生产切流前必须从无 VPN 网络连续测试渠道验证、Chat 和 Embedding；如果仍返回 `unsupported_country_region_territory` 或节点漂移后失败，应选择当地可用厂商，或把相同内部协议迁移到真正固定在支持地区的运行环境。
 
-Docker 构建上下文受根目录 `.dockerignore` 保护，明确排除 `.deploy-secrets.json`、`.dev.vars*`、`.env*`、`.git`、构建产物和依赖目录。禁止删除这些规则后直接构建生产镜像。
+从旧 Container 版本升级时，Wrangler 的 declarative export lifecycle 已把 `AiRuntimeContainer` 标记为删除，从而移除仅用于转发的 Durable Object 类。该对象不承载 D1、R2、Vectorize、模型 Key 或业务数据，删除后不可恢复，也不影响站点内容与渠道配置；完成一次生产迁移后应移除失效 tombstone，避免后续发布持续警告。
 
-### 11.2 Runtime Secret
+### 11.2 生产验收结论（2026-11-28）
+
+生产部署已经确认以下环节正常：
+
+- Runtime 普通 Worker 上传成功。
+- Web/Admin 的 `AI_RUNTIME` HTTP Service Binding 生效。
+- 三端 `AI_RUNTIME_AUTH_SECRET` 同步成功。
+- Admin 深度健康检查通过签名协议探测。
+- Web 成功发布到 `twin-ai.online`。
+
+随后以公开 `/api/chat` 发起最小真实问答，模型链路返回 `ROUTE_REGION_UNSUPPORTED`。这证明 RAG/Web/Service Binding 并非当前阻塞点，实际 OpenAI 请求出口仍未被厂商接受。因此 Placement 方案保留为独立执行层，但不能被宣称为已解决 OpenAI 区域问题；若继续使用 OpenAI，需要真正固定在受支持地区的执行环境，或者切换当前部署所在地可用的模型厂商。
+
+### 11.3 Runtime Secret
 
 ```bash
 PORT=8080
@@ -306,11 +318,11 @@ wrangler secret put AI_RUNTIME_AUTH_SECRET --config apps/runtime/wrangler.jsonc
 
 其他厂商按需写入对应 Secret。站长必须确认密钥用途、目标 Cloudflare 账号和生产环境后再执行。
 
-### 11.3 Docker 本地验证
+### 11.4 本地验证与生产部署
 
 ```bash
-docker build -f apps/runtime/Dockerfile -t ai-bunshin-runtime .
-docker run --rm -p 8790:8080 --env-file apps/runtime/.env ai-bunshin-runtime
+cp apps/runtime/.env.example apps/runtime/.env
+pnpm --filter @ai-bunshin/runtime dev
 ```
 
 生产部署：
@@ -321,16 +333,16 @@ pnpm --filter @ai-bunshin/runtime deploy
 
 Runtime Worker 不提供公开 `workers.dev` URL。`/health` 和三个 `/internal/v1/*` 接口只可经 Service Binding 到达，内部接口没有有效签名时仍返回 401。
 
-### 11.4 Web/Admin Secret 与切流
+### 11.5 Web/Admin Secret 与切流
 
 ```bash
 wrangler secret put AI_RUNTIME_AUTH_SECRET --config apps/web/wrangler.jsonc
 wrangler secret put AI_RUNTIME_AUTH_SECRET --config apps/admin/wrangler.jsonc
 ```
 
-Web/Admin/Runtime 三端的 `AI_RUNTIME_AUTH_SECRET` 必须完全一致。部署脚本还会给 Web/Admin 写入独立的 `DEPLOY_HEALTH_TOKEN`；只有携带该 Header 的 `?deep=1` 探针才会唤醒 Container 并执行签名协议版本检查，公开浅健康检查不会触发 Runtime。
+Web/Admin/Runtime 三端的 `AI_RUNTIME_AUTH_SECRET` 必须完全一致。部署脚本还会给 Web/Admin 写入独立的 `DEPLOY_HEALTH_TOKEN`；只有携带该 Header 的 `?deep=1` 探针才会执行签名协议版本检查，公开浅健康检查不会调用 Runtime。
 
-首次发布必须遵循“开通 Paid → 部署 Runtime → 三端同源 Secret → 内部签名测试 → Admin 灰度 → Web 切流”的顺序。Runtime 未存在或 Secret 尚未同步时，不要部署带 Service Binding 的 Web/Admin 配置。
+首次发布必须遵循“部署 Runtime → 三端同源 Secret → 内部签名测试 → Admin 灰度 → Web 切流”的顺序。Runtime 未存在或 Secret 尚未同步时，不要部署带 Service Binding 的 Web/Admin 配置。
 
 ## 12. 本地验证
 
@@ -359,7 +371,7 @@ pnpm build
 
 ## 13. 安全与合规边界
 
-固定区域 Runtime 解决的是部署出口可预测性和模型执行隔离，不应被用于绕过模型厂商地区政策。部署区域、账号主体、支付方式和最终服务范围都必须符合厂商条款。目标访客所在地区不受某厂商支持时，应在后台选择当地可合法提供服务的模型厂商。
+Placement Model Worker 提供的是模型执行隔离和“靠近指定区域”的调度提示，不是固定出口保证，也不应被用于绕过模型厂商地区政策。部署区域、账号主体、支付方式和最终服务范围都必须符合厂商条款。目标访客所在地区不受某厂商支持时，应在后台选择当地可合法提供服务的模型厂商。
 
 ## 14. 决策记录
 

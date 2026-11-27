@@ -80,7 +80,7 @@ class ArchitectureDiagram(Flowable):
         y_top = self.height - 28 * mm
         self._box(c, 8 * mm, y_top, box_w, box_h, "访客浏览器", "只访问 twin-ai.online")
         self._box(c, 50 * mm, y_top, box_w, box_h, "Web Worker", "Turnstile / 限流 / RAG", LIGHT_BLUE)
-        self._box(c, 94 * mm, y_top, box_w, box_h, "AI Runtime", "固定区域 / HMAC", colors.HexColor("#E8F4EE"))
+        self._box(c, 94 * mm, y_top, box_w, box_h, "Model Worker", "Placement / HMAC", colors.HexColor("#E8F4EE"))
         self._box(c, 138 * mm, y_top, box_w, box_h, "模型厂商", "OpenAI / 兼容渠道")
         self._arrow(c, 39 * mm, y_top + box_h / 2, 50 * mm, y_top + box_h / 2, "POST /api/chat")
         self._arrow(c, 81 * mm, y_top + box_h / 2, 94 * mm, y_top + box_h / 2, "签名请求")
@@ -251,7 +251,7 @@ def build():
         rightMargin=right,
         topMargin=top,
         bottomMargin=bottom,
-        title="Bunshin 固定区域 AI Runtime 技术方案",
+        title="Bunshin Placement Model Worker 技术方案",
         author="ai-bunshin",
         subject="模型执行后端拆分、鉴权、迁移与部署",
     )
@@ -262,15 +262,15 @@ def build():
         Spacer(1, 22 * mm),
         Paragraph("BUNSHIN TECHNICAL DESIGN", styles["subtitle"]),
         Spacer(1, 4 * mm),
-        Paragraph("固定区域 AI Runtime<br/>拆分与迁移方案", styles["title"]),
-        Paragraph("在不迁移 D1、R2、Vectorize 和公开 API 的前提下，将 Chat、Embedding 与渠道测试抽离到固定区域模型执行层。", styles["subtitle"]),
+        Paragraph("Placement Model Worker<br/>拆分与迁移方案", styles["title"]),
+        Paragraph("在不迁移 D1、R2、Vectorize 和公开 API 的前提下，将 Chat、Embedding 与渠道测试抽离到带 Placement Hint 的内部模型执行层。", styles["subtitle"]),
         Spacer(1, 12 * mm),
         ArchitectureDiagram(content_width),
         Spacer(1, 10 * mm),
         Table(
             [
-                [Paragraph("版本", styles["small"]), Paragraph("0.1.x", styles["small"]), Paragraph("日期", styles["small"]), Paragraph("2026-11-27", styles["small"])],
-                [Paragraph("状态", styles["small"]), Paragraph("代码完成 · 待绑定固定区域平台", styles["small"]), Paragraph("范围", styles["small"]), Paragraph("Web / Admin / Runtime", styles["small"])],
+                [Paragraph("版本", styles["small"]), Paragraph("0.1.x", styles["small"]), Paragraph("日期", styles["small"]), Paragraph("2026-11-28", styles["small"])],
+                [Paragraph("状态", styles["small"]), Paragraph("已部署 · OpenAI 区域验收未通过", styles["small"]), Paragraph("范围", styles["small"]), Paragraph("Web / Admin / Runtime", styles["small"])],
             ],
             colWidths=[22 * mm, 54 * mm, 22 * mm, 58 * mm],
             style=TableStyle([

@@ -26,7 +26,7 @@ Cloudflare 当前建议新项目优先使用 Workers Static Assets，而非新�
 
 ### 2.1 API 所在位置
 
-本项目不创建公开的独立 `apps/api`。业务 API 按使用者和安全边界分别内聚在两个 Cloudflare Worker 中；可选 `apps/runtime` 只承载固定区域模型执行：
+本项目不创建公开的独立 `apps/api`。业务 API 按使用者和安全边界分别内聚在两个 Cloudflare Worker 中；可选 `apps/runtime` 只承载带 Placement Hint 的模型执行：
 
 - `apps/web/worker`：公开只读 API、搜索和 Agent 对话流。
 - `apps/admin/worker`：登录、内容管理、上传、模型配置、统计和异步任务消费者。
@@ -43,7 +43,7 @@ flowchart LR
 
     WW -->|读取已发布内容| D1[(D1)]
     WW -->|问题向量检索| VX[(Vectorize)]
-    WW -->|签名模型请求| RT[固定区域 AI Runtime]
+    WW -->|HTTP Service Binding + HMAC| RT[Placement Model Worker]
     RT -->|模型请求| LLM[模型厂商]
     WW -->|调用量事件| D1
     WW -->|限流 / 缓存| KV[(KV / Cache)]
@@ -62,7 +62,7 @@ flowchart LR
     C -.共享包.-> P
 ```
 
-`Web Worker` 和 `Admin Worker` 是两个用户端及业务权限边界；它们共用 D1/R2/Vectorize。`AI Runtime` 是可选的第三个部署单元，只持有模型 Secret，通过 HMAC 与两个 Worker 通信，不形成第三套用户产品。详细安全和迁移契约见 `ai-runtime-architecture.md`。
+`Web Worker` 和 `Admin Worker` 是两个用户端及业务权限边界；它们共用 D1/R2/Vectorize。`Model Worker` 是可选的第三个部署单元，通过 HTTP Service Binding 与 HMAC 接收当前请求所需的临时模型凭据，不形成第三套用户产品。Placement Hint 只改善调度位置，不保证固定出口。详细安全和迁移契约见 `ai-runtime-architecture.md`。
 
 ```text
 访客

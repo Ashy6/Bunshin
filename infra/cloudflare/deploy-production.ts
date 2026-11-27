@@ -104,6 +104,7 @@ async function verifyHealth(url: string, token: string) {
     try {
       const response = await fetch(url, {
           headers: { "X-Bunshin-Health-Token": token },
+          signal: AbortSignal.timeout(10_000),
         }),
         body = await response.json() as {
           ok?: boolean;
@@ -128,11 +129,11 @@ async function verifyHealth(url: string, token: string) {
 async function main() {
 const adminOrigin = (
     process.env.AI_BUNSHIN_ADMIN_ORIGIN ??
-    "https://ai-bunshin-admin.zengjx1998.workers.dev"
+    "https://admin.twin-ai.online"
   ).replace(/\/$/, ""),
   webOrigin = (
     process.env.AI_BUNSHIN_WEB_ORIGIN ??
-    "https://ai-bunshin-web.zengjx1998.workers.dev"
+    "https://twin-ai.online"
   ).replace(/\/$/, "");
 console.log("1/10 Checking Cloudflare authentication...");
 run("pnpm", ["exec", "wrangler", "whoami"]);
@@ -140,24 +141,11 @@ run("pnpm", ["exec", "wrangler", "whoami"]);
 console.log("2/10 Validating stable production secrets before any deployment...");
 const secrets = loadSecrets();
 
-console.log("3/10 Checking R2 and Workers Paid Container access...");
+console.log("3/10 Checking R2 access...");
 const buckets = run("pnpm", ["exec", "wrangler", "r2", "bucket", "list"], undefined, true);
 if (!buckets.includes("ai-bunshin-assets")) {
   throw new Error("R2 bucket ai-bunshin-assets is missing. Enable R2 in Cloudflare Dashboard, then create the bucket.");
 }
-try {
-  run(
-    "pnpm",
-    ["exec", "wrangler", "containers", "list"],
-    undefined,
-    true,
-  );
-} catch {
-  throw new Error(
-    "Cloudflare Containers is unavailable for this account. Enable the Workers Paid plan (and re-authorize Wrangler if needed) before deploying the fixed-region Runtime. No D1, Admin, or Web changes were made.",
-  );
-}
-
 console.log("4/10 Running quality gates...");
 run("pnpm", ["typecheck"]);
 run("pnpm", ["test"]);
