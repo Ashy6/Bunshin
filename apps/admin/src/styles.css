@@ -259,6 +259,14 @@ td small {
   background: #edf2f7;
   color: #426786;
 }
+.status.warning {
+  background: #fff4dc;
+  color: #8a6115;
+}
+.status.error {
+  background: #fdecec;
+  color: #a14343;
+}
 .link {
   border: 0;
   background: transparent;
@@ -294,7 +302,7 @@ td small {
   border-radius: 12px;
   padding: 19px;
 }
-.provider > div {
+.provider-head {
   display: flex;
   align-items: center;
   gap: 11px;
@@ -322,8 +330,44 @@ td small {
   color: #8d979e;
   margin: 3px 0;
 }
-.provider > div > .status {
-  margin-left: auto;
+.provider-statuses {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 16px;
+}
+.provider-runtime {
+  display: grid;
+  gap: 4px;
+  margin-top: 12px;
+  padding: 11px 12px;
+  border: 1px solid #e2e8ec;
+  border-radius: 9px;
+  background: #f7f9fa;
+  color: #63727c;
+}
+.provider-runtime strong {
+  color: #334650;
+  font-size: 12px;
+}
+.provider-runtime span,
+.provider-runtime small {
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.provider-runtime.ok {
+  border-color: #d7e8dd;
+  background: #f3f8f5;
+}
+.provider-runtime.warning {
+  border-color: #f0dfb7;
+  background: #fffaf0;
+}
+.provider-runtime.error {
+  border-color: #f0d5d5;
+  background: #fff7f7;
 }
 .provider dl {
   margin: 20px 0;

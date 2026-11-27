@@ -4,7 +4,7 @@
 
 - `apps/web`：公开访客端，无注册、无用户体系。
 - `apps/admin`：仅站长使用的后台，包含内容、RAG、模型渠道和数据统计能力。
-- `apps/runtime`：固定区域部署的内部 AI Runtime，只负责 Chat、Embedding 和渠道健康检查。
+- `apps/runtime`：通过私有 Service Binding 调用的固定区域 AI Runtime，只负责 Chat、Embedding 和渠道健康检查；Cloudflare Container 部署需要 Workers Paid。
 
 ## 文档索引
 
@@ -17,6 +17,7 @@
 - [邮箱密码重置与模型连接方案](./password-reset-and-model-connectivity.md)
 - [离线恢复码与密码重置方案](./offline-recovery-codes.md)
 - [固定区域 AI Runtime 拆分与迁移方案](./ai-runtime-architecture.md)
+- [模型执行路由、状态机与故障恢复](./provider-execution-state-machine.md)
 
 ## 已确认的产品边界
 

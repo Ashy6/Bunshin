@@ -2,8 +2,12 @@
   "$schema": "../../node_modules/wrangler/config-schema.json",
   "name": "ai-bunshin-runtime",
   "main": "src/worker.ts",
+  "workers_dev": false,
   "compatibility_date": "2026-11-27",
   "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "AI_RUNTIME_ALLOW_ENV_PROVIDER_KEYS": "false"
+  },
   "containers": [
     {
       "class_name": "AiRuntimeContainer",

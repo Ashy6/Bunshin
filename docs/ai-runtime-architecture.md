@@ -1,6 +1,6 @@
 # Bunshin 固定区域 AI Runtime 技术方案
 
-> 文档状态：代码与 Cloudflare Container 部署定义已实现，生产 Secret 待站长明确配置  
+> 文档状态：代码与 Cloudflare Container/Service Binding 部署定义已实现；当前账户尚未开通 Workers Paid，生产 Runtime 待计划升级后部署
 > 适用版本：ai-bunshin 0.1.x  
 > 更新日期：2026-11-27
 
@@ -36,8 +36,8 @@ flowchart LR
     W --> V[(Vectorize / 本地向量)]
     W --> R[RAG 检索与 Prompt 组装]
 
-    R -->|HMAC 内部请求| AI[AI Runtime<br/>固定区域 Node.js 服务]
-    AI -->|读取环境变量 Key| O[OpenAI / 其他模型厂商]
+    R -->|私有 Service Binding + HMAC| AI[AI Runtime<br/>固定区域 Node.js 服务]
+    AI -->|仅本次请求使用解密后的 Key| O[OpenAI / 其他模型厂商]
     O -->|流式回答与 Token usage| AI
     AI -->|标准 SSE| W
     W -->|流式转发| U
@@ -71,7 +71,7 @@ flowchart LR
 
 ### 3.3 AI Runtime
 
-- 根据受控 provider ID 选择环境变量中的密钥。
+- 根据受控 provider ID 选择固定厂商地址，并仅在当前请求生命周期使用调用方传入的 API Key。
 - 将统一 Chat/Embedding 请求转换为 OpenAI-compatible 请求。
 - 原样流式转发厂商 SSE，并保留 usage 事件。
 - 统一清洗上游错误，绝不输出密钥。
@@ -98,6 +98,7 @@ flowchart LR
 {
   "provider": "openai",
   "model": "gpt-5.4-mini",
+  "apiKey": "仅在私有内部请求中传输，日志与响应禁止记录",
   "messages": [
     { "role": "system", "content": "RAG Prompt" },
     { "role": "user", "content": "问题" }
@@ -137,7 +138,7 @@ flowchart LR
 
 `POST /internal/v1/providers/test`
 
-请求只包含 provider、model 和受控 Base URL。Runtime 使用自己的 Secret 发起最小测试请求，成功返回 `{ "ok": true }`。
+请求包含 provider、model、受控 Base URL 和当前后台待验证的 API Key。Runtime 发起最小测试请求，成功返回 `{ "ok": true }`。连接测试与门户问答因此验证同一份凭据和同一执行出口。
 
 ### 4.4 健康检查
 
@@ -174,22 +175,24 @@ Runtime 的验证规则：
 - 请求体超过 2 MiB 立即拒绝。
 - 不配置 CORS，不接受浏览器凭据。
 
-生产上还应在运行平台防火墙、私网或 Zero Trust 层增加第二道来源限制；HMAC 是应用层必需防线，不替代网络边界。
+生产通过 HTTP Service Binding 调用 Runtime，并关闭 `workers.dev` 公网入口；Service Binding 是第一道账户级权限边界，HMAC 是第二道应用层完整性校验。完整 JSON（包括临时明文 API Key）都参与 body hash 和签名。
 
 ## 6. Provider 和 Secret 模型
 
-Runtime 只接受以下 provider ID：
+Runtime 只接受以下 provider ID。预设地址由 Runtime 固定，不信任调用方随意指定的 Origin：
 
-| Provider ID | 默认 Base URL | Secret |
+| Provider ID | 默认 Base URL | Key 来源 |
 |---|---|---|
-| `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
-| `deepseek` | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` |
-| `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
-| `custom` | 必须出现在允许列表 | `CUSTOM_PROVIDER_API_KEY` |
+| `openai` | `https://api.openai.com/v1` | 后台录入并在 D1 信封加密保存 |
+| `deepseek` | `https://api.deepseek.com/v1` | 后台录入并在 D1 信封加密保存 |
+| `openrouter` | `https://openrouter.ai/api/v1` | 后台录入并在 D1 信封加密保存 |
+| `custom` | 必须出现在允许列表 | 后台录入并在 D1 信封加密保存 |
 
-预设厂商忽略调用方传入的 Base URL，防止将 Runtime 变成任意 URL 代理。自定义渠道必须使用 HTTPS，并且 Origin 必须出现在 `AI_RUNTIME_CUSTOM_BASE_URLS` 中。
+预设厂商忽略调用方传入的 Base URL，防止将 Runtime 变成任意 URL 代理。自定义渠道必须使用 HTTPS，并且规范化后的完整 Base URL（包括路径，不含查询和片段）必须精确出现在 `AI_RUNTIME_CUSTOM_BASE_URLS` 中。
 
-后台启用 Runtime 后不再要求输入 API Key，只保存厂商、模型、预算和 Embedding 策略。渠道列表显示 `runtime_secret`，不会返回 Secret 的前后缀。
+后台始终要求站长输入自己的 API Key。Key 使用 `MASTER_ENCRYPTION_KEY` 加密保存，列表只返回短掩码；Web/Admin 在调用 Runtime 前临时解密，通过私有绑定传递，Runtime 不写数据库、磁盘、环境变量或日志。
+
+Runtime 默认拒绝没有携带请求级 Key 的模型调用，避免静默改用另一个账户并错误标记 D1 凭据有效。仅迁移旧部署时可临时设置 `AI_RUNTIME_ALLOW_ENV_PROVIDER_KEYS=true` 使用环境变量 Key；新部署和正常生产必须保持 `false`。
 
 ## 7. RAG 完整链路
 
@@ -228,7 +231,7 @@ Chat 和 Embedding 必须一起迁移。只迁移 Chat 会留下 Query Embedding
 Worker 只有在以下条件全部满足时启用 Runtime：
 
 ```text
-AI_RUNTIME_URL 非空
+AI_RUNTIME Service Binding 或兼容 AI_RUNTIME_URL 存在
 AI_RUNTIME_AUTH_SECRET 非空
 AI_RUNTIME_ENABLED != false
 ```
@@ -237,11 +240,11 @@ AI_RUNTIME_ENABLED != false
 
 灰度顺序：
 
-1. 部署 Runtime，但不配置 Worker 的 Runtime Secret。
-2. 检查 `/health`。
+1. 升级 Workers Paid，部署 Runtime，但暂不部署 Web/Admin 的 Service Binding 配置。
+2. 为 Runtime 配置 HMAC Secret，并通过内部验收脚本检查健康状态。
 3. 使用签名脚本测试 Chat、Embedding 和渠道测试。
-4. 给 Admin Worker配置 Runtime URL/Secret，验证渠道测试和一份测试文档入库。
-5. 给 Web Worker 配置 Runtime URL/Secret，执行门户问答。
+4. 给 Admin Worker 配置同一个 Secret 并部署 Service Binding，验证渠道测试和一份测试文档入库。
+5. 给 Web Worker 配置同一个 Secret并部署 Service Binding，执行门户问答。
 6. 观察模型错误率、P95 延迟、Token 和检索命中率。
 7. 稳定后删除 D1 中不再使用的旧 Key，或保留加密记录但禁止回退。
 
@@ -254,9 +257,9 @@ AI_RUNTIME_ENABLED != false
 | Runtime DNS/连接失败 | 释放本次额度，记录 `chat_provider_error`，返回脱敏提示 |
 | Chat 流中断 | 释放额度，记录 `chat_stream_interrupted` |
 | Query Embedding 失败 | 当前请求失败；后续可增强为自动退回本地向量 |
-| Document Embedding 失败 | Queue 重试，达到上限进入 DLQ 风险状态 |
+| Document Embedding 失败 | 保留本地向量、记录 fallback，文档仍完成索引；不污染 Chat 渠道状态 |
 | 无相关资料 | 不调用模型，不消耗成功问答额度 |
-| 模型 Key 未配置 | 渠道测试失败，后台显示 Runtime Secret 未配置 |
+| 模型 Key 未录入或历史占位密文 | 渠道测试失败，后台要求重新录入，不把占位值发送给厂商 |
 | HMAC 失败/重放 | Runtime 返回 401，不触达模型厂商 |
 | 预算用尽 | Web Worker 在调用 Runtime 前拒绝请求 |
 
@@ -275,7 +278,11 @@ Runtime 输出结构化日志，但只允许记录 request ID、provider ID、�
 
 ### 11.1 Cloudflare Container 部署形态
 
-仓库中的 `apps/runtime/wrangler.jsonc` 把 Node.js Runtime 打包为 Cloudflare Container，并通过 `AiRuntimeContainer` Durable Object 作为唯一入口。Container 使用 `default` 调度策略，约束到 `ENAM`/`WNAM` 且 `jurisdiction=us`，从而使模型请求从受支持的美国区域发出。Worker Secret 在 Container 启动时注入进程环境，不写入镜像、D1 或浏览器。
+仓库中的 `apps/runtime/wrangler.jsonc` 把 Node.js Runtime 打包为 Cloudflare Container，并通过 `AiRuntimeContainer` Durable Object 作为唯一入口。Container 使用 `default` 调度策略，约束到 `ENAM`/`WNAM` 且 `jurisdiction=us`，从而使模型请求从受支持的美国区域发出。Runtime Worker 关闭 `workers.dev`，仅允许 Web/Admin 的 Service Binding 调用。
+
+Cloudflare Containers 不包含在免费计划中，需要 Workers Paid 计划。2026-11-28 对当前账户的只读预检明确返回“Deploying containers requires the Workers Paid plan”，因此升级前不能把 Web/Admin 切到 Runtime；普通 Worker Targeted Placement 已经真实请求验证，仍会收到 OpenAI 的 `unsupported_country_region_territory`，不能作为等价替代。
+
+生产发布脚本在质量门禁和任何 Worker 上传前执行 `wrangler containers list` 只读预检。免费计划、Containers 未开通或 Wrangler 授权不足都会立即终止，并保持 D1、Admin 与 Web 不变。Cloudflare 的 Container 发布本身不是事务：Worker 代码可能先上线、镜像推送随后失败，因此不能把一次 `wrangler deploy` 的 Worker 上传当成 Runtime 已就绪；只有镜像发布、三端 Secret 同步和签名深度健康检查全部通过后，才允许 Web 切流。
 
 Cloudflare 已把 `default` 调度标记为 deprecated，但截至 2026-11-27，新的 `durable_object` 调度仍不支持应用级区域约束。当前选择是“固定区域优先”的有意取舍；当新策略支持区域约束时，应迁移到新应用，不能直接原地修改调度策略。
 
@@ -286,11 +293,8 @@ Docker 构建上下文受根目录 `.dockerignore` 保护，明确排除 `.deplo
 ```bash
 PORT=8080
 AI_RUNTIME_AUTH_SECRET=<至少32字符随机值>
-OPENAI_API_KEY=<服务端Secret>
-DEEPSEEK_API_KEY=
-OPENROUTER_API_KEY=
-CUSTOM_PROVIDER_API_KEY=
-AI_RUNTIME_CUSTOM_BASE_URLS=https://example-provider.invalid
+AI_RUNTIME_ALLOW_ENV_PROVIDER_KEYS=false
+AI_RUNTIME_CUSTOM_BASE_URLS=https://example-provider.invalid/v1
 AI_RUNTIME_REQUEST_TIMEOUT_MS=60000
 ```
 
@@ -298,7 +302,6 @@ Secret 必须逐项通过 Wrangler 写入 Runtime，不能放入 `wrangler.jsonc
 
 ```bash
 wrangler secret put AI_RUNTIME_AUTH_SECRET --config apps/runtime/wrangler.jsonc
-wrangler secret put OPENAI_API_KEY --config apps/runtime/wrangler.jsonc
 ```
 
 其他厂商按需写入对应 Secret。站长必须确认密钥用途、目标 Cloudflare 账号和生产环境后再执行。
@@ -316,23 +319,18 @@ docker run --rm -p 8790:8080 --env-file apps/runtime/.env ai-bunshin-runtime
 pnpm --filter @ai-bunshin/runtime deploy
 ```
 
-Cloudflare Worker URL 只是 HMAC 保护的服务端入口，不写入门户 HTML 或公开配置。`/health` 仅报告存活；三个 `/internal/v1/*` 接口没有有效签名时返回 401。
+Runtime Worker 不提供公开 `workers.dev` URL。`/health` 和三个 `/internal/v1/*` 接口只可经 Service Binding 到达，内部接口没有有效签名时仍返回 401。
 
 ### 11.4 Web/Admin Secret 与切流
 
 ```bash
-wrangler secret put AI_RUNTIME_URL --config apps/web/wrangler.jsonc
 wrangler secret put AI_RUNTIME_AUTH_SECRET --config apps/web/wrangler.jsonc
-wrangler secret put AI_RUNTIME_ENABLED --config apps/web/wrangler.jsonc
-
-wrangler secret put AI_RUNTIME_URL --config apps/admin/wrangler.jsonc
 wrangler secret put AI_RUNTIME_AUTH_SECRET --config apps/admin/wrangler.jsonc
-wrangler secret put AI_RUNTIME_ENABLED --config apps/admin/wrangler.jsonc
 ```
 
-Web/Admin/Runtime 三端的 `AI_RUNTIME_AUTH_SECRET` 必须完全一致。
+Web/Admin/Runtime 三端的 `AI_RUNTIME_AUTH_SECRET` 必须完全一致。部署脚本还会给 Web/Admin 写入独立的 `DEPLOY_HEALTH_TOKEN`；只有携带该 Header 的 `?deep=1` 探针才会唤醒 Container 并执行签名协议版本检查，公开浅健康检查不会触发 Runtime。
 
-首次发布必须遵循“Runtime Secret → `/health` → 签名测试 → Admin 灰度 → Web 切流”的顺序。不要在 Runtime 尚未配置模型密钥时把 `AI_RUNTIME_ENABLED` 设为 `true`。
+首次发布必须遵循“开通 Paid → 部署 Runtime → 三端同源 Secret → 内部签名测试 → Admin 灰度 → Web 切流”的顺序。Runtime 未存在或 Secret 尚未同步时，不要部署带 Service Binding 的 Web/Admin 配置。
 
 ## 12. 本地验证
 
@@ -351,17 +349,17 @@ pnpm build
 1. 无签名请求返回 401。
 2. 过期签名返回 401。
 3. 重放 Request ID 返回 401。
-4. OpenAI Secret 缺失时渠道测试返回可操作错误。
+4. 请求级 OpenAI Key 缺失时渠道测试返回 `PROVIDER_KEY_MISSING`，不会静默使用环境 Key。
 5. Chat 能连续转发 SSE 和 usage。
 6. Query Embedding 返回维度正确的向量。
 7. 文档 Queue 能通过 Runtime 写入 Vectorize。
 8. 无相关资料时不调用 Runtime。
-9. Runtime 关闭后旧链路仍可回退。
+9. Runtime 明确启用但缺失时 fail-closed，不会把 Key 回退发送到不可控出口。
 10. 门户和后台不出现 Runtime URL、Key 或内部错误正文。
 
 ## 13. 安全与合规边界
 
-固定区域 Runtime 解决的是部署出口可预测性、密钥集中管理和模型执行隔离，不应被用于绕过模型厂商地区政策。部署区域、账号主体、支付方式和最终服务范围都必须符合厂商条款。目标访客所在地区不受某厂商支持时，应在后台选择当地可合法提供服务的模型厂商。
+固定区域 Runtime 解决的是部署出口可预测性和模型执行隔离，不应被用于绕过模型厂商地区政策。部署区域、账号主体、支付方式和最终服务范围都必须符合厂商条款。目标访客所在地区不受某厂商支持时，应在后台选择当地可合法提供服务的模型厂商。
 
 ## 14. 决策记录
 

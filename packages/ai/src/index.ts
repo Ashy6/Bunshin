@@ -6,14 +6,76 @@ export interface ProviderConfig {
   timeoutMs?: number;
 }
 
-export interface RuntimeProviderConfig {
-  runtimeUrl: string;
+export interface AIGatewayBinding {
+  run(
+    request: {
+      provider: string;
+      endpoint: string;
+      headers: Record<string, string>;
+      query: unknown;
+    },
+    options?: { signal?: AbortSignal },
+  ): Promise<Response>;
+}
+
+export {
+  classifyProviderError,
+  classifyUpstreamError,
+  toUpstreamProviderError,
+  UpstreamProviderError,
+  upstreamErrorCodes,
+} from "./upstream-errors";
+export type {
+  UpstreamErrorClassification,
+  UpstreamErrorCode,
+  UpstreamErrorContext,
+} from "./upstream-errors";
+export {
+  canAttemptProvider,
+  isProviderCircuitOpen,
+  nextProviderFailureState,
+  nextProviderSuccessState,
+} from "./provider-state";
+export type {
+  ProviderCredentialStatus,
+  ProviderExecutionRoute,
+  ProviderFailureClassification,
+  ProviderFailureTransition,
+  ProviderRuntimeStatus,
+  ProviderState,
+} from "./provider-state";
+
+import {
+  UpstreamProviderError,
+  toUpstreamProviderError,
+  upstreamErrorCodes,
+  type UpstreamErrorClassification,
+} from "./upstream-errors";
+
+export interface RuntimeFetcher {
+  fetch(input: Request | string | URL, init?: RequestInit): Promise<Response>;
+}
+
+type RuntimeProviderTarget =
+  | { runtimeFetcher: RuntimeFetcher; runtimeUrl?: never }
+  | { runtimeUrl: string; runtimeFetcher?: never };
+
+export type RuntimeConnectionConfig = RuntimeProviderTarget & {
   authSecret: string;
+  timeoutMs?: number;
+};
+
+export type RuntimeProviderConfig = RuntimeConnectionConfig & {
   provider: string;
   baseUrl?: string;
   model: string;
-  timeoutMs?: number;
-}
+  /**
+   * Sent only inside the HMAC-covered body. Runtime rejects an omitted key by
+   * default; the environment-key fallback exists only behind an explicit
+   * migration flag and must remain disabled in normal production.
+   */
+  apiKey?: string;
+};
 
 export type ChatMessage = {
   role: "system" | "user" | "assistant";
@@ -67,16 +129,84 @@ export async function createRuntimeSignature(input: {
   );
 }
 
+type RuntimeErrorEnvelope = {
+  error?: {
+    code?: string;
+    message?: string;
+    status?: number;
+    retryable?: boolean;
+    configInvalid?: boolean;
+    credentialInvalid?: boolean;
+    runtimeFailure?: boolean;
+  };
+  requestId?: string;
+};
+
+function redactFailureDetail(value: string) {
+  return value
+    .replace(/sk-[A-Za-z0-9_-]+/g, "[REDACTED_KEY]")
+    .replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]")
+    .slice(0, 500);
+}
+
+async function runtimeFailure(response: Response) {
+  const raw = redactFailureDetail(await response.text().catch(() => ""));
+  let envelope: RuntimeErrorEnvelope | undefined;
+  try {
+    envelope = JSON.parse(raw) as RuntimeErrorEnvelope;
+  } catch {
+    // Older Runtime deployments returned plain text. The generic classifier
+    // below keeps those deployments backwards compatible during rollout.
+  }
+  const detail = envelope?.error,
+    message = detail?.message ?? raw,
+    code = detail?.code;
+  if (
+    code &&
+    upstreamErrorCodes.includes(
+      code as (typeof upstreamErrorCodes)[number],
+    ) &&
+    typeof detail.retryable === "boolean" &&
+    typeof detail.configInvalid === "boolean" &&
+    typeof detail.credentialInvalid === "boolean" &&
+    typeof detail.runtimeFailure === "boolean"
+  ) {
+    const classification: UpstreamErrorClassification = {
+      code: code as (typeof upstreamErrorCodes)[number],
+      ...(typeof detail.status === "number"
+        ? { status: detail.status }
+        : {}),
+      retryable: detail.retryable,
+      configInvalid: detail.configInvalid,
+      credentialInvalid: detail.credentialInvalid,
+      runtimeFailure: detail.runtimeFailure,
+    };
+    return new UpstreamProviderError(
+      `AI Runtime returned ${response.status}${message ? `: ${message}` : ""}`,
+      classification,
+    );
+  }
+  return toUpstreamProviderError(
+    `AI Runtime returned ${response.status}${message ? `: ${message}` : ""}`,
+    { status: response.status, body: envelope ?? raw },
+  );
+}
+
 async function runtimeRequest(
-  config: RuntimeProviderConfig,
+  config: RuntimeConnectionConfig | RuntimeProviderConfig,
   path: string,
   payload: Record<string, unknown>,
 ) {
   const body = JSON.stringify({
-      provider: config.provider,
-      baseUrl: config.baseUrl,
-      model: config.model,
       ...payload,
+      ...("provider" in config
+        ? {
+            provider: config.provider,
+            baseUrl: config.baseUrl,
+            model: config.model,
+            apiKey: config.apiKey,
+          }
+        : {}),
     }),
     timestamp = String(Date.now()),
     requestId = crypto.randomUUID(),
@@ -88,22 +218,62 @@ async function runtimeRequest(
       requestId,
       body,
     }),
-    response = await fetch(
-      `${config.runtimeUrl.replace(/\/$/, "")}${path}`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Bunshin-Timestamp": timestamp,
-          "X-Bunshin-Request-Id": requestId,
-          "X-Bunshin-Signature": signature,
-        },
-        body,
-        signal: AbortSignal.timeout(config.timeoutMs ?? 60_000),
+    requestInit: RequestInit = {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Bunshin-Timestamp": timestamp,
+        "X-Bunshin-Request-Id": requestId,
+        "X-Bunshin-Signature": signature,
       },
-    );
-  if (!response.ok) throw await providerFailure(response, "AI Runtime");
+      body,
+      signal: AbortSignal.timeout(config.timeoutMs ?? 60_000),
+    },
+    response = config.runtimeFetcher
+      ? await config.runtimeFetcher.fetch(
+          `https://ai-runtime.internal${path}`,
+          requestInit,
+        )
+      : await fetch(
+          `${normalizeRuntimeUrl(config.runtimeUrl)}${path}`,
+          requestInit,
+        );
+  if (!response.ok) throw await runtimeFailure(response);
   return response;
+}
+
+function normalizeRuntimeUrl(value: string) {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw toUpstreamProviderError("AI Runtime transport URL is not allowed");
+  }
+  const local = ["localhost", "127.0.0.1", "::1"].includes(parsed.hostname);
+  if (
+    (parsed.protocol !== "https:" && !(local && parsed.protocol === "http:")) ||
+    parsed.username ||
+    parsed.password ||
+    parsed.search ||
+    parsed.hash
+  )
+    throw toUpstreamProviderError("AI Runtime transport URL is not allowed");
+  return `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
+}
+
+export async function testRuntimeConnection(config: RuntimeConnectionConfig) {
+  const response = await runtimeRequest(config, "/internal/v1/health", {});
+  const body = (await response.json()) as {
+    ok?: boolean;
+    service?: string;
+    protocolVersion?: number;
+  };
+  if (!body.ok || body.protocolVersion !== 1)
+    throw toUpstreamProviderError("AI Runtime health probe failed", {
+      status: 502,
+      body,
+    });
+  return body;
 }
 
 export async function createEmbeddingViaRuntime(
@@ -161,11 +331,96 @@ export interface NormalizedUsage {
   estimated: boolean;
 }
 async function providerFailure(response: Response, label: string) {
-  const detail = (await response.text().catch(() => ""))
+  const detail = redactProviderDetail(await response.text().catch(() => ""));
+  const message = `${label} returned ${response.status}${detail ? `: ${detail}` : ""}`;
+  return toUpstreamProviderError(message, {
+    status: response.status,
+    body: detail,
+  });
+}
+function redactProviderDetail(detail: string) {
+  return detail
     .replace(/sk-[A-Za-z0-9_-]+/g, "[REDACTED_KEY]")
     .replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]")
     .slice(0, 500);
-  return new Error(`${label} returned ${response.status}${detail ? `: ${detail}` : ""}`);
+}
+function bindingRequest(
+  gateway: AIGatewayBinding,
+  endpoint: string,
+  config: ProviderConfig,
+  query: Record<string, unknown>,
+) {
+  return gateway.run(
+    {
+      provider: "openai",
+      endpoint,
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      query,
+    },
+    { signal: AbortSignal.timeout(config.timeoutMs ?? 60_000) },
+  );
+}
+export async function createEmbeddingViaGateway(
+  gateway: AIGatewayBinding,
+  config: ProviderConfig,
+  texts: string[],
+) {
+  const response = await bindingRequest(gateway, "embeddings", config, {
+    model: config.model,
+    input: texts,
+  });
+  if (!response.ok)
+    throw await providerFailure(response, "AI Gateway embedding provider");
+  const body = (await response.json()) as {
+      data: Array<{ embedding: number[] }>;
+      usage?: { prompt_tokens?: number; total_tokens?: number };
+    },
+    tokens =
+      body.usage?.prompt_tokens ??
+      body.usage?.total_tokens ??
+      Math.ceil(texts.join(" ").length / 3);
+  return {
+    vectors: body.data.map((item) => item.embedding),
+    usage: {
+      inputTokens: tokens,
+      outputTokens: 0,
+      cachedTokens: 0,
+      estimated: !body.usage,
+    },
+  };
+}
+export async function streamChatViaGateway(
+  gateway: AIGatewayBinding,
+  config: ProviderConfig,
+  messages: ChatMessage[],
+) {
+  const response = await bindingRequest(gateway, "chat/completions", config, {
+    model: config.model,
+    messages,
+    stream: true,
+    stream_options: { include_usage: true },
+  });
+  if (!response.ok)
+    throw await providerFailure(response, "AI Gateway chat provider");
+  if (!response.body)
+    throw new Error("AI Gateway chat provider returned an empty response body");
+  return response;
+}
+export async function testChatViaGateway(
+  gateway: AIGatewayBinding,
+  config: ProviderConfig,
+) {
+  const response = await bindingRequest(gateway, "chat/completions", config, {
+    model: config.model,
+    messages: [{ role: "user", content: "Reply with OK." }],
+    stream: false,
+  });
+  if (!response.ok)
+    throw await providerFailure(response, "AI Gateway chat provider");
+  return true;
 }
 export async function createEmbedding(config: ProviderConfig, texts: string[]) {
   const response = await fetch(
@@ -173,6 +428,7 @@ export async function createEmbedding(config: ProviderConfig, texts: string[]) {
     {
       method: "POST",
       headers: providerHeaders(config),
+      redirect: "error",
       body: JSON.stringify({ model: config.model, input: texts }),
       signal: AbortSignal.timeout(config.timeoutMs ?? 60_000),
     },
@@ -206,6 +462,7 @@ export async function streamChat(
     {
       method: "POST",
       headers: providerHeaders(config),
+      redirect: "error",
       body: JSON.stringify({
         model: config.model,
         messages,
@@ -227,6 +484,7 @@ export async function testChatConnection(config: ProviderConfig) {
     {
       method: "POST",
       headers: providerHeaders(config),
+      redirect: "error",
       body: JSON.stringify({
         model: config.model,
         messages: [{ role: "user", content: "Reply with OK." }],
@@ -236,10 +494,14 @@ export async function testChatConnection(config: ProviderConfig) {
     },
   );
   if (!response.ok) {
-    const detail = (await response.text()).slice(0, 300);
-    throw new Error(
-      `模型渠道返回 ${response.status}${detail ? `：${detail}` : ""}`,
-    );
+    const detail = redactProviderDetail(await response.text().catch(() => ""))
+      .slice(0, 300);
+    const message =
+      `模型渠道返回 ${response.status}${detail ? `：${detail}` : ""}`;
+    throw toUpstreamProviderError(message, {
+      status: response.status,
+      body: detail,
+    });
   }
   return true;
 }

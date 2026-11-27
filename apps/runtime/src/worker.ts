@@ -7,6 +7,7 @@ interface Env {
   DEEPSEEK_API_KEY?: string;
   OPENROUTER_API_KEY?: string;
   CUSTOM_PROVIDER_API_KEY?: string;
+  AI_RUNTIME_ALLOW_ENV_PROVIDER_KEYS?: string;
   AI_RUNTIME_CUSTOM_BASE_URLS?: string;
   AI_RUNTIME_REQUEST_TIMEOUT_MS?: string;
 }
@@ -32,6 +33,8 @@ export class AiRuntimeContainer extends Container<Env> {
       ...(env.CUSTOM_PROVIDER_API_KEY
         ? { CUSTOM_PROVIDER_API_KEY: env.CUSTOM_PROVIDER_API_KEY }
         : {}),
+      AI_RUNTIME_ALLOW_ENV_PROVIDER_KEYS:
+        env.AI_RUNTIME_ALLOW_ENV_PROVIDER_KEYS ?? "false",
       ...(env.AI_RUNTIME_CUSTOM_BASE_URLS
         ? { AI_RUNTIME_CUSTOM_BASE_URLS: env.AI_RUNTIME_CUSTOM_BASE_URLS }
         : {}),
@@ -50,14 +53,51 @@ export class AiRuntimeContainer extends Container<Env> {
       JSON.stringify({
         level: "error",
         event: "runtime_container_error",
-        message: error instanceof Error ? error.message : "Unknown container error",
+        errorType: error instanceof Error ? error.name : "UnknownError",
       }),
     );
   }
 }
 
 export default {
-  fetch(request: Request, env: Env): Promise<Response> {
-    return env.AI_RUNTIME.getByName("ai-bunshin-runtime-singleton").fetch(request);
+  async fetch(request: Request, env: Env): Promise<Response> {
+    try {
+      const response = await env.AI_RUNTIME
+        .getByName("ai-bunshin-runtime-singleton")
+        .fetch(request),
+        headers = new Headers(response.headers);
+      headers.set("Cache-Control", "no-store");
+      headers.set("X-Content-Type-Options", "nosniff");
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
+    } catch {
+      return Response.json(
+        {
+          error: {
+            code: "UNKNOWN",
+            message: "AI Runtime container is unavailable",
+            retryable: true,
+            configInvalid: false,
+            credentialInvalid: false,
+            runtimeFailure: true,
+          },
+          ...(request.headers.get("X-Bunshin-Request-Id")
+            ? {
+                requestId: request.headers.get("X-Bunshin-Request-Id"),
+              }
+            : {}),
+        },
+        {
+          status: 503,
+          headers: {
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+          },
+        },
+      );
+    }
   },
 } satisfies ExportedHandler<Env>;

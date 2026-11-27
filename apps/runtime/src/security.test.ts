@@ -4,7 +4,11 @@ import { authorizeRuntimeRequest } from "./security";
 
 const secret = "runtime-secret-that-is-at-least-32-characters",
   path = "/internal/v1/chat",
-  body = JSON.stringify({ provider: "openai", model: "gpt-4.1-mini" });
+  body = JSON.stringify({
+    provider: "openai",
+    model: "gpt-4.1-mini",
+    apiKey: "provider-key-one",
+  });
 
 async function signedRequest(now: number, requestId = crypto.randomUUID()) {
   const timestamp = String(now),
@@ -49,6 +53,20 @@ describe("Runtime request authorization", () => {
         },
         body,
       }), body, path, secret, replayCache, now,
+    })).toBe(false);
+  });
+
+  it("rejects an API key changed after the body was signed", async () => {
+    const now = Date.now(), replayCache = new Map<string, number>(),
+      request = await signedRequest(now),
+      changedBody = body.replace("provider-key-one", "provider-key-two");
+    expect(await authorizeRuntimeRequest({
+      request,
+      body: changedBody,
+      path,
+      secret,
+      replayCache,
+      now,
     })).toBe(false);
   });
 });

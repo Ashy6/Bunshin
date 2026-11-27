@@ -198,27 +198,59 @@ export const chunks = sqliteTable(
     index("idx_chunks_document_id").on(t.documentId),
   ],
 );
-export const providers = sqliteTable("providers", {
-  id: text("id").primaryKey(),
-  name: text("name").notNull(),
-  kind: text("kind").notNull(),
-  baseUrl: text("base_url").notNull(),
-  encryptedApiKey: text("encrypted_api_key").notNull(),
-  chatModel: text("chat_model").notNull(),
-  embeddingModel: text("embedding_model").notNull(),
-  inputPriceMicros: integer("input_price_micros").notNull().default(0),
-  outputPriceMicros: integer("output_price_micros").notNull().default(0),
-  embeddingPriceMicros: integer("embedding_price_micros").notNull().default(0),
-  monthlyBudgetMicros: integer("monthly_budget_micros").notNull().default(0),
-  enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
-  isDefault: integer("is_default", { mode: "boolean" })
-    .notNull()
-    .default(false),
-  healthStatus: text("health_status").notNull().default("unknown"),
-  lastCheckedAt: text("last_checked_at"),
-  lastError: text("last_error"),
-  ...timestamps,
-});
+export const providers = sqliteTable(
+  "providers",
+  {
+    id: text("id").primaryKey(),
+    name: text("name").notNull(),
+    kind: text("kind").notNull(),
+    baseUrl: text("base_url").notNull(),
+    encryptedApiKey: text("encrypted_api_key").notNull(),
+    chatModel: text("chat_model").notNull(),
+    embeddingModel: text("embedding_model").notNull(),
+    inputPriceMicros: integer("input_price_micros").notNull().default(0),
+    outputPriceMicros: integer("output_price_micros").notNull().default(0),
+    embeddingPriceMicros: integer("embedding_price_micros").notNull().default(0),
+    monthlyBudgetMicros: integer("monthly_budget_micros").notNull().default(0),
+    enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+    isDefault: integer("is_default", { mode: "boolean" })
+      .notNull()
+      .default(false),
+    healthStatus: text("health_status").notNull().default("unknown"),
+    lastCheckedAt: text("last_checked_at"),
+    lastError: text("last_error"),
+    credentialStatus: text("credential_status", {
+      enum: ["unverified", "valid", "invalid"],
+    })
+      .notNull()
+      .default("unverified"),
+    runtimeStatus: text("runtime_status", {
+      enum: ["unknown", "healthy", "degraded", "circuit_open", "unavailable"],
+    })
+      .notNull()
+      .default("unknown"),
+    failureCode: text("failure_code"),
+    consecutiveFailures: integer("consecutive_failures").notNull().default(0),
+    lastSuccessAt: text("last_success_at"),
+    lastFailureAt: text("last_failure_at"),
+    circuitOpenUntil: text("circuit_open_until"),
+    stateEpoch: integer("state_epoch").notNull().default(0),
+    routeMode: text("route_mode", {
+      enum: ["direct", "gateway", "runtime"],
+    })
+      .notNull()
+      .default("direct"),
+    ...timestamps,
+  },
+  (t) => [
+    index("idx_providers_credential_status").on(t.credentialStatus),
+    index("idx_providers_runtime_circuit").on(
+      t.runtimeStatus,
+      t.circuitOpenUntil,
+    ),
+    index("idx_providers_route_enabled").on(t.routeMode, t.enabled),
+  ],
+);
 export const usageEvents = sqliteTable(
   "usage_events",
   {

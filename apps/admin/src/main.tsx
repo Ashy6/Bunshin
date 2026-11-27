@@ -877,19 +877,111 @@ type ProviderPreset = {
   embeddingModel: string;
   embeddingMode: string;
 };
+type CredentialStatus = "unverified" | "valid" | "invalid";
+type RuntimeStatus =
+  | "unknown"
+  | "healthy"
+  | "degraded"
+  | "circuit_open"
+  | "unavailable";
+type ProviderItem = {
+  id: string;
+  name: string;
+  key_preview: string;
+  chat_model: string;
+  embedding_model: string;
+  embedding_mode?: string;
+  health_status?: string;
+  credential_status?: CredentialStatus;
+  runtime_status?: RuntimeStatus;
+  failure_code?: string | null;
+  consecutive_failures?: number;
+  last_success_at?: string | null;
+  last_failure_at?: string | null;
+  circuit_open_until?: string | null;
+  execution_route?: "direct" | "gateway" | "runtime" | null;
+  last_checked_at?: string | null;
+  last_error?: string | null;
+};
+
+const credentialState = (item: ProviderItem) => {
+  const status = item.credential_status
+    ?? (item.health_status === "healthy" ? "valid" : "unverified");
+  return {
+    status,
+    label: status === "valid" ? "凭据已验证" : status === "invalid" ? "凭据无效" : "凭据待验证",
+    tone: status === "valid" ? "ok" : status === "invalid" ? "error" : "",
+  };
+};
+
+const runtimeState = (item: ProviderItem) => {
+  // The legacy health_status is the result of one admin-side test and cannot
+  // prove that the visitor production path is healthy. Keep it out of the
+  // runtime state fallback so the UI never makes that stronger claim.
+  const status = item.runtime_status ?? "unknown";
+  const labels: Record<RuntimeStatus, string> = {
+    unknown: "运行状态待探测",
+    healthy: "生产链路正常",
+    degraded: "生产链路降级",
+    circuit_open: "生产链路暂时熔断",
+    unavailable: "生产链路不可用",
+  };
+  return {
+    status,
+    label: labels[status],
+    tone: status === "healthy" ? "ok" : status === "degraded" ? "warning" : status === "unknown" ? "" : "error",
+  };
+};
+
+const failureReason = (item: ProviderItem) => {
+  const labels: Record<string, string> = {
+    RUNTIME_NOT_CONFIGURED: "固定区域 Runtime 尚未完成配置",
+    PROVIDER_AUTH_INVALID: "模型厂商凭据无效或权限不足",
+    GATEWAY_AUTH_MISCONFIGURED: "AI Gateway 鉴权配置错误",
+    RUNTIME_AUTH_MISCONFIGURED: "固定区域 Runtime 内部鉴权配置错误",
+    CUSTOM_BASE_URL_DENIED: "自定义模型地址未加入 Runtime 白名单",
+    PROVIDER_KEY_MISSING: "模型渠道缺少 API Key",
+    RUNTIME_REQUEST_INVALID: "模型渠道或模型配置不正确",
+    ROUTE_REGION_UNSUPPORTED: "模型服务拒绝了当前出口区域",
+    RATE_LIMITED: "上游限流，请稍后重试",
+    UPSTREAM_5XX: "上游模型服务暂时不可用",
+    TIMEOUT: "上游模型响应超时",
+    UNKNOWN: "模型执行链路出现临时异常",
+    legacy_error: "等待使用新状态模型重新探测",
+    invalid_api_key: "API Key 无效或已失效",
+    invalid_credentials: "API Key 无效或已失效",
+    insufficient_permissions: "API Key 缺少模型调用权限",
+    gateway_auth_failed: "AI Gateway 鉴权失败",
+    unsupported_region: "模型服务拒绝了当前出口区域",
+    unsupported_country_region_territory: "模型服务拒绝了当前出口区域",
+    rate_limited: "上游限流，请稍后重试",
+    budget_exceeded: "渠道预算或账户余额不足",
+    upstream_timeout: "上游模型响应超时",
+    upstream_unavailable: "上游模型服务暂时不可用",
+    network_error: "模型执行链路网络异常",
+  };
+  if (item.failure_code && labels[item.failure_code]) return labels[item.failure_code];
+  if (item.last_error) return item.last_error.length > 140 ? `${item.last_error.slice(0, 140)}…` : item.last_error;
+  return "尚无运行异常";
+};
+
+const executionRouteLabel = (route: ProviderItem["execution_route"]) =>
+  ({ direct: "厂商直连", gateway: "AI Gateway", runtime: "固定区域 Runtime" } as Record<string, string>)[route ?? ""] ?? "自动选择";
+
+const compactDateTime = (value?: string | null) => {
+  if (!value) return "暂无";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "暂无";
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+};
+
 function Providers() {
-  const [items, setItems] = useState<
-      Array<{
-        id: string;
-        name: string;
-        key_preview: string;
-        chat_model: string;
-        embedding_model: string;
-        embedding_mode?: string;
-        health_status?: string;
-        last_error?: string | null;
-      }>
-    >([]),
+  const [items, setItems] = useState<ProviderItem[]>([]),
     [presets, setPresets] = useState<ProviderPreset[]>([]),
     [runtimeConfigured, setRuntimeConfigured] = useState(false),
     [open, setOpen] = useState(false),
@@ -919,9 +1011,15 @@ function Providers() {
     });
     const result = (await response.json().catch(() => ({}))) as {
       error?: string;
+      action?: string;
     };
     setTestingId(null);
-    if (!response.ok) setError(result.error ?? "连接测试失败");
+    if (!response.ok)
+      setError(
+        [result.error ?? "连接测试失败", result.action]
+          .filter(Boolean)
+          .join("；"),
+      );
     await load();
   };
   const submit = async (e: React.FormEvent<HTMLFormElement>) => {
@@ -944,8 +1042,13 @@ function Providers() {
     if (!response.ok) {
       const result = (await response.json().catch(() => ({}))) as {
         error?: string;
+        action?: string;
       };
-      setError(result.error ?? "测试失败，请检查配置");
+      setError(
+        [result.error ?? "测试失败，请检查配置", result.action]
+          .filter(Boolean)
+          .join("；"),
+      );
       setSaving(false);
       return;
     }
@@ -961,7 +1064,7 @@ function Providers() {
           <p>模型渠道</p>
           <h1>
             {runtimeConfigured
-              ? "选择由 AI Runtime 托管的模型厂商"
+              ? "选择厂商，由固定区域 AI Runtime 执行"
               : "选择厂商，输入一个 API Key"}
           </h1>
         </div>
@@ -971,51 +1074,69 @@ function Providers() {
       </header>
       <div className="notice">
         {runtimeConfigured
-          ? "API Key 由固定区域 AI Runtime 的环境变量托管，管理后台不会接收或返回完整密钥。"
+          ? "API Key 仍由你录入，并在 D1 中加密保存；只有服务端会通过私有绑定交给固定区域 Runtime，浏览器不会读取完整密钥。"
           : "系统自动选择推荐模型。本地向量化不会外传简历；外部向量化必须单独授权。"}
       </div>
       <section className="provider-grid">
-        {items.map((item) => (
-          <article className="provider" key={item.id}>
-            <div>
-              <span className="provider-logo">{item.name[0]}</span>
-              <div>
-                <h2>{item.name}</h2>
-                <p>
-                  {runtimeConfigured
-                    ? "由 AI Runtime Secret 管理"
-                    : maskApiKey(item.key_preview)}
-                </p>
+        {items.map((item) => {
+          const credential = credentialState(item), runtime = runtimeState(item);
+          return (
+            <article className="provider" key={item.id}>
+              <div className="provider-head">
+                <span className="provider-logo">{item.name[0]}</span>
+                <div>
+                  <h2>{item.name}</h2>
+                  <p>{maskApiKey(item.key_preview)}</p>
+                </div>
               </div>
-              <span
-                className={`status ${item.health_status === "healthy" ? "ok" : ""}`}
+              <div className="provider-statuses" aria-label="渠道状态">
+                <span className={`status ${credential.tone}`}>{credential.label}</span>
+                <span className={`status ${runtime.tone}`}>{runtime.label}</span>
+              </div>
+              <div className={`provider-runtime ${runtime.tone}`}>
+                <strong>{runtime.label}</strong>
+                <span>
+                  {runtime.status === "healthy"
+                    ? `最近成功：${compactDateTime(item.last_success_at ?? item.last_checked_at)}`
+                    : runtime.status === "unknown"
+                      ? "等待真实问答或生产链路探测"
+                      : failureReason(item)}
+                </span>
+                {runtime.status !== "healthy" && Number(item.consecutive_failures || 0) > 0 && (
+                  <small>连续失败 {item.consecutive_failures} 次 · 最近失败 {compactDateTime(item.last_failure_at)}</small>
+                )}
+                {runtime.status === "circuit_open" && item.circuit_open_until && (
+                  <small>预计 {compactDateTime(item.circuit_open_until)} 后自动探测恢复</small>
+                )}
+              </div>
+              <dl>
+                <div>
+                  <dt>对话模型</dt>
+                  <dd>{item.chat_model}</dd>
+                </div>
+                <div>
+                  <dt>向量化</dt>
+                  <dd>
+                    {item.embedding_mode === "provider"
+                      ? item.embedding_model
+                      : "本地隐私模式"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>执行链路</dt>
+                  <dd>{executionRouteLabel(item.execution_route)}</dd>
+                </div>
+              </dl>
+              <button
+                className="secondary"
+                onClick={() => void retest(item.id)}
+                disabled={testingId === item.id}
               >
-                {item.health_status === "healthy" ? "已验证" : "待验证"}
-              </span>
-            </div>
-            <dl>
-              <div>
-                <dt>对话模型</dt>
-                <dd>{item.chat_model}</dd>
-              </div>
-              <div>
-                <dt>向量化</dt>
-                <dd>
-                  {item.embedding_mode === "provider"
-                    ? item.embedding_model
-                    : "本地隐私模式"}
-                </dd>
-              </div>
-            </dl>
-            <button
-              className="secondary"
-              onClick={() => void retest(item.id)}
-              disabled={testingId === item.id}
-            >
-              {testingId === item.id ? "测试中…" : "重新测试连接"}
-            </button>
-          </article>
-        ))}
+                {testingId === item.id ? "正在验证凭据与链路…" : "验证凭据与生产链路"}
+              </button>
+            </article>
+          );
+        })}
       </section>
       {error && !open && <div className="auth-error">{error}</div>}
       {open && (
@@ -1058,35 +1179,39 @@ function Providers() {
                   ))}
                 </select>
               </label>
-              {runtimeConfigured ? (
-                <div className="notice">
-                  密钥来源：AI Runtime 环境变量。这里只保存厂商、模型、预算和向量化策略。
+              <label>
+                API Key
+                <div className="drawer-secret-field">
+                  <input
+                    type="password"
+                    required
+                    value={key}
+                    onChange={(e) => setKey(e.target.value)}
+                    autoComplete="new-password"
+                    aria-label="API Key"
+                  />
+                  <span className="drawer-secret-mask">
+                    {key ? maskApiKey(key) : "粘贴 API Key"}
+                  </span>
+                  <span className="drawer-secret-count">{key.length} 字符</span>
                 </div>
-              ) : (
-                <label>
-                  API Key
-                  <div className="drawer-secret-field">
-                    <input
-                      type="password"
-                      required
-                      value={key}
-                      onChange={(e) => setKey(e.target.value)}
-                      autoComplete="new-password"
-                      aria-label="API Key"
-                    />
-                    <span className="drawer-secret-mask">
-                      {key ? maskApiKey(key) : "粘贴 API Key"}
-                    </span>
-                    <span className="drawer-secret-count">{key.length} 字符</span>
-                  </div>
-                  <small>完整 Key 只在本次提交中使用，保存后不可读取。</small>
-                </label>
-              )}
+                <small>
+                  {runtimeConfigured
+                    ? "完整 Key 加密保存在 D1，只在服务端内部传给 Runtime；保存后不可读取。"
+                    : "完整 Key 只在本次提交中使用，保存后不可读取。"}
+                </small>
+              </label>
               {presetId === "custom" && (
                 <>
                   <label>
                     Base URL
                     <input name="baseUrl" type="url" required />
+                    {runtimeConfigured && (
+                      <small>
+                        该 HTTPS 地址还必须加入 Runtime 的
+                        AI_RUNTIME_CUSTOM_BASE_URLS 精确白名单。
+                      </small>
+                    )}
                   </label>
                   <label>
                     Chat 模型

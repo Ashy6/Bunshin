@@ -152,6 +152,117 @@ function renderCitedSources(container, items, answerText) {
   renderSources(container, items.filter((item) => cited.has(Number(item.index))));
 }
 
+function parseSseEvent(eventText) {
+  const raw = eventText
+    .replace(/\r/g, "")
+    .split("\n")
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trimStart())
+    .join("\n");
+  if (!raw || raw === "[DONE]") return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function responseErrorMessage(payload, fallback) {
+  if (!payload || typeof payload !== "object") return fallback;
+  const nested = payload.error;
+  if (typeof nested === "string" && nested.trim()) return nested;
+  if (nested && typeof nested === "object" && typeof nested.message === "string")
+    return nested.message;
+  if (typeof payload.message === "string" && payload.message.trim()) return payload.message;
+  if (typeof payload.text === "string" && payload.text.trim()) return payload.text;
+  return fallback;
+}
+
+function httpErrorFallback(status) {
+  if (status === 401 || status === 403) return "当前访问未通过验证，请刷新页面后重试。";
+  if (status === 429) return "请求过于频繁或今日次数已用完，请稍后再试。";
+  if (status >= 500) return "模型服务暂时不可用，请稍后再试。";
+  return "暂时无法回答，请稍后再试。";
+}
+
+async function readErrorResponse(response) {
+  const fallback = httpErrorFallback(response.status);
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.includes("text/event-stream")) {
+    const body = await response.text().catch(() => "");
+    const events = body
+      .replace(/\r/g, "")
+      .split("\n\n")
+      .map(parseSseEvent)
+      .filter(Boolean);
+    const errorEvent = events.find((event) => event.type === "error");
+    const doneEvent = events.findLast?.((event) => event.type === "done")
+      || [...events].reverse().find((event) => event.type === "done");
+    return {
+      message: responseErrorMessage(errorEvent, fallback),
+      remaining: Number.isFinite(doneEvent?.remaining) ? doneEvent.remaining : null,
+    };
+  }
+  if (contentType.includes("application/json")) {
+    const payload = await response.json().catch(() => null);
+    return { message: responseErrorMessage(payload, fallback), remaining: null };
+  }
+  const text = await response.text().catch(() => "");
+  return {
+    message: contentType.startsWith("text/plain") && text.trim() && text.length < 300
+      ? text.trim()
+      : fallback,
+    remaining: null,
+  };
+}
+
+function updateRemainingQuota(value, quotaElement = document.querySelector("#agent-quota")) {
+  if (!Number.isFinite(value)) return;
+  remainingCount = value;
+  if (quotaElement) quotaElement.textContent = `今日剩余 ${remainingCount} 次`;
+}
+
+async function consumeChatStream(response, answerElement, sourcesElement, quotaElement) {
+  answerElement.textContent = "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "", answerText = "", pendingSources = [], streamError = null;
+  const applyEvent = (data) => {
+    if (!data || typeof data !== "object") return;
+    if (data.type === "delta" && typeof data.text === "string") {
+      answerText += data.text;
+      answerElement.innerHTML = renderAnswer(answerText);
+    }
+    if (data.type === "error") {
+      const message = responseErrorMessage(data, "模型响应中断，请稍后重试。");
+      answerText += `${answerText ? "\n\n" : ""}${message}`;
+      answerElement.innerHTML = renderAnswer(answerText);
+      streamError = {
+        code: typeof data.code === "string" ? data.code : "UNKNOWN",
+        retryable: data.retryable !== false,
+        action: typeof data.action === "string" ? data.action : "retry",
+      };
+    }
+    if (data.type === "sources") pendingSources = Array.isArray(data.items) ? data.items : [];
+    if (data.type === "done") {
+      updateRemainingQuota(data.remaining, quotaElement);
+      if (sourcesElement) renderCitedSources(sourcesElement, pendingSources, answerText);
+    }
+  };
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true }).replace(/\r/g, "");
+    const events = buffer.split("\n\n");
+    buffer = events.pop() || "";
+    for (const eventText of events) applyEvent(parseSseEvent(eventText));
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) applyEvent(parseSseEvent(buffer));
+  if (!answerText) answerElement.textContent = "模型没有返回有效内容，请稍后重试。";
+  return { error: streamError };
+}
+
 function setAvailability(status) {
   agentReady = Boolean(status.ready);
   remainingCount = Number(status.remaining || 0);
@@ -170,12 +281,20 @@ function setAvailability(status) {
       : status.reason || "Agent 尚未就绪";
   }
 }
-fetch("/api/agent/status")
-  .then((response) => response.json())
-  .then((status) => { setAvailability(status); renderTurnstile(status, form); })
-  .catch(() => {
+async function refreshAvailability() {
+  try {
+    const response = await fetch("/api/agent/status", { cache: "no-store" });
+    if (!response.ok) throw new Error("Agent status unavailable");
+    const status = await response.json();
+    setAvailability(status);
+    renderTurnstile(status, form);
+    return status;
+  } catch {
     if (statusText) statusText.textContent = "Agent 状态读取失败";
-  });
+    return null;
+  }
+}
+refreshAvailability();
 
 document.querySelectorAll(".suggestions button").forEach((button) =>
   button.addEventListener("click", () => {
@@ -210,46 +329,19 @@ form?.addEventListener("submit", async (event) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message, turnstileToken: turnstileToken || undefined }),
     });
-    if (!response.ok || !response.body) {
-      const result = await response.json().catch(() => ({}));
-      answer.textContent = result.error || "暂时无法回答，请稍后再试。";
+    if (!response.ok) {
+      const result = await readErrorResponse(response);
+      answer.textContent = result.message;
+      updateRemainingQuota(result.remaining, quotaText);
+      await refreshAvailability();
       return;
     }
-    answer.textContent = "";
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "", answerText = "", pendingSources = [];
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const events = buffer.split("\n\n");
-      buffer = events.pop() || "";
-      for (const eventText of events) {
-        const line = eventText
-          .split("\n")
-          .find((entry) => entry.startsWith("data: "));
-        if (!line) continue;
-        const data = JSON.parse(line.slice(6));
-        if (data.type === "delta") {
-          answerText += data.text;
-          answer.innerHTML = renderAnswer(answerText);
-        }
-        if (data.type === "error") {
-          answerText += `\n\n${data.text}`;
-          answer.innerHTML = renderAnswer(answerText);
-        }
-        if (data.type === "sources") pendingSources = Array.isArray(data.items) ? data.items : [];
-        if (data.type === "done" && Number.isFinite(data.remaining)) {
-          remainingCount = data.remaining;
-          if (quotaText)
-            quotaText.textContent = `今日剩余 ${remainingCount} 次`;
-        }
-        if (data.type === "done" && sources) renderCitedSources(sources, pendingSources, answerText);
-      }
-    }
+    if (!response.body) throw new Error("Response body unavailable");
+    const result = await consumeChatStream(response, answer, sources, quotaText);
+    if (result.error) await refreshAvailability();
   } catch {
     answer.textContent = "网络连接中断，请稍后重新提问。";
+    await refreshAvailability();
   } finally {
     sending = false;
     resetTurnstile(form);
@@ -380,42 +472,43 @@ async function submitDynamicQuestion(dynamicForm) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message, turnstileToken: turnstileToken || undefined }),
     });
-    if (!response.ok || !response.body) {
-      const result = await response.json().catch(() => ({}));
-      dynamicAnswer.textContent = result.error || "暂时无法回答，请稍后再试。";
+    if (!response.ok) {
+      const result = await readErrorResponse(response);
+      dynamicAnswer.textContent = result.message;
+      updateRemainingQuota(result.remaining, document.querySelector("#agent-quota"));
+      await refreshDynamicAvailability(dynamicForm);
       return;
     }
-    dynamicAnswer.textContent = "";
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "", answerText = "", pendingSources = [];
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const events = buffer.split("\n\n");
-      buffer = events.pop() || "";
-      for (const eventText of events) {
-        const line = eventText.split("\n").find((entry) => entry.startsWith("data: "));
-        if (!line) continue;
-        const data = JSON.parse(line.slice(6));
-        if (data.type === "delta") { answerText += data.text; dynamicAnswer.innerHTML = renderAnswer(answerText); }
-        if (data.type === "error") { answerText += `\n\n${data.text}`; dynamicAnswer.innerHTML = renderAnswer(answerText); }
-        if (data.type === "sources") pendingSources = Array.isArray(data.items) ? data.items : [];
-        if (data.type === "done" && Number.isFinite(data.remaining)) {
-          remainingCount = data.remaining;
-          const dynamicQuota = document.querySelector("#agent-quota");
-          if (dynamicQuota) dynamicQuota.textContent = `今日剩余 ${remainingCount} 次`;
-        }
-        if (data.type === "done" && dynamicSources) renderCitedSources(dynamicSources, pendingSources, answerText);
-      }
-    }
+    if (!response.body) throw new Error("Response body unavailable");
+    const result = await consumeChatStream(
+      response,
+      dynamicAnswer,
+      dynamicSources,
+      document.querySelector("#agent-quota"),
+    );
+    if (result.error) await refreshDynamicAvailability(dynamicForm);
   } catch {
     dynamicAnswer.textContent = "网络连接中断，请稍后重新提问。";
+    await refreshDynamicAvailability(dynamicForm);
   } finally {
     sending = false;
     resetTurnstile(dynamicForm);
     if (dynamicSubmit?.isConnected) dynamicSubmit.disabled = !agentReady || remainingCount <= 0 || (turnstileRequired && !turnstileToken);
+  }
+}
+
+async function refreshDynamicAvailability(dynamicForm) {
+  try {
+    const response = await fetch("/api/agent/status", { cache: "no-store" });
+    if (!response.ok) throw new Error("Agent status unavailable");
+    const status = await response.json();
+    applyDynamicAvailability(status, dynamicForm);
+    renderTurnstile(status, dynamicForm);
+    return status;
+  } catch {
+    const dynamicStatus = document.querySelector("#agent-status");
+    if (dynamicStatus) dynamicStatus.textContent = "Agent 状态读取失败";
+    return null;
   }
 }
 
@@ -425,13 +518,7 @@ function bindDynamicAgentPage() {
   agentReady = false;
   remainingCount = 0;
   sending = false;
-  fetch("/api/agent/status")
-    .then((response) => response.json())
-    .then((status) => { applyDynamicAvailability(status, dynamicForm); renderTurnstile(status, dynamicForm); })
-    .catch(() => {
-      const dynamicStatus = document.querySelector("#agent-status");
-      if (dynamicStatus) dynamicStatus.textContent = "Agent 状态读取失败";
-    });
+  void refreshDynamicAvailability(dynamicForm);
   dynamicForm.addEventListener("submit", (event) => {
     event.preventDefault();
     void submitDynamicQuestion(dynamicForm);

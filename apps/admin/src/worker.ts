@@ -5,11 +5,19 @@ import {
   type EncryptedSecret,
 } from "@ai-bunshin/crypto";
 import {
+  canAttemptProvider,
+  classifyProviderError,
   createEmbedding,
+  createEmbeddingViaGateway,
   createEmbeddingViaRuntime,
+  nextProviderFailureState,
   resolveProviderBaseUrl,
   testChatConnection,
+  testChatViaGateway,
   testChatViaRuntime,
+  testRuntimeConnection,
+  type ProviderExecutionRoute,
+  type ProviderState,
 } from "@ai-bunshin/ai";
 import { bm25Search, chunkText, cosineSimilarity, createLocalEmbedding, reciprocalRankFusion, rerankHybrid } from "@ai-bunshin/rag";
 import { extractText, getDocumentProxy } from "unpdf";
@@ -34,6 +42,8 @@ import {
 } from "./auth";
 
 type Env = {
+  AI?: Ai;
+  AI_RUNTIME?: Fetcher;
   DB: D1Database;
   ASSETS_BUCKET: R2Bucket;
   VECTORIZE: VectorizeIndex;
@@ -47,6 +57,7 @@ type Env = {
   AI_RUNTIME_URL?: string;
   AI_RUNTIME_AUTH_SECRET?: string;
   AI_RUNTIME_ENABLED?: string;
+  DEPLOY_HEALTH_TOKEN?: string;
   PASSWORD_RESET_FROM_EMAIL?: string;
   EMAIL?: {
     send(message: {
@@ -108,14 +119,222 @@ const providerPresets = {
   },
 } as const;
 function runtimeEnabled(env: Env) {
+  if (env.AI_RUNTIME_ENABLED === "false") return false;
+  if (env.AI_RUNTIME_ENABLED === "true") return true;
   return Boolean(
-    env.AI_RUNTIME_URL &&
-      env.AI_RUNTIME_AUTH_SECRET &&
-      env.AI_RUNTIME_ENABLED !== "false",
+    (env.AI_RUNTIME || env.AI_RUNTIME_URL) && env.AI_RUNTIME_AUTH_SECRET,
   );
 }
-function runtimeProviderId(provider: { preset_id?: string | null; kind: string }) {
-  return provider.preset_id || (provider.kind === "openai" ? "openai" : "custom");
+function runtimeTransport(env: Env) {
+  if (env.AI_RUNTIME) return { runtimeFetcher: env.AI_RUNTIME } as const;
+  if (env.AI_RUNTIME_URL) return { runtimeUrl: env.AI_RUNTIME_URL } as const;
+  throw new Error("AI Runtime transport unavailable");
+}
+function runtimeAuthSecret(env: Env) {
+  if (!env.AI_RUNTIME_AUTH_SECRET || env.AI_RUNTIME_AUTH_SECRET.length < 32)
+    throw new Error("AI Runtime authentication is not configured");
+  return env.AI_RUNTIME_AUTH_SECRET;
+}
+function runtimeConfigurationReady(env: Env) {
+  return Boolean(
+    (env.AI_RUNTIME || env.AI_RUNTIME_URL) &&
+      env.AI_RUNTIME_AUTH_SECRET &&
+      env.AI_RUNTIME_AUTH_SECRET.length >= 32,
+  );
+}
+function usableProviderKey(value: string) {
+  if (!value.trim() || value.startsWith("runtime:"))
+    throw new Error("Provider API key is not configured");
+  return value;
+}
+function knownProviderFromBaseUrl(baseUrl: string) {
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase();
+    if (host === "api.openai.com") return "openai";
+    if (host === "api.deepseek.com") return "deepseek";
+    if (host === "openrouter.ai") return "openrouter";
+  } catch {}
+  return null;
+}
+function runtimeProviderId(provider: {
+  preset_id?: string | null;
+  kind: string;
+  base_url: string;
+}) {
+  return knownProviderFromBaseUrl(provider.base_url) ||
+    provider.preset_id ||
+    (provider.kind === "openai" ? "openai" : "custom");
+}
+type ProviderRuntimeRow = {
+  id: string;
+  kind: string;
+  preset_id: string | null;
+  base_url: string;
+  credential_status: "unverified" | "valid" | "invalid";
+  runtime_status: "unknown" | "healthy" | "degraded" | "circuit_open" | "unavailable";
+  failure_code: string | null;
+  consecutive_failures: number;
+  last_failure_at: string | null;
+  circuit_open_until: string | null;
+  route_mode: ProviderExecutionRoute;
+};
+function providerState(provider: ProviderRuntimeRow): ProviderState {
+  return {
+    credentialStatus: provider.credential_status,
+    runtimeStatus: provider.runtime_status,
+    consecutiveFailures: provider.consecutive_failures,
+    lastFailureAt: provider.last_failure_at,
+    circuitOpenUntil: provider.circuit_open_until,
+  };
+}
+function providerExecutionRoute(
+  env: Env,
+  provider: Pick<ProviderRuntimeRow, "route_mode" | "base_url">,
+): ProviderExecutionRoute {
+  if (
+    runtimeEnabled(env) ||
+    (provider.route_mode === "runtime" && env.AI_RUNTIME_ENABLED !== "false")
+  )
+    return "runtime";
+  if (
+    provider.route_mode === "gateway" &&
+    (env.AI || env.CF_AIG_OPENAI_BASE_URL) &&
+    new URL(provider.base_url).hostname === "api.openai.com"
+  )
+    return "gateway";
+  return "direct";
+}
+async function providerRequestBaseUrl(
+  env: Env,
+  provider: Pick<ProviderRuntimeRow, "base_url">,
+  route: ProviderExecutionRoute,
+) {
+  if (route !== "gateway") return provider.base_url;
+  return resolveProviderBaseUrl(
+    provider.base_url,
+    env.CF_AIG_OPENAI_BASE_URL,
+  );
+}
+function providerFailurePresentation(code: string) {
+  switch (code) {
+    case "RUNTIME_NOT_CONFIGURED":
+      return { message: "固定区域模型执行服务尚未完成配置", action: "请检查 Runtime 私有绑定与共享鉴权密钥" };
+    case "PROVIDER_AUTH_INVALID":
+      return { message: "API Key 无效、已撤销或缺少模型调用权限", action: "请更新 API Key，并确认包含 model.request 权限" };
+    case "GATEWAY_AUTH_MISCONFIGURED":
+      return { message: "Cloudflare AI Gateway 鉴权配置不正确", action: "请检查 Gateway Token 与网关鉴权设置；无需更换模型 API Key" };
+    case "RUNTIME_AUTH_MISCONFIGURED":
+      return { message: "固定区域 Runtime 内部鉴权配置不一致", action: "请把同一个 AI_RUNTIME_AUTH_SECRET 同步到 Runtime、Web 和 Admin" };
+    case "CUSTOM_BASE_URL_DENIED":
+      return { message: "自定义模型地址尚未加入 Runtime 白名单", action: "请把规范化后的 HTTPS Base URL 加入 AI_RUNTIME_CUSTOM_BASE_URLS，再重新部署 Runtime" };
+    case "PROVIDER_KEY_MISSING":
+      return { message: "模型渠道没有可用的 API Key", action: "请重新录入并保存 API Key" };
+    case "RUNTIME_REQUEST_INVALID":
+      return { message: "Runtime 请求中的渠道或模型配置不正确", action: "请检查模型名称、厂商与 Base URL" };
+    case "ROUTE_REGION_UNSUPPORTED":
+      return { message: "当前模型执行出口不在厂商支持区域", action: "请检查 Gateway 或固定区域 Runtime，API Key 无需重新录入" };
+    case "RATE_LIMITED":
+      return { message: "模型渠道触发限流", action: "稍后重试，或检查厂商账户配额" };
+    case "TIMEOUT":
+      return { message: "模型渠道响应超时", action: "稍后重试；连续失败会自动短暂熔断" };
+    case "UPSTREAM_5XX":
+      return { message: "模型厂商服务异常", action: "稍后重试；成功后系统会自动恢复" };
+    default:
+      return { message: "模型执行链路暂时不可用", action: "请查看生产监控中的 trace 与错误代码后重试" };
+  }
+}
+async function beginProviderOperation(env: Env, providerId: string) {
+  const row = await env.DB.prepare(
+    "UPDATE providers SET state_epoch=state_epoch+1 WHERE id=? RETURNING state_epoch",
+  ).bind(providerId).first<{ state_epoch: number }>();
+  if (!row) throw new Error("Provider state is unavailable");
+  return row.state_epoch;
+}
+async function markProviderSuccess(
+  env: Env,
+  providerId: string,
+  stateEpoch: number,
+) {
+  const now = new Date().toISOString();
+  const row = await env.DB.prepare(
+    "UPDATE providers SET credential_status='valid',runtime_status='healthy',failure_code=NULL,consecutive_failures=0,last_success_at=?,circuit_open_until=NULL,health_status='healthy',last_checked_at=?,last_error=NULL,updated_at=? WHERE id=? AND state_epoch=? RETURNING credential_status,runtime_status,failure_code",
+  ).bind(now, now, now, providerId, stateEpoch).first<{
+    credential_status: ProviderRuntimeRow["credential_status"];
+    runtime_status: ProviderRuntimeRow["runtime_status"];
+    failure_code: string | null;
+  }>();
+  return row ?? env.DB.prepare(
+    "SELECT credential_status,runtime_status,failure_code FROM providers WHERE id=?",
+  ).bind(providerId).first<{
+    credential_status: ProviderRuntimeRow["credential_status"];
+    runtime_status: ProviderRuntimeRow["runtime_status"];
+    failure_code: string | null;
+  }>();
+}
+async function markProviderFailure(
+  env: Env,
+  providerId: string,
+  error: unknown,
+  stateEpoch: number,
+) {
+  const classification = classifyProviderError(error),
+    presentation = providerFailurePresentation(classification.code),
+    now = new Date().toISOString(),
+    circuitUntil = new Date(Date.now() + 60_000).toISOString(),
+    row = await env.DB.prepare(`
+      UPDATE providers SET
+        credential_status=CASE WHEN ?1=1 THEN 'invalid' ELSE credential_status END,
+        runtime_status=CASE
+          WHEN ?2=1 AND (CASE WHEN last_failure_at IS NOT NULL AND julianday(?3)-julianday(last_failure_at) BETWEEN 0 AND 5.0/1440.0 THEN consecutive_failures+1 ELSE 1 END)>=3 THEN 'circuit_open'
+          WHEN ?4=1 THEN 'unavailable'
+          ELSE 'degraded'
+        END,
+        failure_code=?5,
+        consecutive_failures=CASE WHEN last_failure_at IS NOT NULL AND julianday(?3)-julianday(last_failure_at) BETWEEN 0 AND 5.0/1440.0 THEN consecutive_failures+1 ELSE 1 END,
+        last_failure_at=?3,
+        circuit_open_until=CASE WHEN ?2=1 AND (CASE WHEN last_failure_at IS NOT NULL AND julianday(?3)-julianday(last_failure_at) BETWEEN 0 AND 5.0/1440.0 THEN consecutive_failures+1 ELSE 1 END)>=3 THEN ?6 ELSE NULL END,
+        health_status='error',last_checked_at=?3,last_error=?7,updated_at=?3
+      WHERE id=?8 AND state_epoch=?9
+      RETURNING credential_status,runtime_status,failure_code,consecutive_failures,last_failure_at,circuit_open_until
+    `).bind(
+      classification.credentialInvalid ? 1 : 0,
+      classification.retryable ? 1 : 0,
+      now,
+      classification.configInvalid || !classification.retryable ? 1 : 0,
+      classification.code,
+      circuitUntil,
+      presentation.message,
+      providerId,
+      stateEpoch,
+    ).first<{
+      credential_status: ProviderRuntimeRow["credential_status"];
+      runtime_status: ProviderRuntimeRow["runtime_status"];
+      failure_code: string | null;
+      consecutive_failures: number;
+      last_failure_at: string | null;
+      circuit_open_until: string | null;
+    }>(),
+    current = row ?? await env.DB.prepare(
+      "SELECT credential_status,runtime_status,failure_code,consecutive_failures,last_failure_at,circuit_open_until FROM providers WHERE id=?",
+    ).bind(providerId).first<{
+      credential_status: ProviderRuntimeRow["credential_status"];
+      runtime_status: ProviderRuntimeRow["runtime_status"];
+      failure_code: string | null;
+      consecutive_failures: number;
+      last_failure_at: string | null;
+      circuit_open_until: string | null;
+    }>(),
+    next = current
+      ? {
+          credentialStatus: current.credential_status,
+          runtimeStatus: current.runtime_status,
+          failureCode: current.failure_code ?? classification.code,
+          consecutiveFailures: current.consecutive_failures,
+          lastFailureAt: current.last_failure_at ?? now,
+          circuitOpenUntil: current.circuit_open_until,
+        }
+      : nextProviderFailureState({}, classification, new Date(now));
+  return { classification, next, presentation };
 }
 const defaultAgentConfig = {
   enabled: true,
@@ -215,18 +434,6 @@ function parseObservabilityConfig(value?: string | null) {
   }
 }
 async function recordAdminTelemetry(env:Env,event:{eventType:string;severity?:"info"|"warning"|"error"|"critical";route?:string;scenario?:string;durationMs?:number;statusCode?:number;traceId?:string;detail?:Record<string,unknown>}){const traceId=event.traceId??crypto.randomUUID();try{await env.DB.prepare("INSERT INTO observability_events (id,service,event_type,severity,route,scenario,duration_ms,status_code,trace_id,detail_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(),"admin",event.eventType,event.severity??"info",event.route??null,event.scenario??null,event.durationMs??0,event.statusCode??0,traceId,JSON.stringify(event.detail??{}),new Date().toISOString()).run()}catch(error){console.error("telemetry_write_failed",error)}return traceId}
-function providerErrorMessage(error: unknown) {
-  const message = error instanceof Error ? error.message : "模型连接测试失败";
-  if (message.includes("model.request") || message.includes("Missing scopes"))
-    return "API Key 可以被识别，但缺少模型调用权限（model.request）。请在对应 OpenAI Project 的 API Keys 页面将该 Key 改为 All，或在 Restricted 权限中开启模型请求；同时确认当前账号属于该 Project（Member 或 Owner）。";
-  if (message.includes("returned 401") || message.includes("返回 401"))
-    return "API Key 无效或权限不足。请确认 Key 属于当前项目、尚未过期，并具有模型调用权限。";
-  if (message.includes("returned 429") || message.includes("返回 429"))
-    return "模型渠道返回 429：可能是余额不足、预算限制或请求频率过高，请检查厂商账单与限额。";
-  if (message.includes("returned 404") || message.includes("返回 404"))
-    return "模型不可用或当前项目没有该模型权限，请检查项目的 Model usage 设置。";
-  return message;
-}
 function avatarSvg(displayName: string | null | undefined) {
   const first = Array.from(displayName?.trim() || "B")[0] ?? "B";
   const safe = first
@@ -469,7 +676,41 @@ app.use("/api/*", async (c, next) => {
     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
   );
 });
-app.get("/api/admin/health", (c) => c.json({ ok: true, service: "admin" }));
+app.get("/api/admin/health", async (c) => {
+  const enabled = runtimeEnabled(c.env),
+    configured = !enabled || runtimeConfigurationReady(c.env),
+    deep = c.req.query("deep") === "1";
+  if (
+    deep &&
+    (!c.env.DEPLOY_HEALTH_TOKEN ||
+      c.req.header("X-Bunshin-Health-Token") !== c.env.DEPLOY_HEALTH_TOKEN)
+  )
+    return c.json({ ok: false, error: "Not found" }, 404);
+  let reachable: boolean | null = null,
+    failureCode: string | null = null;
+  if (deep && enabled && configured) {
+    try {
+      await testRuntimeConnection({
+        ...runtimeTransport(c.env),
+        authSecret: runtimeAuthSecret(c.env),
+        timeoutMs: 20_000,
+      });
+      reachable = true;
+    } catch (error) {
+      reachable = false;
+      failureCode = classifyProviderError(error).code;
+    }
+  }
+  const ok = configured && reachable !== false;
+  return c.json(
+    {
+      ok,
+      service: "admin",
+      runtime: { enabled, configured, ...(deep ? { reachable, failureCode } : {}) },
+    },
+    ok ? 200 : 503,
+  );
+});
 app.get("/api/admin/auth/status", async (c) => {
   const row = await c.env.DB.prepare(
     "SELECT COUNT(*) count FROM admin_users",
@@ -858,7 +1099,7 @@ app.get("/api/admin/settings", async (c) => {
     c.env.DB.prepare("SELECT value,updated_at FROM settings WHERE key='system_config'").first<{ value: string; updated_at: string }>(),
     c.env.DB.prepare("SELECT value,updated_at FROM settings WHERE key='observability_config'").first<{ value: string; updated_at: string }>(),
     c.env.DB.prepare("SELECT display_name,published,updated_at FROM profiles ORDER BY updated_at DESC LIMIT 1").first<{display_name:string;published:number;updated_at:string}>(),
-    c.env.DB.prepare("SELECT name,health_status,updated_at FROM providers ORDER BY is_default DESC,updated_at DESC LIMIT 1").first<{name:string;health_status:string;updated_at:string}>(),
+    c.env.DB.prepare("SELECT name,credential_status,runtime_status,failure_code,updated_at FROM providers ORDER BY is_default DESC,updated_at DESC LIMIT 1").first<{name:string;credential_status:string;runtime_status:string;failure_code:string|null;updated_at:string}>(),
     c.env.DB.prepare("SELECT COUNT(*) total,SUM(CASE WHEN status='indexed' THEN 1 ELSE 0 END) ready,SUM(CASE WHEN status IN ('failed','needs_ocr') THEN 1 ELSE 0 END) failed FROM documents WHERE archived_at IS NULL").first(),
     c.env.DB.prepare("SELECT COUNT(*) total,SUM(CASE WHEN status='published' THEN 1 ELSE 0 END) published FROM articles").first(),
     c.env.DB.prepare("SELECT action,target_type,target_id,created_at FROM audit_events ORDER BY created_at DESC LIMIT 8").all(),
@@ -872,7 +1113,14 @@ app.get("/api/admin/settings", async (c) => {
       profileName: profile?.display_name ?? "",
       profilePublished: Boolean(profile?.published),
       providerName: provider?.name ?? "",
-      providerHealth: provider?.health_status ?? "missing",
+      providerHealth: provider
+        ? provider.credential_status === "valid" && provider.runtime_status === "healthy"
+          ? "healthy"
+          : "error"
+        : "missing",
+      providerCredentialStatus: provider?.credential_status ?? "missing",
+      providerRuntimeStatus: provider?.runtime_status ?? "missing",
+      providerFailureCode: provider?.failure_code ?? null,
       documents: documents ?? { total: 0, ready: 0, failed: 0 },
       articles: articles ?? { total: 0, published: 0 },
     },
@@ -941,7 +1189,7 @@ app.get("/api/admin/agent", async (c) => {
       value: string;
     }>(),
     c.env.DB.prepare(
-      "SELECT id,name,chat_model,embedding_model,embedding_mode,health_status,last_checked_at,last_error,monthly_budget_micros,(SELECT COALESCE(SUM(cost_micros),0) FROM usage_events WHERE provider_id=providers.id AND created_at>=datetime('now','start of month')) month_spent_micros FROM providers WHERE enabled=1 AND is_default=1 LIMIT 1",
+      "SELECT id,name,kind,preset_id,base_url,chat_model,embedding_model,embedding_mode,health_status,last_checked_at,last_error,credential_status,runtime_status,failure_code,consecutive_failures,last_success_at,last_failure_at,circuit_open_until,route_mode,monthly_budget_micros,(SELECT COALESCE(SUM(cost_micros),0) FROM usage_events WHERE provider_id=providers.id AND created_at>=datetime('now','start of month')) month_spent_micros FROM providers WHERE enabled=1 AND is_default=1 LIMIT 1",
     ).first(),
     c.env.DB.prepare(
       "SELECT COUNT(*) total,SUM(CASE WHEN status='indexed' AND visibility!='private' THEN 1 ELSE 0 END) ready,SUM(CASE WHEN status IN ('uploaded','parsing','embedding') THEN 1 ELSE 0 END) processing,SUM(CASE WHEN status IN ('failed','needs_ocr') THEN 1 ELSE 0 END) failed FROM documents",
@@ -961,7 +1209,7 @@ app.get("/api/admin/agent", async (c) => {
     ready: Boolean(
       config.enabled &&
         provider &&
-        (provider as { health_status?: string }).health_status === "healthy" &&
+        canAttemptProvider(providerState(provider as ProviderRuntimeRow)) &&
         (Number(
           (provider as { monthly_budget_micros?: number })
             .monthly_budget_micros ?? 0,
@@ -1280,16 +1528,23 @@ app.get("/api/admin/documents/:id/download", async (c) => {
 });
 app.get("/api/admin/providers", async (c) => {
   const useRuntime = runtimeEnabled(c.env),
+    runtimeConfigured = runtimeConfigurationReady(c.env),
     items = (
       await c.env.DB.prepare(
-        "SELECT id,name,kind,base_url,key_preview,chat_model,embedding_model,embedding_mode,preset_id,monthly_budget_micros,enabled,is_default,health_status,last_checked_at,last_error,updated_at FROM providers ORDER BY updated_at DESC",
+        "SELECT id,name,kind,base_url,key_preview,chat_model,embedding_model,embedding_mode,preset_id,monthly_budget_micros,enabled,is_default,health_status,last_checked_at,last_error,credential_status,runtime_status,failure_code,consecutive_failures,last_success_at,last_failure_at,circuit_open_until,route_mode,updated_at FROM providers ORDER BY updated_at DESC",
       ).all<Record<string, unknown>>()
     ).results.map((item) => ({
       ...item,
-      key_preview: useRuntime ? "Runtime Secret" : item.key_preview,
-      key_source: useRuntime ? "runtime_secret" : "encrypted_database",
+      key_preview: item.key_preview,
+      key_source: "encrypted_database",
+      execution_route: useRuntime
+        ? "runtime"
+        : item.route_mode === "gateway" &&
+              (c.env.AI || c.env.CF_AIG_OPENAI_BASE_URL)
+            ? "gateway"
+            : "direct",
     }));
-  return c.json({ items, runtimeConfigured: useRuntime });
+  return c.json({ items, runtimeConfigured });
 });
 app.post("/api/admin/articles/import", async (c) => {
   const form = await c.req.formData(), files = form.getAll("files");
@@ -1585,10 +1840,72 @@ app.post("/api/admin/providers", async (c) => {
   if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
   const p = parsed.data,
     now = new Date().toISOString(),
-    id = crypto.randomUUID();
-  const encrypted = await encryptSecret(p.apiKey, c.env.MASTER_ENCRYPTION_KEY);
+    id = crypto.randomUUID(),
+    routeMode: ProviderExecutionRoute = runtimeEnabled(c.env)
+      ? "runtime"
+      : (p.kind === "openai" || knownProviderFromBaseUrl(p.baseUrl) === "openai") &&
+          (c.env.AI || c.env.CF_AIG_OPENAI_BASE_URL)
+        ? "gateway"
+        : "direct";
+  try {
+    if (routeMode === "runtime")
+      await testChatViaRuntime({
+        ...runtimeTransport(c.env),
+        authSecret: runtimeAuthSecret(c.env),
+        provider: runtimeProviderId({
+          preset_id: null,
+          kind: p.kind,
+          base_url: p.baseUrl,
+        }),
+        baseUrl: p.baseUrl,
+        model: p.chatModel,
+        apiKey: p.apiKey,
+      });
+    else if (routeMode === "gateway" && c.env.AI)
+      await testChatViaGateway(c.env.AI.gateway("default"), {
+        baseUrl: p.baseUrl,
+        apiKey: p.apiKey,
+        model: p.chatModel,
+      });
+    else
+      await testChatConnection({
+        baseUrl: await providerRequestBaseUrl(
+          c.env,
+          { base_url: p.baseUrl },
+          routeMode,
+        ),
+        apiKey: p.apiKey,
+        model: p.chatModel,
+        cloudflareAIGatewayToken: c.env.CF_AIG_TOKEN,
+      });
+  } catch (error) {
+    const classification = classifyProviderError(error),
+      presentation = providerFailurePresentation(classification.code);
+    return c.json(
+      {
+        error: presentation.message,
+        code: classification.code,
+        credentialStatus: classification.credentialInvalid
+          ? "invalid"
+          : "unverified",
+        runtimeStatus: classification.configInvalid
+          ? "unavailable"
+          : "degraded",
+        retryable: classification.retryable,
+        action: presentation.action,
+      },
+      classification.configInvalid ? 400 : 503,
+    );
+  }
+  const encrypted = await encryptSecret(p.apiKey, c.env.MASTER_ENCRYPTION_KEY),
+    presetId = runtimeProviderId({
+      preset_id: null,
+      kind: p.kind,
+      base_url: p.baseUrl,
+    });
+  await c.env.DB.prepare("UPDATE providers SET is_default=0").run();
   await c.env.DB.prepare(
-    "INSERT INTO providers (id,name,kind,base_url,encrypted_api_key,key_preview,chat_model,embedding_model,monthly_budget_micros,is_default,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+    "INSERT INTO providers (id,name,kind,base_url,encrypted_api_key,key_preview,chat_model,embedding_model,monthly_budget_micros,is_default,preset_id,health_status,last_checked_at,credential_status,runtime_status,last_success_at,route_mode,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
   )
     .bind(
       id,
@@ -1601,11 +1918,27 @@ app.post("/api/admin/providers", async (c) => {
       p.embeddingModel,
       p.monthlyBudgetMicros,
       1,
+      presetId,
+      "healthy",
+      now,
+      "valid",
+      "healthy",
+      now,
+      routeMode,
       now,
       now,
     )
     .run();
-  return c.json({ id, keyPreview: `••••${p.apiKey.slice(-4)}` }, 201);
+  return c.json(
+    {
+      id,
+      keyPreview: `••••${p.apiKey.slice(-4)}`,
+      credentialStatus: "valid",
+      runtimeStatus: "healthy",
+      executionRoute: routeMode,
+    },
+    201,
+  );
 });
 app.post("/api/admin/providers/simple", async (c) => {
   const parsed = simpleProviderSchema.safeParse(
@@ -1618,53 +1951,69 @@ app.post("/api/admin/providers/simple", async (c) => {
     baseUrl =
       input.presetId === "custom"
         ? (input.baseUrl ?? preset.baseUrl)
-        : input.presetId === "openai" &&
-            !useRuntime &&
-            c.env.CF_AIG_TOKEN &&
-            c.env.CF_AIG_OPENAI_BASE_URL
-          ? c.env.CF_AIG_OPENAI_BASE_URL.replace(/\/$/, "")
-          : preset.baseUrl,
+        : preset.baseUrl,
+    routeMode: ProviderExecutionRoute = useRuntime
+      ? "runtime"
+      : input.presetId === "openai" &&
+          (c.env.AI || c.env.CF_AIG_OPENAI_BASE_URL)
+        ? "gateway"
+        : "direct",
     chatModel = input.chatModel ?? preset.chatModel,
-    secretValue = useRuntime ? `runtime:${input.presetId}` : input.apiKey,
-    encrypted = await encryptSecret(secretValue, c.env.MASTER_ENCRYPTION_KEY),
+    encrypted = await encryptSecret(input.apiKey, c.env.MASTER_ENCRYPTION_KEY),
     now = new Date().toISOString(),
     id = crypto.randomUUID(),
-    preview = useRuntime
-      ? "Runtime Secret"
-      : `${input.apiKey.slice(0, 4)}*****${input.apiKey.slice(-2)}`,
+    preview = `${input.apiKey.slice(0, 4)}*****${input.apiKey.slice(-2)}`,
     embeddingMode =
       input.allowExternalEmbedding && preset.embeddingMode === "provider"
         ? "provider"
         : "local";
-  if (!useRuntime && input.apiKey.length < 8)
+  if (input.apiKey.length < 8)
     return c.json({ error: "API Key 至少需要 8 个字符" }, 400);
   try {
     if (useRuntime)
       await testChatViaRuntime({
-        runtimeUrl: c.env.AI_RUNTIME_URL!,
-        authSecret: c.env.AI_RUNTIME_AUTH_SECRET!,
+        ...runtimeTransport(c.env),
+        authSecret: runtimeAuthSecret(c.env),
         provider: input.presetId,
         baseUrl,
+        model: chatModel,
+        apiKey: input.apiKey,
+      });
+    else if (routeMode === "gateway" && c.env.AI)
+      await testChatViaGateway(c.env.AI.gateway("default"), {
+        baseUrl,
+        apiKey: input.apiKey,
         model: chatModel,
       });
     else
       await testChatConnection({
-        baseUrl,
+        baseUrl: await providerRequestBaseUrl(
+          c.env,
+          { base_url: baseUrl },
+          routeMode,
+        ),
         apiKey: input.apiKey,
         model: chatModel,
         cloudflareAIGatewayToken: c.env.CF_AIG_TOKEN,
       });
   } catch (error) {
+    const classification = classifyProviderError(error),
+      presentation = providerFailurePresentation(classification.code);
     return c.json(
       {
-        error: providerErrorMessage(error),
+        error: presentation.message,
+        code: classification.code,
+        credentialStatus: classification.credentialInvalid ? "invalid" : "unverified",
+        runtimeStatus: classification.configInvalid ? "unavailable" : "degraded",
+        retryable: classification.retryable,
+        action: presentation.action,
       },
-      400,
+      classification.configInvalid ? 400 : 503,
     );
   }
   await c.env.DB.prepare("UPDATE providers SET is_default=0").run();
   await c.env.DB.prepare(
-    "INSERT INTO providers (id,name,kind,base_url,encrypted_api_key,key_preview,chat_model,embedding_model,input_price_micros,output_price_micros,monthly_budget_micros,is_default,preset_id,embedding_mode,health_status,last_checked_at,last_error,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    "INSERT INTO providers (id,name,kind,base_url,encrypted_api_key,key_preview,chat_model,embedding_model,input_price_micros,output_price_micros,monthly_budget_micros,is_default,preset_id,embedding_mode,health_status,last_checked_at,last_error,credential_status,runtime_status,last_success_at,route_mode,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
   )
     .bind(
       id,
@@ -1684,6 +2033,10 @@ app.post("/api/admin/providers/simple", async (c) => {
       "healthy",
       now,
       null,
+      "valid",
+      "healthy",
+      now,
+      routeMode,
       now,
       now,
     )
@@ -1715,13 +2068,16 @@ app.post("/api/admin/providers/simple", async (c) => {
       keyPreview: preview,
       embeddingMode,
       healthStatus: "healthy",
+      credentialStatus: "valid",
+      runtimeStatus: "healthy",
+      executionRoute: routeMode,
     },
     201,
   );
 });
 app.post("/api/admin/providers/:id/test", async (c) => {
   const provider = await c.env.DB.prepare(
-    "SELECT id,kind,preset_id,base_url,encrypted_api_key,chat_model FROM providers WHERE id=? LIMIT 1",
+    "SELECT id,kind,preset_id,base_url,encrypted_api_key,chat_model,credential_status,runtime_status,failure_code,consecutive_failures,last_failure_at,circuit_open_until,route_mode FROM providers WHERE id=? LIMIT 1",
   )
     .bind(c.req.param("id"))
     .first<{
@@ -1731,47 +2087,99 @@ app.post("/api/admin/providers/:id/test", async (c) => {
       base_url: string;
       encrypted_api_key: string;
       chat_model: string;
+      credential_status: ProviderRuntimeRow["credential_status"];
+      runtime_status: ProviderRuntimeRow["runtime_status"];
+      failure_code: string | null;
+      consecutive_failures: number;
+      last_failure_at: string | null;
+      circuit_open_until: string | null;
+      route_mode: ProviderExecutionRoute;
     }>();
   if (!provider) return c.json({ error: "渠道不存在" }, 404);
-  const now = new Date().toISOString();
+  const executionRoute = providerExecutionRoute(c.env, provider),
+    stateEpoch = await beginProviderOperation(c.env, provider.id);
   try {
-    if (runtimeEnabled(c.env))
+    const apiKey = usableProviderKey(
+      await decryptSecret(
+        JSON.parse(provider.encrypted_api_key) as EncryptedSecret,
+        c.env.MASTER_ENCRYPTION_KEY,
+      ),
+    );
+    if (executionRoute === "runtime")
       await testChatViaRuntime({
-        runtimeUrl: c.env.AI_RUNTIME_URL!,
-        authSecret: c.env.AI_RUNTIME_AUTH_SECRET!,
+        ...runtimeTransport(c.env),
+        authSecret: runtimeAuthSecret(c.env),
         provider: runtimeProviderId(provider),
         baseUrl: provider.base_url,
         model: provider.chat_model,
+        apiKey,
       });
     else {
-      const apiKey = await decryptSecret(
-        JSON.parse(provider.encrypted_api_key) as EncryptedSecret,
-        c.env.MASTER_ENCRYPTION_KEY,
-      );
-      await testChatConnection({
-        baseUrl: resolveProviderBaseUrl(
-          provider.base_url,
-          c.env.CF_AIG_TOKEN ? c.env.CF_AIG_OPENAI_BASE_URL : undefined,
-        ),
-        apiKey,
-        model: provider.chat_model,
-        cloudflareAIGatewayToken: c.env.CF_AIG_TOKEN,
-      });
+      if (executionRoute === "gateway" && c.env.AI)
+        await testChatViaGateway(c.env.AI.gateway("default"), {
+          baseUrl: provider.base_url,
+          apiKey,
+          model: provider.chat_model,
+        });
+      else
+        await testChatConnection({
+          baseUrl: await providerRequestBaseUrl(
+            c.env,
+            provider,
+            executionRoute,
+          ),
+          apiKey,
+          model: provider.chat_model,
+          cloudflareAIGatewayToken: c.env.CF_AIG_TOKEN,
+        });
     }
-    await c.env.DB.prepare(
-      "UPDATE providers SET health_status='healthy',last_checked_at=?,last_error=NULL,updated_at=? WHERE id=?",
-    )
-      .bind(now, now, provider.id)
-      .run();
-    return c.json({ healthStatus: "healthy" });
+    const persisted = await markProviderSuccess(
+      c.env,
+      provider.id,
+      stateEpoch,
+    );
+    if (
+      !persisted ||
+      persisted.credential_status !== "valid" ||
+      persisted.runtime_status !== "healthy"
+    ) {
+      const code = persisted?.failure_code ?? "UNKNOWN",
+        presentation = providerFailurePresentation(code);
+      return c.json(
+        {
+          error: "本次连接测试成功，但有更新的请求改变了渠道状态",
+          code,
+          credentialStatus: persisted?.credential_status ?? "unverified",
+          runtimeStatus: persisted?.runtime_status ?? "unknown",
+          retryable: true,
+          action: presentation.action,
+          executionRoute,
+        },
+        409,
+      );
+    }
+    return c.json({
+      healthStatus: "healthy",
+      credentialStatus: "valid",
+      runtimeStatus: "healthy",
+      executionRoute,
+    });
   } catch (error) {
-    const message = providerErrorMessage(error);
-    await c.env.DB.prepare(
-      "UPDATE providers SET health_status='error',last_checked_at=?,last_error=?,updated_at=? WHERE id=?",
-    )
-      .bind(now, message, now, provider.id)
-      .run();
-    return c.json({ error: message }, 400);
+    const failure = await markProviderFailure(
+      c.env,
+      provider.id,
+      error,
+      stateEpoch,
+    );
+    return c.json({
+      error: failure.presentation.message,
+      code: failure.classification.code,
+      credentialStatus: failure.next.credentialStatus,
+      runtimeStatus: failure.next.runtimeStatus,
+      retryable: failure.classification.retryable,
+      action: failure.presentation.action,
+      executionRoute,
+    }, failure.classification.configInvalid ? 400 : 503);
   }
 });
 app.post("/api/admin/documents", async (c) => {
@@ -2183,7 +2591,7 @@ async function consume(batch: MessageBatch<Job>, env: Env) {
           ),
         );
       const provider = await env.DB.prepare(
-        "SELECT id,kind,preset_id,base_url,encrypted_api_key,embedding_model,embedding_mode FROM providers WHERE enabled=1 AND is_default=1 LIMIT 1",
+        "SELECT id,kind,preset_id,base_url,encrypted_api_key,embedding_model,embedding_mode,credential_status,runtime_status,failure_code,consecutive_failures,last_failure_at,circuit_open_until,route_mode FROM providers WHERE enabled=1 AND is_default=1 LIMIT 1",
       ).first<{
         id: string;
         kind: string;
@@ -2192,80 +2600,100 @@ async function consume(batch: MessageBatch<Job>, env: Env) {
         encrypted_api_key: string;
         embedding_model: string;
         embedding_mode: string;
+        credential_status: ProviderRuntimeRow["credential_status"];
+        runtime_status: ProviderRuntimeRow["runtime_status"];
+        failure_code: string | null;
+        consecutive_failures: number;
+        last_failure_at: string | null;
+        circuit_open_until: string | null;
+        route_mode: ProviderExecutionRoute;
       }>();
-      if (provider?.embedding_mode === "provider" && chunks.length) {
+      if (provider?.embedding_mode === "provider" && chunks.length && canAttemptProvider(providerState(provider))) {
         await updateQueueRun(env,{id:runId,documentId:job.documentId,status:"processing",attempt,traceId,startedAt});
         await env.DB.prepare(
           "UPDATE documents SET status='embedding',ingestion_progress=75,updated_at=? WHERE id=?",
         )
           .bind(new Date().toISOString(), job.documentId)
           .run();
-        const useRuntime = runtimeEnabled(env),
-          apiKey = useRuntime
-            ? null
-            : await decryptSecret(
-                JSON.parse(provider.encrypted_api_key) as EncryptedSecret,
-                env.MASTER_ENCRYPTION_KEY,
-              ),
-          started = Date.now(),
-          embedded = useRuntime
-            ? await createEmbeddingViaRuntime(
-                {
-                  runtimeUrl: env.AI_RUNTIME_URL!,
-                  authSecret: env.AI_RUNTIME_AUTH_SECRET!,
-                  provider: runtimeProviderId(provider),
-                  baseUrl: provider.base_url,
-                  model: provider.embedding_model,
-                },
-                chunks.map((chunk) => chunk.text),
-              )
-            : await createEmbedding(
-                {
-                  baseUrl: resolveProviderBaseUrl(
-                    provider.base_url,
-                    env.CF_AIG_TOKEN ? env.CF_AIG_OPENAI_BASE_URL : undefined,
-                  ),
-                  apiKey: apiKey!,
-                  model: provider.embedding_model,
-                  cloudflareAIGatewayToken: env.CF_AIG_TOKEN,
-                },
-                chunks.map((chunk) => chunk.text),
-              );
-        await env.VECTORIZE.upsert(
-          chunks.map((chunk, index) => ({
-            id: chunk.id,
-            values: embedded.vectors[index]!,
-            metadata: { documentId: job.documentId },
-          })),
-        );
-        await env.DB.batch(
-          chunks.map((chunk) =>
-            env.DB.prepare("UPDATE chunks SET vector_id=? WHERE id=?").bind(
-              chunk.id,
-              chunk.id,
+        const executionRoute = providerExecutionRoute(env, provider),
+          useRuntime = executionRoute === "runtime",
+          apiKey = usableProviderKey(
+            await decryptSecret(
+              JSON.parse(provider.encrypted_api_key) as EncryptedSecret,
+              env.MASTER_ENCRYPTION_KEY,
             ),
           ),
-        );
-        await env.DB.prepare(
-          "INSERT INTO usage_events (id,scenario,provider_id,model,input_tokens,output_tokens,cached_tokens,cost_micros,currency,latency_ms,status,estimated,trace_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        )
-          .bind(
-            crypto.randomUUID(),
-            "document_embedding",
-            provider.id,
-            provider.embedding_model,
-            embedded.usage.inputTokens,
-            0,
-            0,
-            0,
-            "USD",
-            Date.now() - started,
-            "success",
-            embedded.usage.estimated ? 1 : 0,
-            crypto.randomUUID(),
-            new Date().toISOString(),
-          )
-          .run();
+          started = Date.now();
+        try {
+          const embedded = useRuntime
+              ? await createEmbeddingViaRuntime(
+                  {
+                    ...runtimeTransport(env),
+                    authSecret: runtimeAuthSecret(env),
+                    provider: runtimeProviderId(provider),
+                    baseUrl: provider.base_url,
+                    model: provider.embedding_model,
+                    apiKey,
+                  },
+                  chunks.map((chunk) => chunk.text),
+                )
+              : executionRoute === "gateway" && env.AI
+                ? await createEmbeddingViaGateway(
+                    env.AI.gateway("default"),
+                    {
+                      baseUrl: provider.base_url,
+                      apiKey: apiKey!,
+                      model: provider.embedding_model,
+                    },
+                    chunks.map((chunk) => chunk.text),
+                  )
+                : await createEmbedding(
+                  {
+                    baseUrl: await providerRequestBaseUrl(
+                      env,
+                      provider,
+                      executionRoute,
+                    ),
+                    apiKey: apiKey!,
+                    model: provider.embedding_model,
+                    cloudflareAIGatewayToken: env.CF_AIG_TOKEN,
+                  },
+                  chunks.map((chunk) => chunk.text),
+                );
+          await env.VECTORIZE.upsert(
+            chunks.map((chunk, index) => ({
+              id: chunk.id,
+              values: embedded.vectors[index]!,
+              metadata: { documentId: job.documentId },
+            })),
+          );
+          await env.DB.batch(
+            chunks.map((chunk) =>
+              env.DB.prepare("UPDATE chunks SET vector_id=? WHERE id=?").bind(
+                chunk.id,
+                chunk.id,
+              ),
+            ),
+          );
+          await env.DB.prepare(
+            "INSERT INTO usage_events (id,scenario,provider_id,model,input_tokens,output_tokens,cached_tokens,cost_micros,currency,latency_ms,status,estimated,trace_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          ).bind(crypto.randomUUID(),"document_embedding",provider.id,provider.embedding_model,embedded.usage.inputTokens,0,0,0,"USD",Date.now()-started,"success",embedded.usage.estimated?1:0,crypto.randomUUID(),new Date().toISOString()).run();
+        } catch (error) {
+          const classification = classifyProviderError(error);
+          await recordAdminTelemetry(env, {
+            eventType: "document_embedding_fallback",
+            severity: "warning",
+            scenario: executionRoute,
+            durationMs: Date.now() - started,
+            statusCode: classification.status ?? 502,
+            traceId,
+            detail: {
+              documentId: job.documentId,
+              failureCode: classification.code,
+              fallback: "local_vectors",
+            },
+          });
+        }
       }
       await env.DB.prepare(
         "UPDATE documents SET status='indexed',ingestion_progress=100, parsed_text=?, chunk_count=?, error_message=NULL, updated_at=? WHERE id=?",
