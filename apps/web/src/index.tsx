@@ -773,9 +773,7 @@ app.get("/api/agent/status", async (c) => {
       enabled: config.enabled,
       ready,
       mode: providerReady ? "agent" : "retrieval_only",
-      notice: ready && !providerReady
-        ? "知识检索可用，AI 生成暂不可用"
-        : null,
+      notice: ready && !providerReady ? "知识检索已就绪" : null,
       remaining: Math.max(0, config.dailyLimit - (usage?.count ?? 0)),
       dailyLimit: config.dailyLimit,
       welcomeMessage: config.welcomeMessage,
@@ -949,7 +947,7 @@ app.post("/api/chat", async (c) => {
       .map((item, index) => `[${index + 1}] ${item.title}：${item.content}`)
       .join("\n\n");
     return new Response(
-      `data: ${JSON.stringify({ type: "delta", text: `模型生成服务暂时不可用，已为你返回知识库中的相关资料：\n\n${evidence}` })}\n\ndata: ${JSON.stringify({ type: "done", remaining: quota.remaining })}\n\n`,
+      `data: ${JSON.stringify({ type: "delta", text: `根据知识库检索到以下相关资料：\n\n${evidence}` })}\n\ndata: ${JSON.stringify({ type: "done", remaining: quota.remaining })}\n\n`,
       { headers },
     );
   }
