@@ -1081,9 +1081,19 @@ app.post("/api/chat", async (c) => {
     return new Response(stream, { headers });
   } catch (error) {
     await quota.release();
-    c.executionCtx.waitUntil(recordTelemetry(c.env,{eventType:"chat_provider_error",severity:"error",route:"/api/chat",scenario:"chat",statusCode:502,detail:{message:error instanceof Error?error.message:"provider unavailable"}}));
+    const providerMessage = error instanceof Error ? error.message : "provider unavailable",
+      persistentProviderError = /returned (401|403)/.test(providerMessage),
+      publicMessage = providerMessage.includes("unsupported_country_region_territory")
+        ? "模型服务受出口区域限制，站长需要配置受支持区域的模型网关。"
+        : "模型渠道暂时不可用，请稍后重试。";
+    c.executionCtx.waitUntil(Promise.all([
+      recordTelemetry(c.env,{eventType:"chat_provider_error",severity:"error",route:"/api/chat",scenario:"chat",statusCode:502,detail:{message:providerMessage}}),
+      ...(persistentProviderError ? [c.env.DB.prepare(
+        "UPDATE providers SET health_status='error',last_checked_at=?,last_error=?,updated_at=? WHERE id=?",
+      ).bind(new Date().toISOString(), publicMessage, new Date().toISOString(), provider.id).run()] : []),
+    ]));
     return new Response(
-      `data: ${JSON.stringify({ type: "error", text: "模型渠道暂时不可用，请稍后重试。" })}\n\n`,
+      `data: ${JSON.stringify({ type: "error", text: publicMessage })}\n\n`,
       { status: 502, headers },
     );
   }

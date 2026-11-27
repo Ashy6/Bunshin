@@ -55,6 +55,25 @@ https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/openai
 
 两种模式都会改变密钥流向，不能在没有站长明确授权和具体 Gateway 标识时自动开启。
 
+### 生产故障实例：OpenAI 403 区域限制
+
+2026-11-27 对 `https://twin-ai.online/api/chat` 的端到端验证确认：浏览器能够访问门户，Web Worker、D1 检索和额度检查均正常，但 OpenAI 返回：
+
+```text
+403 unsupported_country_region_territory
+Country, region, or territory not supported
+```
+
+这类错误发生在 `Web Worker → OpenAI`，与访客所在地、公开站域名和浏览器 CORS 无关。把 `twin-ai.online` 或另一个仍指向同一 Worker 的域名填入模型 Base URL，不会改变出口区域。
+
+修复需要以下任一条件：
+
+1. 创建经过身份验证的 Cloudflare AI Gateway，并为 Bunshin 配置 Gateway Run Token；如果使用 Provider passthrough，还需确保 OpenAI Key 只发送到站长自己的 Gateway。
+2. 使用部署在厂商支持区域、由站长控制的 OpenAI-compatible 网关。
+3. 切换到 Cloudflare Worker 当前出口可以访问的正规模型厂商，例如使用独立 Key 的 OpenRouter、DeepSeek 等。
+
+Cloudflare 新建 AI Gateway 默认强制认证。仅修改 Base URL 还不够，必须同时处理 Gateway 身份凭据；项目不得把 Cloudflare 账号 OAuth Token、全局 API Key 或 Gateway Run Token暴露给浏览器。
+
 ## 4. 安全边界
 
 - 自定义 Base URL 必须使用 HTTPS，禁止内网、环回、链路本地和保留地址，防止 SSRF。

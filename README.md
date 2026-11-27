@@ -163,6 +163,7 @@ Agent 只有在“渠道测试成功 + 至少一份非私有资料完成索引 +
 - 日志不记录 API Key、Cookie、Authorization、完整 prompt 或私密原文。
 - 访客 IP 仅与随机访客 ID、服务端 Secret 组合生成匿名 SHA-256 哈希，用于限流和统计。
 - 自定义模型 Base URL 仅允许 HTTPS 或本地开发地址。
+- 公开站域名只负责访客访问、canonical 与 SEO，不改变模型请求的出口区域。若厂商返回 `unsupported_country_region_territory`，必须在“模型渠道”中改用位于厂商支持区域的 OpenAI-compatible Gateway（例如 Cloudflare AI Gateway 或自托管网关）；把 Gateway 域名指回同一个 Web Worker 无法绕过区域限制。持续的 `401/403` 会自动把渠道标记为异常，后台展示脱敏后的可操作原因。
 
 ## GEO 与 SEO
 

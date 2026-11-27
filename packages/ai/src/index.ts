@@ -9,6 +9,13 @@ export interface NormalizedUsage {
   cachedTokens: number;
   estimated: boolean;
 }
+async function providerFailure(response: Response, label: string) {
+  const detail = (await response.text().catch(() => ""))
+    .replace(/sk-[A-Za-z0-9_-]+/g, "[REDACTED_KEY]")
+    .replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]")
+    .slice(0, 500);
+  return new Error(`${label} returned ${response.status}${detail ? `: ${detail}` : ""}`);
+}
 export async function createEmbedding(config: ProviderConfig, texts: string[]) {
   const response = await fetch(
     `${config.baseUrl.replace(/\/$/, "")}/embeddings`,
@@ -22,7 +29,7 @@ export async function createEmbedding(config: ProviderConfig, texts: string[]) {
     },
   );
   if (!response.ok)
-    throw new Error(`Embedding provider returned ${response.status}`);
+    throw await providerFailure(response, "Embedding provider");
   const body = (await response.json()) as {
     data: Array<{ embedding: number[] }>;
     usage?: { prompt_tokens?: number; total_tokens?: number };
@@ -61,8 +68,10 @@ export async function streamChat(
       }),
     },
   );
-  if (!response.ok || !response.body)
-    throw new Error(`Chat provider returned ${response.status}`);
+  if (!response.ok)
+    throw await providerFailure(response, "Chat provider");
+  if (!response.body)
+    throw new Error("Chat provider returned an empty response body");
   return response;
 }
 export async function testChatConnection(config: ProviderConfig) {
