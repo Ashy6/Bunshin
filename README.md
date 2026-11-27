@@ -18,7 +18,7 @@
 
 ## 总体架构
 
-项目只有两个部署应用，API 内聚在各自 Worker 中，不创建第三个 `apps/api`：
+项目有两个用户界面和一个可选的内部模型执行服务。公开 API 仍内聚在 Web Worker，后台 API 仍内聚在 Admin Worker；`apps/runtime` 不是第三套产品或公开通用 API，只为两个 Worker 提供签名保护的 Chat、Embedding 和渠道测试能力：
 
 ```mermaid
 flowchart LR
@@ -28,7 +28,8 @@ flowchart LR
 
     W --> D[(D1)]
     W --> X[(Vectorize)]
-    W --> L[模型厂商 / AI Gateway]
+    W --> I[AI Runtime\n固定区域内部服务]
+    I --> L[模型厂商]
     W --> K[(KV / Cache)]
 
     M --> D
@@ -38,10 +39,11 @@ flowchart LR
     C --> R
     C --> D
     C --> X
-    C --> L
+    C --> I
 
     W -.复用.-> P[packages/*\nDB / AI / RAG / Crypto]
     M -.复用.-> P
+    I -.复用.-> P
 ```
 
 ### API 位置
@@ -72,7 +74,7 @@ flowchart LR
 
 后台使用可刷新、支持浏览器前进/后退的 Hash 路由：`#/profile`、`#/articles`、`#/categories`、`#/knowledge`、`#/agent`、`#/providers`。文章新建与编辑使用全屏工作台路由；切换模块时若有尚未保存的资料会先提示确认。
 
-共享包不是服务，不监听端口，也不发生内部 HTTP 调用。
+`apps/runtime` 提供 `/internal/v1/chat`、`/internal/v1/embeddings` 和 `/internal/v1/providers/test`，只能由 Web/Admin Worker 使用 HMAC 签名调用。共享包不是服务，不监听端口。
 
 ## Monorepo 结构
 
@@ -80,7 +82,8 @@ flowchart LR
 ai-bunshin/
 ├── apps/
 │   ├── web/                 # 公开 SSR 站点与 Public Worker API
-│   └── admin/               # 后台、Admin Worker API、Queue Consumer
+│   ├── admin/               # 后台、Admin Worker API、Queue Consumer
+│   └── runtime/             # 可选固定区域 AI Runtime（Node.js + Docker）
 ├── packages/
 │   ├── ai/                  # 模型渠道适配、Usage 归一化
 │   ├── crypto/              # API Key 信封加密
@@ -181,7 +184,7 @@ Agent 只有在“渠道测试成功 + 至少一份非私有资料完成索引 +
 
 ## 本地开发
 
-本地开发采用两个进程、一个共享数据目录：`apps/admin` 由 Cloudflare Vite 插件同时提供 React 管理界面和 Admin Worker API；`apps/web` 提供访客端和公开 Chat API。两者共享 `apps/admin/.wrangler/state` 中的本地 D1 数据，因此后台上传的内容可以立即被访客端检索，无需额外启动第三个 API 项目。
+本地内容开发仍可只启动 Web/Admin 两个进程。启用固定区域模型执行链路时，再启动可选 `apps/runtime`；它不保存业务数据，也不访问 D1、R2 或 Vectorize。Web/Admin 共享 `apps/admin/.wrangler/state` 中的本地 D1 数据，Runtime 只接收签名后的模型执行请求。
 
 首次打开后台时会进入站长账号初始化页。密码至少 12 位；初始化完成后会生成 10 个只展示一次的离线恢复码，下载或复制保存后使用 HttpOnly 会话 Cookie 进入后台。登录页的“忘记密码”可选择离线恢复码；邮件服务配置完成后也可选择邮箱验证码。模型 API Key 输入框始终使用密码态，只显示首尾掩码和字符长度；服务端只返回 `key_preview`，密文使用 AES-256-GCM 保存，任何读取接口都不会返回原始 Key。
 
@@ -200,12 +203,15 @@ pnpm install
 cp .dev.vars.example .dev.vars
 pnpm db:migrate:local
 pnpm dev
+# 另一个终端，可选：启用 AI Runtime
+pnpm --filter @ai-bunshin/runtime dev
 ```
 
 本地地址：
 
 - 访客端：`http://localhost:8787`
 - 后台：`http://localhost:8788`
+- AI Runtime：`http://localhost:8790`（只供服务端调用）
 
 知识库流程为：上传文本型 PDF/TXT/Markdown → R2 存储 → Queue 消费 → PDF 文字提取 → 切片 → D1 向量索引 → 访客端相似度检索。未配置模型渠道或渠道异常时，Chat 仍以“知识检索”模式展示带来源的相关片段，不向访客暴露内部渠道故障；配置并验证 OpenAI-compatible 渠道后，会将检索上下文交给模型生成回答。扫描版 PDF 无可提取文字时会标记为 `needs_ocr`，需要先进行 OCR。
 
@@ -230,12 +236,30 @@ pnpm admin:init
 wrangler secret put MASTER_ENCRYPTION_KEY
 wrangler secret put SESSION_SECRET
 wrangler secret put ADMIN_BOOTSTRAP_TOKEN
+# 可选：通过 Cloudflare AI Gateway 透传用户自己的 OpenAI API Key。
+# 必须分别写入两个 Worker；它只认证 Gateway，不承担 OpenAI 计费。
+wrangler secret put CF_AIG_TOKEN --config apps/web/wrangler.jsonc
+wrangler secret put CF_AIG_TOKEN --config apps/admin/wrangler.jsonc
 # 可选：启用公开 Agent 人机验证时同时设置
 wrangler secret put TURNSTILE_SITE_KEY --config apps/web/wrangler.jsonc
 wrangler secret put TURNSTILE_SECRET_KEY --config apps/web/wrangler.jsonc
+# 可选：先把模型密钥与内部鉴权 Secret 写入固定区域 Runtime
+wrangler secret put AI_RUNTIME_AUTH_SECRET --config apps/runtime/wrangler.jsonc
+wrangler secret put OPENAI_API_KEY --config apps/runtime/wrangler.jsonc
+pnpm --filter @ai-bunshin/runtime deploy
+
+# Runtime 健康检查和签名测试通过后，再同时写入 Web/Admin Worker
+wrangler secret put AI_RUNTIME_URL --config apps/web/wrangler.jsonc
+wrangler secret put AI_RUNTIME_AUTH_SECRET --config apps/web/wrangler.jsonc
+wrangler secret put AI_RUNTIME_URL --config apps/admin/wrangler.jsonc
+wrangler secret put AI_RUNTIME_AUTH_SECRET --config apps/admin/wrangler.jsonc
 ```
 
-模型 API Key 由后台录入，经 `MASTER_ENCRYPTION_KEY` 加密后保存，不需要逐个写入 Wrangler。
+启用 AI Runtime 后，模型 API Key 使用 Runtime 所在平台的 Secret/环境变量保存，后台只选择厂商、模型、预算与向量化策略。未启用 Runtime 时继续兼容原有的后台录入和 D1 信封加密模式。
+
+Runtime 至少需要 `AI_RUNTIME_AUTH_SECRET` 和对应厂商密钥（如 `OPENAI_API_KEY`）。同一个 `AI_RUNTIME_AUTH_SECRET` 同时配置到 Runtime、Web Worker 和 Admin Worker。Runtime 必须部署在固定、合规且受模型厂商支持的区域；再部署一个普通全球 Worker 并不能保证改变上游出口。完整方案见 [固定区域 AI Runtime 拆分与迁移方案](./docs/ai-runtime-architecture.md)。
+
+若 Admin Worker 配置了 `CF_AIG_OPENAI_BASE_URL`，内置 OpenAI 预设会自动通过该 provider-native Gateway 地址转发；普通用户仍只需输入自己的 OpenAI API Key。后端仅当 Base URL 的主机严格等于 `gateway.ai.cloudflare.com` 时，才从 Worker Secret 读取 `CF_AIG_TOKEN` 并发送 `cf-aig-authorization`，避免把平台 Token 泄露给其他兼容渠道。OpenAI Key 继续放在标准 `Authorization` 请求头中，因此推理费用由用户的 OpenAI 账户承担，而不是 Cloudflare Unified Billing。
 
 Turnstile 只有在 Site Key 与 Secret Key 同时配置时启用。前端 Token 必须由 Web Worker 调用 Cloudflare Siteverify 校验，且每次成功或失败后都会重置；它与 D1 中默认 25 次的服务端额度是两层独立保护。`cf_clearance` 是 Cloudflare WAF/Challenge 的可选凭据，不作为业务额度身份。详细方案见 [生产监控、混合 RAG 与 Turnstile](./docs/observability-rag-turnstile.md)。
 
@@ -265,7 +289,8 @@ Agent 的核心身份由服务端固定：它始终是资料所有者本人的 A
 
 正式部署需要：
 
-- 两个 Workers：`ai-bunshin-web`、`ai-bunshin-admin`
+- 两个用户端 Workers：`ai-bunshin-web`、`ai-bunshin-admin`
+- 可选的内部模型执行 Worker + Container：`ai-bunshin-runtime`
 - 一个 D1：`ai-bunshin`
 - 一个 R2：`ai-bunshin-assets`
 - 一个 Vectorize：`ai-bunshin-knowledge-v1`
@@ -286,7 +311,7 @@ pnpm cf:setup
 pnpm deploy:production
 ```
 
-脚本会依次检查 Cloudflare 登录和 R2、运行类型检查/测试/构建、应用远程 D1 迁移、部署两个 Worker、生成并安装生产 Secrets，最后输出一次性管理员初始化令牌。稳定密钥保存在本机被 Git 忽略的 `.deploy-secrets.json` 中；后续部署会复用，避免更换主密钥导致已保存的模型 API Key 无法解密。
+脚本会依次检查 Cloudflare 登录和 R2、运行类型检查/测试/构建、应用远程 D1 迁移、部署 Web/Admin、生成并安装生产 Secrets，最后输出一次性管理员初始化令牌。Runtime 单独部署并显式配置厂商 Secret；脚本不会擅自把本机模型密钥上传或自动切流。稳定应用密钥保存在本机被 Git 忽略的 `.deploy-secrets.json` 中；后续部署会复用，避免更换主密钥导致已保存的模型 API Key 无法解密。
 
 `0008_operations.sql` 会创建系统配置、把已有站点的默认访客额度统一为 25 次，并回填可从 D1 版本记录确定的附件元数据；`0009_observability_rag_security.sql` 创建生产事件、告警、Queue 运行和 RAG 检索指标。部署完成后进入后台“系统设置”，填写正式公开地址并执行一次“修复历史附件元数据”，再到“生产监控”确认运行健康。
 

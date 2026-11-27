@@ -74,6 +74,19 @@ for (const [name, value] of Object.entries(secrets)) {
     run("pnpm", ["exec", "wrangler", "secret", "put", name, "--config", config], `${value}\n`);
   }
 }
+if (process.env.CF_AIG_TOKEN) {
+  for (const config of ["apps/web/wrangler.jsonc", "apps/admin/wrangler.jsonc"]) {
+    run("pnpm", ["exec", "wrangler", "secret", "put", "CF_AIG_TOKEN", "--config", config], `${process.env.CF_AIG_TOKEN}\n`);
+  }
+}
+if (process.env.AI_RUNTIME_URL && process.env.AI_RUNTIME_AUTH_SECRET) {
+  for (const config of ["apps/web/wrangler.jsonc", "apps/admin/wrangler.jsonc"]) {
+    for (const name of ["AI_RUNTIME_URL", "AI_RUNTIME_AUTH_SECRET"] as const) {
+      run("pnpm", ["exec", "wrangler", "secret", "put", name, "--config", config], `${process.env[name]}\n`);
+    }
+    run("pnpm", ["exec", "wrangler", "secret", "put", "AI_RUNTIME_ENABLED", "--config", config], "true\n");
+  }
+}
 if (process.env.PASSWORD_RESET_FROM_EMAIL) {
   run("pnpm", ["exec", "wrangler", "secret", "put", "PASSWORD_RESET_FROM_EMAIL", "--config", "apps/admin/wrangler.jsonc"], `${process.env.PASSWORD_RESET_FROM_EMAIL}\n`);
 }

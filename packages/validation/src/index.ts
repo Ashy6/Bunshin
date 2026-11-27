@@ -33,7 +33,7 @@ export const providerSchema = z.object({
 });
 export const simpleProviderSchema = z.object({
   presetId: z.enum(["openai", "deepseek", "openrouter", "custom"]),
-  apiKey: z.string().min(8).max(500),
+  apiKey: z.string().max(500).default(""),
   monthlyBudgetMicros: z.number().int().nonnegative().default(0),
   baseUrl: z.string().url().optional(),
   chatModel: z.string().trim().min(1).max(120).optional(),

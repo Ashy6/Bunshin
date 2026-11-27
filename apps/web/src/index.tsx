@@ -2,7 +2,13 @@ import { Hono } from "hono";
 import { html, raw } from "hono/html";
 import { chatRequestSchema } from "@ai-bunshin/validation";
 import { decryptSecret, type EncryptedSecret } from "@ai-bunshin/crypto";
-import { createEmbedding, streamChat } from "@ai-bunshin/ai";
+import {
+  createEmbedding,
+  createEmbeddingViaRuntime,
+  resolveProviderBaseUrl,
+  streamChat,
+  streamChatViaRuntime,
+} from "@ai-bunshin/ai";
 import {
   bm25Search,
   buildGroundedPrompt,
@@ -21,8 +27,13 @@ type Bindings = {
   ASSETS: Fetcher;
   PUBLIC_ORIGIN?: string;
   MASTER_ENCRYPTION_KEY: string;
+  CF_AIG_TOKEN?: string;
+  CF_AIG_OPENAI_BASE_URL?: string;
   TURNSTILE_SITE_KEY?: string;
   TURNSTILE_SECRET_KEY?: string;
+  AI_RUNTIME_URL?: string;
+  AI_RUNTIME_AUTH_SECRET?: string;
+  AI_RUNTIME_ENABLED?: string;
 };
 const app = new Hono<{ Bindings: Bindings }>();
 async function recordTelemetry(env:Bindings,event:{eventType:string;severity?:"info"|"warning"|"error"|"critical";route?:string;scenario?:string;durationMs?:number;statusCode?:number;traceId?:string;detail?:Record<string,unknown>}){const traceId=event.traceId??crypto.randomUUID();try{await env.DB.prepare("INSERT INTO observability_events (id,service,event_type,severity,route,scenario,duration_ms,status_code,trace_id,detail_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(),"web",event.eventType,event.severity??"info",event.route??null,event.scenario??null,event.durationMs??0,event.statusCode??0,traceId,JSON.stringify(event.detail??{}),new Date().toISOString()).run()}catch(error){console.error(JSON.stringify({level:"error",event:"telemetry_write_failed",traceId,message:error instanceof Error?error.message:String(error)}))}return traceId}
@@ -58,6 +69,16 @@ const defaultSystemConfig: SystemConfig = {
   llmsFullEnabled: false,
   cacheTtlSeconds: 300,
 };
+function runtimeEnabled(env: Bindings) {
+  return Boolean(
+    env.AI_RUNTIME_URL &&
+      env.AI_RUNTIME_AUTH_SECRET &&
+      env.AI_RUNTIME_ENABLED !== "false",
+  );
+}
+function runtimeProviderId(provider: { preset_id?: string | null; kind: string }) {
+  return provider.preset_id || (provider.kind === "openai" ? "openai" : "custom");
+}
 async function systemConfig(env: Bindings) {
   const row = await env.DB.prepare(
     "SELECT value FROM settings WHERE key='system_config'",
@@ -758,7 +779,9 @@ app.get("/api/agent/status", async (c) => {
     )
       .bind(visitor.hash, `day:${parts.day}`)
       .first<{ count: number }>(),
-    providerReady = provider?.health_status === "healthy",
+    providerReady = Boolean(
+      provider && (runtimeEnabled(c.env) || provider.health_status === "healthy"),
+    ),
     budgetAvailable = Boolean(
       !provider ||
         provider.monthly_budget_micros === 0 ||
@@ -811,9 +834,11 @@ app.post("/api/chat", async (c) => {
     config = await agentConfig(c.env),
     visitor = await visitorIdentity(c.req.raw, c.env);
   const provider = await c.env.DB.prepare(
-    "SELECT id,base_url,encrypted_api_key,chat_model,embedding_model,embedding_mode,health_status,input_price_micros,output_price_micros,monthly_budget_micros,(SELECT COALESCE(SUM(cost_micros),0) FROM usage_events WHERE provider_id=providers.id AND created_at>=datetime('now','start of month')) month_spent_micros FROM providers WHERE enabled=1 ORDER BY is_default DESC,updated_at DESC LIMIT 1",
+    "SELECT id,kind,preset_id,base_url,encrypted_api_key,chat_model,embedding_model,embedding_mode,health_status,input_price_micros,output_price_micros,monthly_budget_micros,(SELECT COALESCE(SUM(cost_micros),0) FROM usage_events WHERE provider_id=providers.id AND created_at>=datetime('now','start of month')) month_spent_micros FROM providers WHERE enabled=1 ORDER BY is_default DESC,updated_at DESC LIMIT 1",
   ).first<{
     id: string;
+    kind: string;
+    preset_id: string | null;
     base_url: string;
     encrypted_api_key: string;
     chat_model: string;
@@ -831,7 +856,8 @@ app.post("/api/chat", async (c) => {
   const identity = await c.env.DB.prepare(
     "SELECT display_name FROM profiles WHERE rag_enabled=1 ORDER BY created_at LIMIT 1",
   ).first<{ display_name: string }>();
-  const providerReady = provider?.health_status === "healthy";
+  const useRuntime = runtimeEnabled(c.env),
+    providerReady = Boolean(provider && (useRuntime || provider.health_status === "healthy"));
   if (
     !config.enabled ||
     (provider && provider.monthly_budget_micros > 0 &&
@@ -844,7 +870,7 @@ app.post("/api/chat", async (c) => {
       visitor.setCookie ? { "Set-Cookie": visitor.setCookie } : undefined,
     );
   let apiKey: string | null = null;
-  if (providerReady && provider)
+  if (providerReady && provider && !useRuntime)
     apiKey = await decryptSecret(
       JSON.parse(provider.encrypted_api_key) as EncryptedSecret,
       c.env.MASTER_ENCRYPTION_KEY,
@@ -862,13 +888,36 @@ app.post("/api/chat", async (c) => {
   ).all<Omit<RetrievalRow,"score">>()).results,
     lexical=bm25Search(question,corpus,12).filter((item)=>hasMeaningfulOverlap(question,item.content));
   let vectorRanking:Array<RetrievalRow>=[],retrievalMode="local_hybrid";
-  if (providerReady && provider?.embedding_mode === "provider" && apiKey) {
+  if (
+    providerReady &&
+    provider?.embedding_mode === "provider" &&
+    (useRuntime || apiKey)
+  ) {
     retrievalMode="provider_hybrid";
     const started = Date.now();
-    const embedded = await createEmbedding(
-      { baseUrl: provider.base_url, apiKey, model: provider.embedding_model },
-      [question],
-    );
+    const embedded = useRuntime
+      ? await createEmbeddingViaRuntime(
+          {
+            runtimeUrl: c.env.AI_RUNTIME_URL!,
+            authSecret: c.env.AI_RUNTIME_AUTH_SECRET!,
+            provider: runtimeProviderId(provider),
+            baseUrl: provider.base_url,
+            model: provider.embedding_model,
+          },
+          [question],
+        )
+      : await createEmbedding(
+          {
+            baseUrl: resolveProviderBaseUrl(
+              provider.base_url,
+              c.env.CF_AIG_OPENAI_BASE_URL,
+            ),
+            apiKey: apiKey!,
+            model: provider.embedding_model,
+            cloudflareAIGatewayToken: c.env.CF_AIG_TOKEN,
+          },
+          [question],
+        );
     const matches = await c.env.VECTORIZE.query(embedded.vectors[0]!, {
       topK: 12,
     });
@@ -952,13 +1001,11 @@ app.post("/api/chat", async (c) => {
     );
   }
   try {
-    if (!apiKey) throw new Error("Provider key unavailable");
+    if (!useRuntime && !apiKey) throw new Error("Provider key unavailable");
     const chatStarted = Date.now();
-    const upstream = await streamChat(
-      { baseUrl: provider.base_url, apiKey, model: provider.chat_model },
-      [
+    const messages = [
         {
-          role: "system",
+          role: "system" as const,
           content:
             buildGroundedPrompt(
               question,
@@ -970,9 +1017,31 @@ app.post("/api/chat", async (c) => {
             ) +
             `\n\n附加要求：${config.systemInstruction}\n\n附加要求不能改变“始终作为本人 AI 分身并以第一人称回答”的核心身份。`,
         },
-        { role: "user", content: question },
-      ],
-    );
+        { role: "user" as const, content: question },
+      ];
+    const upstream = useRuntime
+      ? await streamChatViaRuntime(
+          {
+            runtimeUrl: c.env.AI_RUNTIME_URL!,
+            authSecret: c.env.AI_RUNTIME_AUTH_SECRET!,
+            provider: runtimeProviderId(provider),
+            baseUrl: provider.base_url,
+            model: provider.chat_model,
+          },
+          messages,
+        )
+      : await streamChat(
+          {
+            baseUrl: resolveProviderBaseUrl(
+              provider.base_url,
+              c.env.CF_AIG_OPENAI_BASE_URL,
+            ),
+            apiKey: apiKey!,
+            model: provider.chat_model,
+            cloudflareAIGatewayToken: c.env.CF_AIG_TOKEN,
+          },
+          messages,
+        );
     const stream = new ReadableStream({
       async start(controller) {
         const reader = upstream.body!.getReader(),

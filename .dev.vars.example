@@ -5,6 +5,14 @@ ADMIN_BOOTSTRAP_TOKEN=replace-with-one-time-bootstrap-token
 PASSWORD_RESET_FROM_EMAIL=Bunshin <no-reply@example.com>
 PUBLIC_ORIGIN=http://localhost:8787
 ADMIN_ORIGIN=http://localhost:8788
+# Optional: authenticate provider-native requests through Cloudflare AI Gateway.
+# The OpenAI API key still belongs to the user and remains the billing credential.
+CF_AIG_TOKEN=
+# Optional fixed-region model execution service. When both values are set,
+# Web/Admin use AI Runtime for chat, embeddings and provider tests.
+AI_RUNTIME_URL=http://127.0.0.1:8790
+AI_RUNTIME_AUTH_SECRET=replace-with-at-least-32-random-characters
+AI_RUNTIME_ENABLED=true
 # Optional: only enable Turnstile when both values are configured.
 TURNSTILE_SITE_KEY=
 TURNSTILE_SECRET_KEY=

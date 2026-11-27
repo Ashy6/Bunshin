@@ -4,6 +4,7 @@
   "main":"src/worker.ts",
   "compatibility_date":"2026-11-24",
   "compatibility_flags":["nodejs_compat"],
+  "vars":{"CF_AIG_OPENAI_BASE_URL":"https://gateway.ai.cloudflare.com/v1/9ce75c7d89010c42f44d17ba6680434f/default/openai"},
   "dev":{"port":8788,"inspector_port":9235},
   "assets":{"directory":"./dist","binding":"ASSETS","not_found_handling":"single-page-application","run_worker_first":["/api/*"]},
   "d1_databases":[{"binding":"DB","database_name":"ai-bunshin","database_id":"605fe3d9-1af8-48c2-b7de-ed836048c51e","migrations_dir":"../../packages/db/migrations"}],

@@ -2,9 +2,10 @@
 
 ## 1. 结构原则
 
-- 产品层面只有两个应用：`web` 和 `admin`。
+- 产品层面只有两个用户端：`web` 和 `admin`；另有一个可选内部模型执行服务 `runtime`。
 - `web` 负责公开页面、公开只读 API 和对话流。
 - `admin` 负责后台 UI、管理 API，以及 Queue 消费者。
+- `runtime` 只负责固定区域 Chat、Embedding 和渠道测试，不持有业务数据。
 - 共享代码只能放入职责明确的 `packages`，禁止创建无边界的 `shared` 大杂烩。
 - Cloudflare 资源定义集中管理，开发、预览和生产环境使用独立绑定。
 
@@ -33,7 +34,7 @@ ai-bunshin/
 │   │   ├── vite.config.ts
 │   │   └── wrangler.jsonc
 │   │
-│   └── admin/                       # 后台 SPA/SSR + Admin Worker + Queue
+│   ├── admin/                       # 后台 SPA/SSR + Admin Worker + Queue
 │       ├── app/
 │       │   ├── components/
 │       │   ├── features/
@@ -58,6 +59,14 @@ ai-bunshin/
 │       ├── tests/
 │       ├── vite.config.ts
 │       └── wrangler.jsonc
+│
+│   └── runtime/                     # 内部 Node.js AI Runtime
+│       ├── src/index.ts             # Container 内 Node/Hono 服务
+│       ├── src/worker.ts            # Cloudflare Container/DO 入口
+│       ├── Dockerfile
+│       ├── wrangler.jsonc           # 美国区域约束与 Container 配置
+│       ├── .env.example
+│       └── package.json
 │
 ├── packages/
 │   ├── ai/                          # Provider adapters、路由、流式响应
@@ -113,6 +122,15 @@ ai-bunshin/
 - ECharts 聚合数据接口。
 - Queue 消费者执行解析、切片和向量化。
 - 管理接口只通过独立后台域名提供。
+
+### apps/runtime
+
+- 仅提供 HMAC 签名保护的内部接口。
+- 模型 Key 只存在于运行平台 Secret。
+- 不访问 D1、R2、Vectorize、Session 或访客 Cookie。
+- 预设厂商使用固定 Base URL，自定义厂商必须进入允许列表。
+- 默认以 Cloudflare Container 部署到 ENAM/WNAM 美国区域；Secret 由 Worker 注入。
+- 生产内部接口使用 HMAC、时间窗和防重放校验。
 
 ## 4. 包依赖方向
 

@@ -1,0 +1,39 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "ai-bunshin-runtime",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-11-27",
+  "compatibility_flags": ["nodejs_compat"],
+  "containers": [
+    {
+      "class_name": "AiRuntimeContainer",
+      "scheduling_policy": "default",
+      "image": "./Dockerfile",
+      "image_build_context": "../..",
+      "instance_type": "lite",
+      "max_instances": 1,
+      "constraints": {
+        "regions": ["ENAM", "WNAM"],
+        "jurisdiction": "us"
+      }
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "AI_RUNTIME",
+        "class_name": "AiRuntimeContainer"
+      }
+    ]
+  },
+  "exports": {
+    "AiRuntimeContainer": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
+  "observability": {
+    "enabled": true,
+    "logs": { "enabled": true, "head_sampling_rate": 1 }
+  }
+}

@@ -1,9 +1,10 @@
 # ai-bunshin 设计文档
 
-`ai-bunshin` 是一个单人自托管的 AI 个人分身、简历与博客项目。仓库包含两个面向不同使用者的应用：
+`ai-bunshin` 是一个单人自托管的 AI 个人分身、简历与博客项目。仓库包含两个面向不同使用者的应用和一个可选内部模型执行服务：
 
 - `apps/web`：公开访客端，无注册、无用户体系。
 - `apps/admin`：仅站长使用的后台，包含内容、RAG、模型渠道和数据统计能力。
+- `apps/runtime`：固定区域部署的内部 AI Runtime，只负责 Chat、Embedding 和渠道健康检查。
 
 ## 文档索引
 
@@ -15,6 +16,7 @@
 - [生产环境端到端验收记录（2026-11-27）](./production-acceptance-2026-11-27.md)
 - [邮箱密码重置与模型连接方案](./password-reset-and-model-connectivity.md)
 - [离线恢复码与密码重置方案](./offline-recovery-codes.md)
+- [固定区域 AI Runtime 拆分与迁移方案](./ai-runtime-architecture.md)
 
 ## 已确认的产品边界
 

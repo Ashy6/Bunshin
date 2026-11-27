@@ -891,6 +891,7 @@ function Providers() {
       }>
     >([]),
     [presets, setPresets] = useState<ProviderPreset[]>([]),
+    [runtimeConfigured, setRuntimeConfigured] = useState(false),
     [open, setOpen] = useState(false),
     [key, setKey] = useState(""),
     [presetId, setPresetId] = useState("openai"),
@@ -903,6 +904,7 @@ function Providers() {
       adminFetch("/api/admin/provider-presets").then((r) => r.json()),
     ]).then(([a, b]: any[]) => {
       setItems(a.items);
+      setRuntimeConfigured(Boolean(a.runtimeConfigured));
       setPresets(b.items);
     });
   useEffect(() => {
@@ -957,14 +959,20 @@ function Providers() {
       <header className="page-head">
         <div>
           <p>模型渠道</p>
-          <h1>选择厂商，输入一个 API Key</h1>
+          <h1>
+            {runtimeConfigured
+              ? "选择由 AI Runtime 托管的模型厂商"
+              : "选择厂商，输入一个 API Key"}
+          </h1>
         </div>
         <button className="primary" onClick={() => setOpen(true)}>
           ＋ 配置渠道
         </button>
       </header>
       <div className="notice">
-        系统自动选择推荐模型。本地向量化不会外传简历；外部向量化必须单独授权。
+        {runtimeConfigured
+          ? "API Key 由固定区域 AI Runtime 的环境变量托管，管理后台不会接收或返回完整密钥。"
+          : "系统自动选择推荐模型。本地向量化不会外传简历；外部向量化必须单独授权。"}
       </div>
       <section className="provider-grid">
         {items.map((item) => (
@@ -973,7 +981,11 @@ function Providers() {
               <span className="provider-logo">{item.name[0]}</span>
               <div>
                 <h2>{item.name}</h2>
-                <p>{maskApiKey(item.key_preview)}</p>
+                <p>
+                  {runtimeConfigured
+                    ? "由 AI Runtime Secret 管理"
+                    : maskApiKey(item.key_preview)}
+                </p>
               </div>
               <span
                 className={`status ${item.health_status === "healthy" ? "ok" : ""}`}
@@ -1046,24 +1058,30 @@ function Providers() {
                   ))}
                 </select>
               </label>
-              <label>
-                API Key
-                <div className="drawer-secret-field">
-                  <input
-                    type="password"
-                    required
-                    value={key}
-                    onChange={(e) => setKey(e.target.value)}
-                    autoComplete="new-password"
-                    aria-label="API Key"
-                  />
-                  <span className="drawer-secret-mask">
-                    {key ? maskApiKey(key) : "粘贴 API Key"}
-                  </span>
-                  <span className="drawer-secret-count">{key.length} 字符</span>
+              {runtimeConfigured ? (
+                <div className="notice">
+                  密钥来源：AI Runtime 环境变量。这里只保存厂商、模型、预算和向量化策略。
                 </div>
-                <small>完整 Key 只在本次提交中使用，保存后不可读取。</small>
-              </label>
+              ) : (
+                <label>
+                  API Key
+                  <div className="drawer-secret-field">
+                    <input
+                      type="password"
+                      required
+                      value={key}
+                      onChange={(e) => setKey(e.target.value)}
+                      autoComplete="new-password"
+                      aria-label="API Key"
+                    />
+                    <span className="drawer-secret-mask">
+                      {key ? maskApiKey(key) : "粘贴 API Key"}
+                    </span>
+                    <span className="drawer-secret-count">{key.length} 字符</span>
+                  </div>
+                  <small>完整 Key 只在本次提交中使用，保存后不可读取。</small>
+                </label>
+              )}
               {presetId === "custom" && (
                 <>
                   <label>

@@ -4,6 +4,9 @@
   "main": "src/index.tsx",
   "compatibility_date": "2026-11-24",
   "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "CF_AIG_OPENAI_BASE_URL": "https://gateway.ai.cloudflare.com/v1/9ce75c7d89010c42f44d17ba6680434f/default/openai"
+  },
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",

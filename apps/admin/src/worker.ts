@@ -4,7 +4,13 @@ import {
   encryptSecret,
   type EncryptedSecret,
 } from "@ai-bunshin/crypto";
-import { createEmbedding, testChatConnection } from "@ai-bunshin/ai";
+import {
+  createEmbedding,
+  createEmbeddingViaRuntime,
+  resolveProviderBaseUrl,
+  testChatConnection,
+  testChatViaRuntime,
+} from "@ai-bunshin/ai";
 import { bm25Search, chunkText, cosineSimilarity, createLocalEmbedding, reciprocalRankFusion, rerankHybrid } from "@ai-bunshin/rag";
 import { extractText, getDocumentProxy } from "unpdf";
 import {
@@ -36,6 +42,11 @@ type Env = {
   MASTER_ENCRYPTION_KEY: string;
   SESSION_SECRET: string;
   ADMIN_BOOTSTRAP_TOKEN: string;
+  CF_AIG_TOKEN?: string;
+  CF_AIG_OPENAI_BASE_URL?: string;
+  AI_RUNTIME_URL?: string;
+  AI_RUNTIME_AUTH_SECRET?: string;
+  AI_RUNTIME_ENABLED?: string;
   PASSWORD_RESET_FROM_EMAIL?: string;
   EMAIL?: {
     send(message: {
@@ -96,6 +107,16 @@ const providerPresets = {
     outputPriceMicros: 0,
   },
 } as const;
+function runtimeEnabled(env: Env) {
+  return Boolean(
+    env.AI_RUNTIME_URL &&
+      env.AI_RUNTIME_AUTH_SECRET &&
+      env.AI_RUNTIME_ENABLED !== "false",
+  );
+}
+function runtimeProviderId(provider: { preset_id?: string | null; kind: string }) {
+  return provider.preset_id || (provider.kind === "openai" ? "openai" : "custom");
+}
 const defaultAgentConfig = {
   enabled: true,
   dailyLimit: 25,
@@ -1200,6 +1221,11 @@ app.get("/api/admin/provider-presets", (c) =>
     items: Object.entries(providerPresets).map(([id, value]) => ({
       id,
       ...value,
+      ...(id === "openai" &&
+      !runtimeEnabled(c.env) &&
+      c.env.CF_AIG_OPENAI_BASE_URL
+        ? { baseUrl: c.env.CF_AIG_OPENAI_BASE_URL.replace(/\/$/, "") }
+        : {}),
     })),
   }),
 );
@@ -1251,15 +1277,19 @@ app.get("/api/admin/documents/:id/download", async (c) => {
     },
   });
 });
-app.get("/api/admin/providers", async (c) =>
-  c.json({
-    items: (
+app.get("/api/admin/providers", async (c) => {
+  const useRuntime = runtimeEnabled(c.env),
+    items = (
       await c.env.DB.prepare(
         "SELECT id,name,kind,base_url,key_preview,chat_model,embedding_model,embedding_mode,preset_id,monthly_budget_micros,enabled,is_default,health_status,last_checked_at,last_error,updated_at FROM providers ORDER BY updated_at DESC",
-      ).all()
-    ).results,
-  }),
-);
+      ).all<Record<string, unknown>>()
+    ).results.map((item) => ({
+      ...item,
+      key_preview: useRuntime ? "Runtime Secret" : item.key_preview,
+      key_source: useRuntime ? "runtime_secret" : "encrypted_database",
+    }));
+  return c.json({ items, runtimeConfigured: useRuntime });
+});
 app.post("/api/admin/articles/import", async (c) => {
   const form = await c.req.formData(), files = form.getAll("files");
   if (!files.length || files.some((file) => !(file instanceof File)))
@@ -1582,26 +1612,46 @@ app.post("/api/admin/providers/simple", async (c) => {
   );
   if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
   const input = parsed.data,
+    useRuntime = runtimeEnabled(c.env),
     preset = providerPresets[input.presetId],
     baseUrl =
       input.presetId === "custom"
         ? (input.baseUrl ?? preset.baseUrl)
-        : preset.baseUrl,
+        : input.presetId === "openai" &&
+            !useRuntime &&
+            c.env.CF_AIG_OPENAI_BASE_URL
+          ? c.env.CF_AIG_OPENAI_BASE_URL.replace(/\/$/, "")
+          : preset.baseUrl,
     chatModel = input.chatModel ?? preset.chatModel,
-    encrypted = await encryptSecret(input.apiKey, c.env.MASTER_ENCRYPTION_KEY),
+    secretValue = useRuntime ? `runtime:${input.presetId}` : input.apiKey,
+    encrypted = await encryptSecret(secretValue, c.env.MASTER_ENCRYPTION_KEY),
     now = new Date().toISOString(),
     id = crypto.randomUUID(),
-    preview = `${input.apiKey.slice(0, 4)}*****${input.apiKey.slice(-2)}`,
+    preview = useRuntime
+      ? "Runtime Secret"
+      : `${input.apiKey.slice(0, 4)}*****${input.apiKey.slice(-2)}`,
     embeddingMode =
       input.allowExternalEmbedding && preset.embeddingMode === "provider"
         ? "provider"
         : "local";
+  if (!useRuntime && input.apiKey.length < 8)
+    return c.json({ error: "API Key 至少需要 8 个字符" }, 400);
   try {
-    await testChatConnection({
-      baseUrl,
-      apiKey: input.apiKey,
-      model: chatModel,
-    });
+    if (useRuntime)
+      await testChatViaRuntime({
+        runtimeUrl: c.env.AI_RUNTIME_URL!,
+        authSecret: c.env.AI_RUNTIME_AUTH_SECRET!,
+        provider: input.presetId,
+        baseUrl,
+        model: chatModel,
+      });
+    else
+      await testChatConnection({
+        baseUrl,
+        apiKey: input.apiKey,
+        model: chatModel,
+        cloudflareAIGatewayToken: c.env.CF_AIG_TOKEN,
+      });
   } catch (error) {
     return c.json(
       {
@@ -1669,11 +1719,13 @@ app.post("/api/admin/providers/simple", async (c) => {
 });
 app.post("/api/admin/providers/:id/test", async (c) => {
   const provider = await c.env.DB.prepare(
-    "SELECT id,base_url,encrypted_api_key,chat_model FROM providers WHERE id=? LIMIT 1",
+    "SELECT id,kind,preset_id,base_url,encrypted_api_key,chat_model FROM providers WHERE id=? LIMIT 1",
   )
     .bind(c.req.param("id"))
     .first<{
       id: string;
+      kind: string;
+      preset_id: string | null;
       base_url: string;
       encrypted_api_key: string;
       chat_model: string;
@@ -1681,15 +1733,29 @@ app.post("/api/admin/providers/:id/test", async (c) => {
   if (!provider) return c.json({ error: "渠道不存在" }, 404);
   const now = new Date().toISOString();
   try {
-    const apiKey = await decryptSecret(
-      JSON.parse(provider.encrypted_api_key) as EncryptedSecret,
-      c.env.MASTER_ENCRYPTION_KEY,
-    );
-    await testChatConnection({
-      baseUrl: provider.base_url,
-      apiKey,
-      model: provider.chat_model,
-    });
+    if (runtimeEnabled(c.env))
+      await testChatViaRuntime({
+        runtimeUrl: c.env.AI_RUNTIME_URL!,
+        authSecret: c.env.AI_RUNTIME_AUTH_SECRET!,
+        provider: runtimeProviderId(provider),
+        baseUrl: provider.base_url,
+        model: provider.chat_model,
+      });
+    else {
+      const apiKey = await decryptSecret(
+        JSON.parse(provider.encrypted_api_key) as EncryptedSecret,
+        c.env.MASTER_ENCRYPTION_KEY,
+      );
+      await testChatConnection({
+        baseUrl: resolveProviderBaseUrl(
+          provider.base_url,
+          c.env.CF_AIG_OPENAI_BASE_URL,
+        ),
+        apiKey,
+        model: provider.chat_model,
+        cloudflareAIGatewayToken: c.env.CF_AIG_TOKEN,
+      });
+    }
     await c.env.DB.prepare(
       "UPDATE providers SET health_status='healthy',last_checked_at=?,last_error=NULL,updated_at=? WHERE id=?",
     )
@@ -2115,9 +2181,11 @@ async function consume(batch: MessageBatch<Job>, env: Env) {
           ),
         );
       const provider = await env.DB.prepare(
-        "SELECT id,base_url,encrypted_api_key,embedding_model,embedding_mode FROM providers WHERE enabled=1 AND is_default=1 LIMIT 1",
+        "SELECT id,kind,preset_id,base_url,encrypted_api_key,embedding_model,embedding_mode FROM providers WHERE enabled=1 AND is_default=1 LIMIT 1",
       ).first<{
         id: string;
+        kind: string;
+        preset_id: string | null;
         base_url: string;
         encrypted_api_key: string;
         embedding_model: string;
@@ -2130,19 +2198,37 @@ async function consume(batch: MessageBatch<Job>, env: Env) {
         )
           .bind(new Date().toISOString(), job.documentId)
           .run();
-        const apiKey = await decryptSecret(
-          JSON.parse(provider.encrypted_api_key) as EncryptedSecret,
-          env.MASTER_ENCRYPTION_KEY,
-        );
-        const started = Date.now(),
-          embedded = await createEmbedding(
-            {
-              baseUrl: provider.base_url,
-              apiKey,
-              model: provider.embedding_model,
-            },
-            chunks.map((chunk) => chunk.text),
-          );
+        const useRuntime = runtimeEnabled(env),
+          apiKey = useRuntime
+            ? null
+            : await decryptSecret(
+                JSON.parse(provider.encrypted_api_key) as EncryptedSecret,
+                env.MASTER_ENCRYPTION_KEY,
+              ),
+          started = Date.now(),
+          embedded = useRuntime
+            ? await createEmbeddingViaRuntime(
+                {
+                  runtimeUrl: env.AI_RUNTIME_URL!,
+                  authSecret: env.AI_RUNTIME_AUTH_SECRET!,
+                  provider: runtimeProviderId(provider),
+                  baseUrl: provider.base_url,
+                  model: provider.embedding_model,
+                },
+                chunks.map((chunk) => chunk.text),
+              )
+            : await createEmbedding(
+                {
+                  baseUrl: resolveProviderBaseUrl(
+                    provider.base_url,
+                    env.CF_AIG_OPENAI_BASE_URL,
+                  ),
+                  apiKey: apiKey!,
+                  model: provider.embedding_model,
+                  cloudflareAIGatewayToken: env.CF_AIG_TOKEN,
+                },
+                chunks.map((chunk) => chunk.text),
+              );
         await env.VECTORIZE.upsert(
           chunks.map((chunk, index) => ({
             id: chunk.id,

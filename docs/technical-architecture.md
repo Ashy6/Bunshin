@@ -26,10 +26,11 @@ Cloudflare 当前建议新项目优先使用 Workers Static Assets，而非新�
 
 ### 2.1 API 所在位置
 
-本项目不创建独立 `apps/api`。API 按使用者和安全边界分别内聚在两个应用的 Cloudflare Worker 中：
+本项目不创建公开的独立 `apps/api`。业务 API 按使用者和安全边界分别内聚在两个 Cloudflare Worker 中；可选 `apps/runtime` 只承载固定区域模型执行：
 
 - `apps/web/worker`：公开只读 API、搜索和 Agent 对话流。
 - `apps/admin/worker`：登录、内容管理、上传、模型配置、统计和异步任务消费者。
+- `apps/runtime`：内部 HMAC 鉴权的 Chat、Embedding 与渠道测试，不接触业务存储。
 - `packages/*`：共享领域逻辑，不对外监听端口，也不是第三个服务。
 
 ```mermaid
@@ -42,7 +43,8 @@ flowchart LR
 
     WW -->|读取已发布内容| D1[(D1)]
     WW -->|问题向量检索| VX[(Vectorize)]
-    WW -->|模型请求| LLM[模型厂商 / AI Gateway]
+    WW -->|签名模型请求| RT[固定区域 AI Runtime]
+    RT -->|模型请求| LLM[模型厂商]
     WW -->|调用量事件| D1
     WW -->|限流 / 缓存| KV[(KV / Cache)]
 
@@ -53,14 +55,14 @@ flowchart LR
     C -->|读取原文件| R2
     C -->|任务状态 / 切片正文| D1
     C -->|写入 / 删除向量| VX
-    C -->|Embedding 请求| LLM
+    C -->|Embedding 请求| RT
 
     WW -.共享包.-> P[packages/*\nDomain / DB / AI / RAG]
     AW -.共享包.-> P
     C -.共享包.-> P
 ```
 
-`Web Worker` 和 `Admin Worker` 是两个独立部署单元、两个域名和两个权限边界；它们共用同一套 D1/R2/Vectorize 资源和共享包。这样保持“两个项目”的产品心智，同时避免独立 API 服务带来的第三套部署、鉴权和跨服务调用。
+`Web Worker` 和 `Admin Worker` 是两个用户端及业务权限边界；它们共用 D1/R2/Vectorize。`AI Runtime` 是可选的第三个部署单元，只持有模型 Secret，通过 HMAC 与两个 Worker 通信，不形成第三套用户产品。详细安全和迁移契约见 `ai-runtime-architecture.md`。
 
 ```text
 访客
