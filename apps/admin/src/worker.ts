@@ -1223,6 +1223,7 @@ app.get("/api/admin/provider-presets", (c) =>
       ...value,
       ...(id === "openai" &&
       !runtimeEnabled(c.env) &&
+      c.env.CF_AIG_TOKEN &&
       c.env.CF_AIG_OPENAI_BASE_URL
         ? { baseUrl: c.env.CF_AIG_OPENAI_BASE_URL.replace(/\/$/, "") }
         : {}),
@@ -1619,6 +1620,7 @@ app.post("/api/admin/providers/simple", async (c) => {
         ? (input.baseUrl ?? preset.baseUrl)
         : input.presetId === "openai" &&
             !useRuntime &&
+            c.env.CF_AIG_TOKEN &&
             c.env.CF_AIG_OPENAI_BASE_URL
           ? c.env.CF_AIG_OPENAI_BASE_URL.replace(/\/$/, "")
           : preset.baseUrl,
@@ -1749,7 +1751,7 @@ app.post("/api/admin/providers/:id/test", async (c) => {
       await testChatConnection({
         baseUrl: resolveProviderBaseUrl(
           provider.base_url,
-          c.env.CF_AIG_OPENAI_BASE_URL,
+          c.env.CF_AIG_TOKEN ? c.env.CF_AIG_OPENAI_BASE_URL : undefined,
         ),
         apiKey,
         model: provider.chat_model,
@@ -2221,7 +2223,7 @@ async function consume(batch: MessageBatch<Job>, env: Env) {
                 {
                   baseUrl: resolveProviderBaseUrl(
                     provider.base_url,
-                    env.CF_AIG_OPENAI_BASE_URL,
+                    env.CF_AIG_TOKEN ? env.CF_AIG_OPENAI_BASE_URL : undefined,
                   ),
                   apiKey: apiKey!,
                   model: provider.embedding_model,

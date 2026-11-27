@@ -259,7 +259,7 @@ wrangler secret put AI_RUNTIME_AUTH_SECRET --config apps/admin/wrangler.jsonc
 
 Runtime 至少需要 `AI_RUNTIME_AUTH_SECRET` 和对应厂商密钥（如 `OPENAI_API_KEY`）。同一个 `AI_RUNTIME_AUTH_SECRET` 同时配置到 Runtime、Web Worker 和 Admin Worker。Runtime 必须部署在固定、合规且受模型厂商支持的区域；再部署一个普通全球 Worker 并不能保证改变上游出口。完整方案见 [固定区域 AI Runtime 拆分与迁移方案](./docs/ai-runtime-architecture.md)。
 
-若 Admin Worker 配置了 `CF_AIG_OPENAI_BASE_URL`，内置 OpenAI 预设会自动通过该 provider-native Gateway 地址转发；普通用户仍只需输入自己的 OpenAI API Key。后端仅当 Base URL 的主机严格等于 `gateway.ai.cloudflare.com` 时，才从 Worker Secret 读取 `CF_AIG_TOKEN` 并发送 `cf-aig-authorization`，避免把平台 Token 泄露给其他兼容渠道。OpenAI Key 继续放在标准 `Authorization` 请求头中，因此推理费用由用户的 OpenAI 账户承担，而不是 Cloudflare Unified Billing。
+只有同时配置 `CF_AIG_OPENAI_BASE_URL` 和有效的 `CF_AIG_TOKEN` 时才启用 Cloudflare AI Gateway；缺少 Token 时继续使用渠道自身地址，避免受保护 Gateway 返回 401。生产配置可预置 Gateway 地址，运维只需用 Worker Secret 补充 `CF_AIG_TOKEN` 即可启用。启用后，后端仅当 Base URL 的主机严格等于 `gateway.ai.cloudflare.com` 时发送 `cf-aig-authorization`，避免把平台 Token 泄露给其他兼容渠道。OpenAI Key 继续放在标准 `Authorization` 请求头中，因此推理费用由用户的 OpenAI 账户承担，而不是 Cloudflare Unified Billing。
 
 Turnstile 只有在 Site Key 与 Secret Key 同时配置时启用。前端 Token 必须由 Web Worker 调用 Cloudflare Siteverify 校验，且每次成功或失败后都会重置；它与 D1 中默认 25 次的服务端额度是两层独立保护。`cf_clearance` 是 Cloudflare WAF/Challenge 的可选凭据，不作为业务额度身份。详细方案见 [生产监控、混合 RAG 与 Turnstile](./docs/observability-rag-turnstile.md)。
 
@@ -281,7 +281,9 @@ Turnstile 只有在 Site Key 与 Secret Key 同时配置时启用。前端 Token
 
 公开站点只采用两种响应式导航：`>=768px` 统一使用顶部导航，不显示左侧导航；`<=767px` 使用顶部菜单按钮和下拉导航抽屉。站内文章、分类、归档和关于页面由浏览器拦截同源链接并局部替换主内容，同时更新 History、canonical、Open Graph 和 JSON-LD；直接访问任意 URL 仍由 Worker 服务端渲染，SEO 与无 JavaScript 访问不受影响。Agent 参考资料只有在文档提供公开 `source_url` 时才显示“访问原文章”，文章来源会进入 `/articles/:slug`。后台在 `<=820px` 改为顶部工具栏与下拉导航抽屉，避免窄屏侧栏挤压表单；静态资源使用显式版本号，公开页内置最小关键布局样式作为加载延迟兜底。
 
-Agent 的核心身份由服务端固定：它始终是资料所有者本人的 AI 分身，使用第一人称描述资料中的经历、项目、观点和文章；后台“附加系统要求”不能覆盖该身份。完整生成回答受后台启用开关、健康模型渠道、已索引知识库和服务端额度共同控制；渠道异常时继续提供本地知识检索，并统一显示为“知识检索已就绪”。
+Agent 的核心身份由服务端固定：它始终是资料所有者本人的 AI 分身，使用第一人称描述资料中的经历、项目、观点和文章；后台“附加系统要求”不能覆盖该身份。完整生成回答受后台启用开关、健康模型渠道、已索引知识库和服务端额度共同控制。渠道异常时不会再把原始 Chunk 直接拼接给访客，而是释放额度并明确提示模型生成暂不可用。
+
+知识文档按 Markdown 标题、空行段落和句子三级切分：目标约 1000 字符、语义重叠最多约 120 字符，超长单段继续按句子和硬上限拆分。检索先从最多 1500 个 Chunk 中分别取得 BM25 与本地/外部向量候选，使用 RRF 融合后重排，再应用最低相关性、每文档最多 2 段、总上下文约 4800 字符和最终最多 4 段的门控。标题和标题路径参与关键词检索，但发给模型的证据仍是原始正文。
 
 后台用量页和 ECharts 从 `usage_events` 读取真实 Chat/Embedding 请求、Token、延迟与状态。后台左下角和移动端头像区读取同一份个人资料，保存名称、职业标题或头像后会同步更新全局站长身份。费用只有在渠道价格可确定时才是估算值；它不等同于厂商账户真实余额。
 

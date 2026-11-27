@@ -16,7 +16,7 @@ import {
   createLocalEmbedding,
   hasMeaningfulOverlap,
   reciprocalRankFusion,
-  rerankHybrid,
+  selectRelevantContexts,
 } from "@ai-bunshin/rag";
 
 type Bindings = {
@@ -877,16 +877,21 @@ app.post("/api/chat", async (c) => {
     );
   type RetrievalRow={
     id: string;
+    document_id: string;
     content: string;
     title: string;
     score: number;
     source_url?: string | null;
     embedding_json?:string|null;
+    heading_path?:string|null;
   };
   const retrievalStarted=Date.now(),corpus=(await c.env.DB.prepare(
-    "SELECT chunks.id,chunks.content,documents.title,documents.source_url,local_vectors.embedding_json FROM chunks JOIN documents ON documents.id=chunks.document_id LEFT JOIN local_vectors ON local_vectors.chunk_id=chunks.id WHERE documents.status='indexed' AND documents.visibility!='private' ORDER BY documents.updated_at DESC LIMIT 1500",
+    "SELECT chunks.id,chunks.document_id,chunks.content,chunks.heading_path,documents.title,documents.source_url,local_vectors.embedding_json FROM chunks JOIN documents ON documents.id=chunks.document_id LEFT JOIN local_vectors ON local_vectors.chunk_id=chunks.id WHERE documents.status='indexed' AND documents.visibility!='private' ORDER BY documents.updated_at DESC LIMIT 1500",
   ).all<Omit<RetrievalRow,"score">>()).results,
-    lexical=bm25Search(question,corpus,12).filter((item)=>hasMeaningfulOverlap(question,item.content));
+    corpusById=new Map(corpus.map((row)=>[row.id,row])),
+    lexical=bm25Search(question,corpus.map((row)=>({id:row.id,content:`${row.title}\n${JSON.parse(row.heading_path||"[]").join(" / ")}\n${row.content}`})),12)
+      .flatMap((item)=>{const source=corpusById.get(item.id);return source?[{...source,score:item.score}]:[]})
+      .filter((item)=>hasMeaningfulOverlap(question,`${item.title}\n${item.content}`));
   let vectorRanking:Array<RetrievalRow>=[],retrievalMode="local_hybrid";
   if (
     providerReady &&
@@ -910,7 +915,7 @@ app.post("/api/chat", async (c) => {
           {
             baseUrl: resolveProviderBaseUrl(
               provider.base_url,
-              c.env.CF_AIG_OPENAI_BASE_URL,
+              c.env.CF_AIG_TOKEN ? c.env.CF_AIG_OPENAI_BASE_URL : undefined,
             ),
             apiKey: apiKey!,
             model: provider.embedding_model,
@@ -921,8 +926,7 @@ app.post("/api/chat", async (c) => {
     const matches = await c.env.VECTORIZE.query(embedded.vectors[0]!, {
       topK: 12,
     });
-    const byId=new Map(corpus.map((row)=>[row.id,row]));
-    vectorRanking=matches.matches.flatMap((match)=>{const row=byId.get(match.id);return row&&match.score>=.45?[{...row,score:match.score}]:[]});
+    vectorRanking=matches.matches.flatMap((match)=>{const row=corpusById.get(match.id);return row&&match.score>=.45?[{...row,score:match.score}]:[]});
     c.executionCtx.waitUntil(
       c.env.DB.prepare(
         "INSERT INTO usage_events (id,scenario,provider_id,model,input_tokens,output_tokens,cached_tokens,cost_micros,currency,latency_ms,status,estimated,trace_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -964,7 +968,7 @@ app.post("/api/chat", async (c) => {
       );
   }
   const fused=reciprocalRankFusion([lexical,vectorRanking],8),
-    contexts=rerankHybrid(question,fused,5) as RetrievalRow[],
+    contexts=selectRelevantContexts(question,fused,{limit:4,maxChars:4800,maxPerDocument:2}) as RetrievalRow[],
     retrievalMs=Date.now()-retrievalStarted,
     retrievalTrace=crypto.randomUUID();
   c.executionCtx.waitUntil(Promise.all([
@@ -992,11 +996,9 @@ app.post("/api/chat", async (c) => {
       visitor.setCookie ? { "Set-Cookie": visitor.setCookie } : undefined,
     );
   if (!providerReady || !provider) {
-    const evidence = contexts
-      .map((item, index) => `[${index + 1}] ${item.title}：${item.content}`)
-      .join("\n\n");
+    await quota.release();
     return new Response(
-      `data: ${JSON.stringify({ type: "delta", text: `根据知识库检索到以下相关资料：\n\n${evidence}` })}\n\ndata: ${JSON.stringify({ type: "done", remaining: quota.remaining })}\n\n`,
+      `data: ${JSON.stringify({ type: "error", text: "知识库检索已完成，但模型生成服务暂不可用。为避免展示未经整理的原始资料，本次不直接拼接 Chunk，请稍后重试。" })}\n\ndata: ${JSON.stringify({ type: "done", remaining: quota.remaining + 1 })}\n\n`,
       { headers },
     );
   }
@@ -1034,7 +1036,7 @@ app.post("/api/chat", async (c) => {
           {
             baseUrl: resolveProviderBaseUrl(
               provider.base_url,
-              c.env.CF_AIG_OPENAI_BASE_URL,
+              c.env.CF_AIG_TOKEN ? c.env.CF_AIG_OPENAI_BASE_URL : undefined,
             ),
             apiKey: apiKey!,
             model: provider.chat_model,
