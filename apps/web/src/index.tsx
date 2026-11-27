@@ -8,6 +8,7 @@ import {
   buildGroundedPrompt,
   cosineSimilarity,
   createLocalEmbedding,
+  hasMeaningfulOverlap,
   reciprocalRankFusion,
   rerankHybrid,
 } from "@ai-bunshin/rag";
@@ -497,7 +498,7 @@ function layout(
             回答请以引用来源为准。
           </footer>
         </div>
-        <script src="/agent.js?v=20261127.2" defer></script>
+        <script src="/agent.js?v=20261127.3" defer></script>
       </body>
     </html>`;
 }
@@ -513,7 +514,7 @@ app.get("/", async (c) => {
       `${profile?.display_name || "个人分身"}-AI分身`,
       html`<section class="hero agent-home" id="ask">
           <p class="eyebrow">AI PERSONAL TWIN</p>
-          <h1 id="agent-greeting">你好，我是${profile?.display_name || "站长"}的 AI 分身</h1>
+          <h1 id="agent-greeting">你好，我是 <span class="hero-owner">${profile?.display_name || "站长"}</span> 的 AI 分身</h1>
           <p class="agent-intro">
             你可以直接问我的经历、项目、文章和知识积累；回答只依据已录入的资料。
           </p>
@@ -864,7 +865,7 @@ app.post("/api/chat", async (c) => {
   const retrievalStarted=Date.now(),corpus=(await c.env.DB.prepare(
     "SELECT chunks.id,chunks.content,documents.title,documents.source_url,local_vectors.embedding_json FROM chunks JOIN documents ON documents.id=chunks.document_id LEFT JOIN local_vectors ON local_vectors.chunk_id=chunks.id WHERE documents.status='indexed' AND documents.visibility!='private' ORDER BY documents.updated_at DESC LIMIT 1500",
   ).all<Omit<RetrievalRow,"score">>()).results,
-    lexical=bm25Search(question,corpus,12);
+    lexical=bm25Search(question,corpus,12).filter((item)=>hasMeaningfulOverlap(question,item.content));
   let vectorRanking:Array<RetrievalRow>=[],retrievalMode="local_hybrid";
   if (provider?.embedding_mode === "provider" && apiKey) {
     retrievalMode="provider_hybrid";
@@ -877,7 +878,7 @@ app.post("/api/chat", async (c) => {
       topK: 12,
     });
     const byId=new Map(corpus.map((row)=>[row.id,row]));
-    vectorRanking=matches.matches.flatMap((match)=>{const row=byId.get(match.id);return row?[{...row,score:match.score}]:[]});
+    vectorRanking=matches.matches.flatMap((match)=>{const row=byId.get(match.id);return row&&match.score>=.45?[{...row,score:match.score}]:[]});
     c.executionCtx.waitUntil(
       c.env.DB.prepare(
         "INSERT INTO usage_events (id,scenario,provider_id,model,input_tokens,output_tokens,cached_tokens,cost_micros,currency,latency_ms,status,estimated,trace_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -913,7 +914,7 @@ app.post("/api/chat", async (c) => {
       }))
       .sort((a, b) => b.score - a.score)
       .slice(0, 12)
-      .filter((row) => row.score > 0);
+      .filter((row) => row.score >= .12);
   }
   const fused=reciprocalRankFusion([lexical,vectorRanking],8),
     contexts=rerankHybrid(question,fused,5) as RetrievalRow[],

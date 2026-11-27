@@ -113,6 +113,11 @@ function renderAnswer(value) {
 }
 
 function renderSources(container, items) {
+  if (!items.length) {
+    container.hidden = true;
+    container.replaceChildren();
+    return;
+  }
   container.hidden = false;
   container.replaceChildren();
   const title = document.createElement("strong");
@@ -137,6 +142,11 @@ function renderSources(container, items) {
     list.append(entry);
   }
   container.append(list);
+}
+
+function renderCitedSources(container, items, answerText) {
+  const cited = new Set([...answerText.matchAll(/\[(\d+)\]/g)].map((match) => Number(match[1])));
+  renderSources(container, items.filter((item) => cited.has(Number(item.index))));
 }
 
 function setAvailability(status) {
@@ -205,7 +215,7 @@ form?.addEventListener("submit", async (event) => {
     answer.textContent = "";
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
-    let buffer = "", answerText = "";
+    let buffer = "", answerText = "", pendingSources = [];
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -226,14 +236,13 @@ form?.addEventListener("submit", async (event) => {
           answerText += `\n\n${data.text}`;
           answer.innerHTML = renderAnswer(answerText);
         }
-        if (data.type === "sources" && sources) {
-          renderSources(sources, data.items);
-        }
+        if (data.type === "sources") pendingSources = Array.isArray(data.items) ? data.items : [];
         if (data.type === "done" && Number.isFinite(data.remaining)) {
           remainingCount = data.remaining;
           if (quotaText)
             quotaText.textContent = `今日剩余 ${remainingCount} 次`;
         }
+        if (data.type === "done" && sources) renderCitedSources(sources, pendingSources, answerText);
       }
     }
   } catch {
@@ -376,7 +385,7 @@ async function submitDynamicQuestion(dynamicForm) {
     dynamicAnswer.textContent = "";
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
-    let buffer = "", answerText = "";
+    let buffer = "", answerText = "", pendingSources = [];
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -389,12 +398,13 @@ async function submitDynamicQuestion(dynamicForm) {
         const data = JSON.parse(line.slice(6));
         if (data.type === "delta") { answerText += data.text; dynamicAnswer.innerHTML = renderAnswer(answerText); }
         if (data.type === "error") { answerText += `\n\n${data.text}`; dynamicAnswer.innerHTML = renderAnswer(answerText); }
-        if (data.type === "sources" && dynamicSources) renderSources(dynamicSources, data.items);
+        if (data.type === "sources") pendingSources = Array.isArray(data.items) ? data.items : [];
         if (data.type === "done" && Number.isFinite(data.remaining)) {
           remainingCount = data.remaining;
           const dynamicQuota = document.querySelector("#agent-quota");
           if (dynamicQuota) dynamicQuota.textContent = `今日剩余 ${remainingCount} 次`;
         }
+        if (data.type === "done" && dynamicSources) renderCitedSources(dynamicSources, pendingSources, answerText);
       }
     }
   } catch {
