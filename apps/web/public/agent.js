@@ -90,6 +90,7 @@ function inline(value) {
 }
 function renderAnswer(value) {
   const lines = value.replace(/\r/g, "").split("\n"), blocks = [];
+  let orderedListNumber = 1;
   for (let index = 0; index < lines.length;) {
     const line = lines[index] || "";
     if (!line.trim()) { index += 1; continue; }
@@ -101,9 +102,11 @@ function renderAnswer(value) {
       blocks.push(`<ul>${items.join("")}</ul>`); continue;
     }
     if (/^\d+[.)]\s+/.test(line)) {
-      const items = [];
+      const items = [], explicitStart = Number(/^\d+/.exec(line)?.[0] || 1);
+      const start = explicitStart > 1 ? explicitStart : orderedListNumber;
       while (index < lines.length && /^\d+[.)]\s+/.test(lines[index])) items.push(`<li>${inline(lines[index++].replace(/^\d+[.)]\s+/, ""))}</li>`);
-      blocks.push(`<ol>${items.join("")}</ol>`); continue;
+      orderedListNumber = start + items.length;
+      blocks.push(`<ol${start > 1 ? ` start="${start}"` : ""}>${items.join("")}</ol>`); continue;
     }
     const paragraph = [line]; index += 1;
     while (index < lines.length && lines[index].trim() && !/^(#{1,3})\s|^[-*]\s+|^\d+[.)]\s+/.test(lines[index])) paragraph.push(lines[index++]);
