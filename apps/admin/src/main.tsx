@@ -1448,12 +1448,13 @@ function AdminApp() {
   );
 }
 function AuthGate() {
-  const [status, setStatus] = useState<"loading" | "setup" | "login" | "reset-request" | "reset-confirm" | "ready">(
+  const [status, setStatus] = useState<"loading" | "setup" | "login" | "reset-method" | "reset-request" | "reset-confirm" | "recovery-reset" | "recovery-codes" | "ready">(
     "loading",
   );
   const [error, setError] = useState(""),
     [message, setMessage] = useState(""),
     [resetEmail, setResetEmail] = useState(""),
+    [recoveryCodes, setRecoveryCodes] = useState<string[]>([]),
     [passwordResetAvailable, setPasswordResetAvailable] = useState(false);
   useEffect(() => {
     Promise.all([
@@ -1478,11 +1479,49 @@ function AuthGate() {
     );
   if (status === "ready")
     return <AdminApp />;
+  const downloadRecoveryCodes = () => {
+    const blob = new Blob([`Bunshin 离线恢复码\n\n${recoveryCodes.join("\n")}\n\n每个恢复码只能使用一次，请离线妥善保存。\n`], { type: "text/plain;charset=utf-8" }),
+      url = URL.createObjectURL(blob),
+      link = document.createElement("a");
+    link.href = url;
+    link.download = "bunshin-recovery-codes.txt";
+    link.click();
+    URL.revokeObjectURL(url);
+  };
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setError("");
     setMessage("");
     const form = new FormData(event.currentTarget);
+    if (status === "recovery-codes") {
+      setStatus("ready");
+      return;
+    }
+    if (status === "recovery-reset") {
+      const password = String(form.get("password") || ""),
+        passwordConfirm = String(form.get("passwordConfirm") || "");
+      if (password !== passwordConfirm) {
+        setError("两次输入的新密码不一致");
+        return;
+      }
+      const response = await fetch("/api/admin/auth/recovery/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: String(form.get("email") || ""),
+          recoveryCode: String(form.get("recoveryCode") || ""),
+          password,
+        }),
+      });
+      const result = await response.json().catch(() => ({})) as { error?: string; message?: string };
+      if (!response.ok) {
+        setError(result.error || "恢复码校验失败");
+        return;
+      }
+      setMessage(result.message || "密码已修改，请重新登录");
+      setStatus("login");
+      return;
+    }
     if (status === "reset-request") {
       const email = String(form.get("email") || "").trim();
       const response = await fetch("/api/admin/auth/password-reset/request", {
@@ -1530,9 +1569,9 @@ function AuthGate() {
       body: JSON.stringify(body),
     });
     const responseText = await response.text();
-    let result: { error?: string } = {};
+    let result: { error?: string; recoveryCodes?: string[] } = {};
     try {
-      result = JSON.parse(responseText) as { error?: string };
+      result = JSON.parse(responseText) as { error?: string; recoveryCodes?: string[] };
     } catch {
       result = {
         error: response.ok
@@ -1554,6 +1593,11 @@ function AuthGate() {
         setStatus("login");
         return;
       }
+      if (result.recoveryCodes?.length) {
+        setRecoveryCodes(result.recoveryCodes);
+        setStatus("recovery-codes");
+        return;
+      }
     }
     setStatus("ready");
   };
@@ -1562,7 +1606,7 @@ function AuthGate() {
       <form className="auth-card" onSubmit={submit}>
         <div className="auth-logo">B</div>
         <p className="eyebrow">AI BUNSHIN</p>
-        <h1>{status === "setup" ? "创建本地管理员" : status === "reset-request" ? "找回管理密码" : status === "reset-confirm" ? "输入邮箱验证码" : "登录管理后台"}</h1>
+        <h1>{status === "setup" ? "创建本地管理员" : status === "reset-method" ? "选择恢复方式" : status === "reset-request" ? "找回管理密码" : status === "reset-confirm" ? "输入邮箱验证码" : status === "recovery-reset" ? "使用离线恢复码" : status === "recovery-codes" ? "保存离线恢复码" : "登录管理后台"}</h1>
         <p>
           {status === "setup"
             ? "首次运行只需创建一个站长账号。"
@@ -1570,9 +1614,16 @@ function AuthGate() {
               ? "验证码只会发送到已经注册的管理员邮箱。"
               : status === "reset-confirm"
                 ? `验证码已请求发送至 ${resetEmail}，10 分钟内有效。`
+                : status === "reset-method"
+                  ? "离线恢复码无需邮件服务；邮箱验证码仅在配置邮件服务后可用。"
+                : status === "recovery-reset"
+                  ? "恢复码只用于重置密码，不会直接创建登录会话。"
+                : status === "recovery-codes"
+                  ? "这些恢复码只展示一次。请下载或复制后离线保存。"
             : "管理你的内容、知识库与模型渠道。"}
         </p>
-        {status !== "reset-confirm" && <label>
+        {status === "recovery-codes" && <div className="recovery-code-list">{recoveryCodes.map((code) => <code key={code}>{code}</code>)}</div>}
+        {!["reset-confirm", "reset-method", "recovery-codes"].includes(status) && <label>
           邮箱
           <input name="email" type="email" required autoComplete="email" />
         </label>}
@@ -1580,7 +1631,11 @@ function AuthGate() {
           6 位验证码
           <input name="code" inputMode="numeric" pattern="[0-9]{6}" maxLength={6} required autoComplete="one-time-code" />
         </label>}
-        {!["reset-request"].includes(status) && <label>
+        {status === "recovery-reset" && <label>
+          离线恢复码
+          <input name="recoveryCode" required autoCapitalize="characters" autoComplete="off" placeholder="BNSH-XXXX-XXXX-XXXX-XXXX" />
+        </label>}
+        {!['reset-request', 'reset-method', 'recovery-codes'].includes(status) && <label>
           {status === "reset-confirm" ? "新密码" : "密码"}
           <input
             name="password"
@@ -1588,11 +1643,11 @@ function AuthGate() {
             required
             minLength={12}
             autoComplete={
-              ["setup", "reset-confirm"].includes(status) ? "new-password" : "current-password"
+              ["setup", "reset-confirm", "recovery-reset"].includes(status) ? "new-password" : "current-password"
             }
           />
         </label>}
-        {status === "reset-confirm" && <label>
+        {["reset-confirm", "recovery-reset"].includes(status) && <label>
           再次输入新密码
           <input name="passwordConfirm" type="password" required minLength={12} autoComplete="new-password" />
         </label>}
@@ -1606,11 +1661,11 @@ function AuthGate() {
           )}
         {message && <div className="notice">{message}</div>}
         {error && <div className="auth-error">{error}</div>}
-        <button className="primary">
-          {status === "setup" ? "创建并进入后台" : status === "reset-request" ? "发送验证码" : status === "reset-confirm" ? "验证并修改密码" : "登录"}
-        </button>
-        {status === "login" && passwordResetAvailable && <button className="text-button" type="button" onClick={() => { setError(""); setMessage(""); setStatus("reset-request"); }}>忘记密码？使用邮箱验证码</button>}
-        {["reset-request", "reset-confirm"].includes(status) && <button className="text-button" type="button" onClick={() => { setError(""); setMessage(""); setStatus("login"); }}>返回登录</button>}
+        {status === "reset-method" ? <div className="auth-actions"><button className="primary" type="button" onClick={() => setStatus("recovery-reset")}>使用离线恢复码</button>{passwordResetAvailable && <button className="secondary-button" type="button" onClick={() => setStatus("reset-request")}>使用邮箱验证码</button>}</div> : status === "recovery-codes" ? <><button className="secondary-button" type="button" onClick={downloadRecoveryCodes}>下载恢复码</button><button className="primary">我已安全保存，进入后台</button></> : <button className="primary">
+          {status === "setup" ? "创建并进入后台" : status === "reset-request" ? "发送验证码" : status === "reset-confirm" ? "验证并修改密码" : status === "recovery-reset" ? "验证恢复码并修改密码" : "登录"}
+        </button>}
+        {status === "login" && <button className="text-button" type="button" onClick={() => { setError(""); setMessage(""); setStatus("reset-method"); }}>忘记密码？</button>}
+        {["reset-method", "reset-request", "reset-confirm", "recovery-reset"].includes(status) && <button className="text-button" type="button" onClick={() => { setError(""); setMessage(""); setStatus("login"); }}>返回登录</button>}
       </form>
     </div>
   );

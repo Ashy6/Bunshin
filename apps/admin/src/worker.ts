@@ -127,6 +127,31 @@ function sixDigitCode() {
   const value = crypto.getRandomValues(new Uint32Array(1))[0] ?? 0;
   return String(value % 1_000_000).padStart(6, "0");
 }
+const recoveryAlphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+function normalizeRecoveryCode(value: string) {
+  return value.toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+function randomRecoveryCode() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  const payload = [...bytes].map((value) => recoveryAlphabet[value % recoveryAlphabet.length]).join("");
+  return `BNSH-${payload.match(/.{1,4}/g)!.join("-")}`;
+}
+async function createRecoveryCodeBatch(env: Env, adminId: string) {
+  const codes = Array.from({ length: 10 }, randomRecoveryCode),
+    batchId = crypto.randomUUID(),
+    now = new Date().toISOString(),
+    statements = await Promise.all(codes.map(async (code) => env.DB.prepare(
+      "INSERT INTO admin_recovery_codes (id,admin_id,code_hash,batch_id,created_at) VALUES (?,?,?,?,?)",
+    ).bind(
+      crypto.randomUUID(),
+      adminId,
+      await sha256(`${normalizeRecoveryCode(code)}:${env.SESSION_SECRET}`),
+      batchId,
+      now,
+    )));
+  await env.DB.batch(statements);
+  return { codes, batchId, createdAt: now };
+}
 function clientAddress(request: Request) {
   return request.headers.get("CF-Connecting-IP") ?? request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() ?? "unknown";
 }
@@ -431,7 +456,52 @@ app.get("/api/admin/auth/status", async (c) => {
   return c.json({
     initialized: (row?.count ?? 0) > 0,
     passwordResetAvailable: Boolean(c.env.EMAIL && c.env.PASSWORD_RESET_FROM_EMAIL),
+    recoveryResetAvailable: (row?.count ?? 0) > 0,
   });
+});
+app.post("/api/admin/auth/recovery/reset", async (c) => {
+  const body = await c.req.json<{ email?: string; recoveryCode?: string; password?: string }>().catch(() => ({} as { email?: string; recoveryCode?: string; password?: string })),
+    email = body.email?.trim().toLowerCase() ?? "",
+    normalizedCode = normalizeRecoveryCode(body.recoveryCode ?? ""),
+    password = body.password ?? "",
+    failure = { error: "恢复码无效、已经使用或账号信息不匹配" },
+    key = await sha256(`recovery-reset:${clientAddress(c.req.raw)}:${email}`),
+    now = new Date(),
+    nowIso = now.toISOString(),
+    bucket = await c.env.DB.prepare("SELECT count,expires_at FROM rate_limit_buckets WHERE visitor_hash=? AND bucket='recovery_reset' LIMIT 1")
+      .bind(key).first<{ count: number; expires_at: string }>();
+  if (bucket && bucket.expires_at > nowIso && bucket.count >= 5) {
+    c.header("Retry-After", "900");
+    return c.json({ error: "尝试次数过多，请 15 分钟后再试" }, 429);
+  }
+  const expiresAt = new Date(now.getTime() + 15 * 60 * 1000).toISOString();
+  await c.env.DB.prepare(
+    "INSERT INTO rate_limit_buckets (visitor_hash,bucket,count,expires_at,updated_at) VALUES (?,'recovery_reset',1,?,?) ON CONFLICT(visitor_hash,bucket) DO UPDATE SET count=CASE WHEN rate_limit_buckets.expires_at<=excluded.updated_at THEN 1 ELSE rate_limit_buckets.count+1 END,expires_at=CASE WHEN rate_limit_buckets.expires_at<=excluded.updated_at THEN excluded.expires_at ELSE rate_limit_buckets.expires_at END,updated_at=excluded.updated_at",
+  ).bind(key, expiresAt, nowIso).run();
+  if (!email || normalizedCode.length !== 20 || password.length < 12)
+    return c.json(password.length < 12 ? { error: "新密码至少需要 12 位" } : failure, 400);
+  const admin = await c.env.DB.prepare("SELECT id,password_hash FROM admin_users WHERE email=? LIMIT 1")
+    .bind(email).first<{ id: string; password_hash: string }>(),
+    codeHash = await sha256(`${normalizedCode}:${c.env.SESSION_SECRET}`),
+    recovery = admin ? await c.env.DB.prepare(
+      "SELECT id,batch_id FROM admin_recovery_codes WHERE admin_id=? AND code_hash=? AND used_at IS NULL AND (expires_at IS NULL OR expires_at>?) LIMIT 1",
+    ).bind(admin.id, codeHash, nowIso).first<{ id: string; batch_id: string }>() : null;
+  if (!admin || !recovery) {
+    await recordAdminTelemetry(c.env, { eventType: "password_reset_by_recovery_code_failed", severity: "warning", route: c.req.path, statusCode: 400 });
+    return c.json(failure, 400);
+  }
+  if (await verifyPassword(password, admin.password_hash))
+    return c.json({ error: "新密码不能与当前密码相同" }, 400);
+  const passwordHash = await hashPassword(password);
+  await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE admin_users SET password_hash=?,updated_at=? WHERE id=?").bind(passwordHash, nowIso, admin.id),
+    c.env.DB.prepare("UPDATE admin_recovery_codes SET used_at=? WHERE admin_id=? AND batch_id=? AND used_at IS NULL").bind(nowIso, admin.id, recovery.batch_id),
+    c.env.DB.prepare("DELETE FROM sessions WHERE admin_id=?").bind(admin.id),
+    c.env.DB.prepare("DELETE FROM rate_limit_buckets WHERE visitor_hash=? AND bucket='recovery_reset'").bind(key),
+  ]);
+  await recordAdminTelemetry(c.env, { eventType: "password_reset_by_recovery_code", route: c.req.path, statusCode: 200 });
+  c.header("Set-Cookie", clearSessionCookie());
+  return c.json({ ok: true, message: "密码已修改，旧会话和旧恢复码均已失效，请使用新密码登录" });
 });
 app.post("/api/admin/auth/password-reset/request", async (c) => {
   const body = await c.req.json<{ email?: string }>().catch(() => ({} as { email?: string })),
@@ -527,7 +597,9 @@ app.post("/api/admin/auth/bootstrap", async (c) => {
   )
     .bind(id, body.email.toLowerCase(), passwordHash, now, now)
     .run();
-  return c.json({ ok: true }, 201);
+  const recovery = await createRecoveryCodeBatch(c.env, id);
+  await recordAdminTelemetry(c.env, { eventType: "recovery_codes_created", route: c.req.path, statusCode: 201 });
+  return c.json({ ok: true, recoveryCodes: recovery.codes }, 201);
 });
 app.post("/api/admin/auth/login", async (c) => {
   const body = await c.req
@@ -622,6 +694,26 @@ app.use("/api/admin/*", async (c, next) => {
       return c.json({ error: "请求来源校验失败" }, 403);
   }
   await next();
+});
+app.get("/api/admin/security/recovery-codes", async (c) => {
+  const admin = (await currentAdmin(c.req.raw, c.env))!;
+  const status = await c.env.DB.prepare(
+    "SELECT batch_id,created_at,COUNT(*) total,SUM(CASE WHEN used_at IS NULL THEN 1 ELSE 0 END) remaining FROM admin_recovery_codes WHERE admin_id=? GROUP BY batch_id,created_at ORDER BY created_at DESC LIMIT 1",
+  ).bind(admin.id).first<{ batch_id: string; created_at: string; total: number; remaining: number }>();
+  return c.json({ configured: Boolean(status), total: status?.total ?? 0, remaining: status?.remaining ?? 0, createdAt: status?.created_at ?? null });
+});
+app.post("/api/admin/security/recovery-codes/regenerate", async (c) => {
+  const admin = (await currentAdmin(c.req.raw, c.env))!,
+    body = await c.req.json<{ password?: string }>().catch(() => ({} as { password?: string })),
+    row = await c.env.DB.prepare("SELECT password_hash FROM admin_users WHERE id=? LIMIT 1").bind(admin.id).first<{ password_hash: string }>(),
+    existing = await c.env.DB.prepare("SELECT COUNT(*) count FROM admin_recovery_codes WHERE admin_id=?").bind(admin.id).first<{ count: number }>();
+  if ((existing?.count ?? 0) > 0 && (!body.password || !row || !(await verifyPassword(body.password, row.password_hash))))
+    return c.json({ error: "当前密码不正确" }, 403);
+  const now = new Date().toISOString();
+  await c.env.DB.prepare("UPDATE admin_recovery_codes SET used_at=? WHERE admin_id=? AND used_at IS NULL").bind(now, admin.id).run();
+  const recovery = await createRecoveryCodeBatch(c.env, admin.id);
+  await recordAdminTelemetry(c.env, { eventType: "recovery_codes_regenerated", route: c.req.path, statusCode: 200 });
+  return c.json({ ok: true, recoveryCodes: recovery.codes, createdAt: recovery.createdAt });
 });
 app.get("/api/admin/analytics/overview", async (c) => {
   const row = await c.env.DB.prepare(

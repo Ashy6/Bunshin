@@ -103,6 +103,7 @@ type SystemSettingsData = {
   recentAudits: Array<{ action: string; target_type: string; target_id: string | null; created_at: string }>;
   updatedAt: string | null;
 };
+type RecoveryCodeStatus = { configured: boolean; total: number; remaining: number; createdAt: string | null };
 
 const emptySummary: Summary = {
   requests: 0,
@@ -410,7 +411,11 @@ export function SystemSettings() {
     [loading, setLoading] = useState(true),
     [saving, setSaving] = useState(false),
     [repairing, setRepairing] = useState(false),
-    [message, setMessage] = useState("");
+    [message, setMessage] = useState(""),
+    [recoveryStatus, setRecoveryStatus] = useState<RecoveryCodeStatus | null>(null),
+    [recoveryPassword, setRecoveryPassword] = useState(""),
+    [recoveryCodes, setRecoveryCodes] = useState<string[]>([]),
+    [regeneratingCodes, setRegeneratingCodes] = useState(false);
   const load = async () => {
     setLoading(true);
     try {
@@ -425,6 +430,12 @@ export function SystemSettings() {
     finally { setLoading(false); }
   };
   useEffect(() => { void load(); }, []);
+  useEffect(() => {
+    void adminFetch("/api/admin/security/recovery-codes")
+      .then((response) => response.ok ? response.json() as Promise<RecoveryCodeStatus> : Promise.reject(new Error("读取恢复码状态失败")))
+      .then(setRecoveryStatus)
+      .catch(() => setRecoveryStatus(null));
+  }, []);
   const changedKeywords = useMemo(
     () => normalizeSeoKeywords(keywords),
     [keywords],
@@ -468,6 +479,25 @@ export function SystemSettings() {
     setRepairing(false);
     setMessage(response.ok ? `扫描 ${body.scanned || 0} 份资料，修复 ${body.repaired || 0} 份，缺失 ${body.missing || 0} 份` : "附件元数据修复失败");
   };
+  const regenerateRecoveryCodes = async () => {
+    if (recoveryStatus?.configured && !recoveryPassword) { setMessage("请输入当前密码后再生成新的恢复码"); return; }
+    if (recoveryStatus?.configured && !confirm("生成新恢复码后，现有恢复码将立即全部失效。确定继续吗？")) return;
+    setRegeneratingCodes(true); setMessage("");
+    const response = await adminFetch("/api/admin/security/recovery-codes/regenerate", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: recoveryPassword }),
+    });
+    const body = await response.json().catch(() => ({})) as { error?: string; recoveryCodes?: string[]; createdAt?: string };
+    setRegeneratingCodes(false); setRecoveryPassword("");
+    if (!response.ok || !body.recoveryCodes) { setMessage(body.error || "生成恢复码失败"); return; }
+    setRecoveryCodes(body.recoveryCodes);
+    setRecoveryStatus({ configured: true, total: body.recoveryCodes.length, remaining: body.recoveryCodes.length, createdAt: body.createdAt ?? new Date().toISOString() });
+    setMessage("新恢复码已生成。它们只展示一次，请立即离线保存");
+  };
+  const downloadRecoveryCodes = () => {
+    const blob = new Blob([`Bunshin 离线恢复码\n\n${recoveryCodes.join("\n")}\n\n每个恢复码只能使用一次，请离线妥善保存。\n`], { type: "text/plain;charset=utf-8" }),
+      url = URL.createObjectURL(blob), link = document.createElement("a");
+    link.href = url; link.download = "bunshin-recovery-codes.txt"; link.click(); URL.revokeObjectURL(url);
+  };
   return (
     <>
       <header className="page-head"><div><p>系统设置</p><h1>站点发布、SEO 与运行策略</h1></div><div className="head-actions"><button className="secondary-button" type="button" onClick={() => void load()} disabled={loading}>{loading ? "检查中…" : "重新检查"}</button><button className="primary" type="submit" form="system-settings" disabled={saving || !dirty}>{saving ? "保存中…" : dirty ? "保存更改" : "已保存"}</button></div></header>
@@ -491,6 +521,7 @@ export function SystemSettings() {
         <section className="panel form-stack"><div className="section-heading"><div><h2>监控与告警阈值</h2><p>生产监控按照这些阈值识别错误、慢请求、卡死任务和预算风险。</p></div></div><div className="settings-field-grid"><label>模型错误率阈值（%）<input type="number" min="1" max="100" value={observability.errorRateThreshold} onChange={(event) => setObservability({ ...observability, errorRateThreshold: Number(event.target.value) })}/><small>达到阈值后创建告警。</small></label><label>最少采样请求数<input type="number" min="1" max="10000" value={observability.minimumRequests} onChange={(event) => setObservability({ ...observability, minimumRequests: Number(event.target.value) })}/><small>低于此请求量时不判断错误率。</small></label><label>任务卡死判定（分钟）<input type="number" min="1" max="1440" value={observability.stuckMinutes} onChange={(event) => setObservability({ ...observability, stuckMinutes: Number(event.target.value) })}/><small>文档或队列超过该时长未更新。</small></label><label>预算预警比例（%）<input type="number" min="1" max="100" value={observability.budgetWarningPercent} onChange={(event) => setObservability({ ...observability, budgetWarningPercent: Number(event.target.value) })}/><small>相对渠道月度预算计算。</small></label><label>慢请求阈值（毫秒）<input type="number" min="100" max="300000" step="100" value={observability.slowRequestMs} onChange={(event) => setObservability({ ...observability, slowRequestMs: Number(event.target.value) })}/><small>用于生产监控中的慢请求统计。</small></label></div></section>
         </div>
         <aside className="settings-side">
+          <section className="panel form-stack"><h2>账户恢复</h2><p className="muted-copy">邮箱不可用时，可使用一次性离线恢复码重置密码。系统只保存哈希值，无法找回已经关闭的明文恢复码。</p>{recoveryStatus && <p className="settings-updated">{recoveryStatus.configured ? `当前批次剩余 ${recoveryStatus.remaining}/${recoveryStatus.total} 个` : "尚未生成恢复码"}{recoveryStatus.createdAt ? ` · ${dateTime(recoveryStatus.createdAt)}` : ""}</p>}{recoveryStatus?.configured && <label>当前密码<input type="password" autoComplete="current-password" value={recoveryPassword} onChange={(event) => setRecoveryPassword(event.target.value)} placeholder="用于确认站长身份"/></label>}<button type="button" className="secondary-button" disabled={regeneratingCodes} onClick={() => void regenerateRecoveryCodes()}>{regeneratingCodes ? "生成中…" : recoveryStatus?.configured ? "重新生成恢复码" : "生成首批恢复码"}</button>{recoveryCodes.length > 0 && <div className="recovery-code-box"><div className="recovery-code-list">{recoveryCodes.map((code) => <code key={code}>{code}</code>)}</div><button type="button" className="secondary-button" onClick={downloadRecoveryCodes}>下载为文本文件</button><small>离开本页或刷新后无法再次查看这些明文恢复码。</small></div>}</section>
           <section className="panel"><h2>SEO 入口</h2><div className="settings-links">{config.publicOrigin ? <><a href={`${config.publicOrigin}/sitemap.xml`} target="_blank" rel="noreferrer">Sitemap ↗</a><a href={`${config.publicOrigin}/robots.txt`} target="_blank" rel="noreferrer">Robots ↗</a><a href={`${config.publicOrigin}/llms.txt`} target="_blank" rel="noreferrer">llms.txt ↗</a></> : <p>保存公开站地址后显示。</p>}</div></section>
           <section className="panel"><h2>数据维护</h2><p className="muted-copy">重新读取 R2 附件大小、文件名和索引进度，修复旧版本遗留元数据。</p><button type="button" className="secondary-button" disabled={repairing} onClick={() => void repair()}>{repairing ? "修复中…" : "修复附件元数据"}</button></section>
           <section className="panel"><h2>最近变更</h2><div className="audit-list">{data.recentAudits.length ? data.recentAudits.map((item, index) => <div key={`${item.created_at}-${index}`}><strong>{({"settings.update":"更新系统设置","profile.update":"更新个人资料","documents.repair_metadata":"修复附件元数据"} as Record<string,string>)[item.action] || item.action}</strong><small>{dateTime(item.created_at)} · {item.target_type}</small></div>) : <p className="muted-copy">还没有管理操作记录。</p>}</div>{data.updatedAt && <p className="settings-updated">系统设置更新于 {dateTime(data.updatedAt)}</p>}</section>

@@ -789,6 +789,7 @@ td small {
   width: 100%;
   margin-top: 10px;
 }
+.auth-actions{display:grid;gap:10px}.recovery-code-list{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:4px 0 12px}.recovery-code-list code{display:block;padding:9px 10px;border:1px solid #dfe5e8;border-radius:8px;background:#f6f8f9;color:#294b61;font-size:12px;text-align:center;letter-spacing:.04em;user-select:all}.recovery-code-box{display:grid;gap:10px;padding:12px;border:1px solid #dfe5e8;border-radius:10px;background:#fafbfc}.recovery-code-box small{color:#8a5960}@media(max-width:520px){.recovery-code-list{grid-template-columns:1fr}}
 .auth-error {
   padding: 9px 11px;
   border-radius: 8px;
